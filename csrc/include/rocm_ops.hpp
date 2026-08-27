@@ -2293,6 +2293,7 @@ namespace py = pybind11;
           py::arg("rowStarts"),                  \
           py::arg("rowEnds"),                    \
           py::arg("pageTable"),                  \
+          py::arg("ptRowMap"),                   \
           py::arg("indices"),                    \
           py::arg("numRows"),                    \
           py::arg("pageSize") = 1,               \

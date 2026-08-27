@@ -437,6 +437,7 @@ def _dsa_topk_transform(
     rowStarts: torch.Tensor | None,
     rowEnds: torch.Tensor,
     pageTable: torch.Tensor | None,
+    ptRowMap: torch.Tensor | None,
     indices: torch.Tensor,
     numRows: int,
     pageSize: int,
@@ -452,6 +453,7 @@ def dsa_topk_transform(
     indices: torch.Tensor,
     pageSize: int = 1,
     k: int = 2048,
+    ptRowMap: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-row top-k of the DSA indexer logits, reported as physical KV slots.
 
@@ -463,11 +465,24 @@ def dsa_topk_transform(
     score gather, two ``torch.where``, the page split, a ``torch.gather``, the
     recombine and a ``masked_fill``).
 
-    ``pageTable`` is [numRows, pages] int32 and ``pageSize`` must be a power of
+    ``pageTable`` is [ptRows, pages] int32 and ``pageSize`` must be a power of
     two. Passing ``pageTable=None`` skips the mapping and emits raw positions in
     the logits buffer's coordinates, which is a plain per-row top-k.
     ``rowStarts=None`` means every row starts at 0, which is what decode wants and
     what saves it a per-call zeros tensor.
+
+    ``ptRowMap`` is [numRows] int32 giving each logits row's page-table row. Decode
+    is one row per sequence, so ``ptRows == numRows``, the map is the identity and
+    it stays None. Speculative decoding is not: verify and draft-extend produce
+    several rows per sequence against a page table that still has one row each, and
+    ``ptRowMap`` is what lets those shapes use this op. It is an indirection inside
+    the kernel rather than an expanded table because at 100k context one
+    page_size=1 row is ~400 KB, so materialising ``bs * draft`` copies would cost
+    more bandwidth than the select itself.
+
+    ``k`` must be 512 (DeepSeek-V4's ``index_topk``) or 2048 (GLM-5.2's); the
+    kernel is templated on it so the emit bounds and the -1 padding stay
+    compile-time.
 
     Selection is exact except on rows whose values are close enough to collapse
     into a single fp16 coarse key; see the coop kernel's refine_from_row. Ties are
@@ -475,7 +490,15 @@ def dsa_topk_transform(
     and a caller needing rank order must sort.
     """
     _dsa_topk_transform(
-        logits, rowStarts, rowEnds, pageTable, indices, logits.shape[0], pageSize, k
+        logits,
+        rowStarts,
+        rowEnds,
+        pageTable,
+        ptRowMap,
+        indices,
+        logits.shape[0],
+        pageSize,
+        k,
     )
     return indices
 
