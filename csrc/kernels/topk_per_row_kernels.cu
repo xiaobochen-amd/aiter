@@ -2907,6 +2907,7 @@ static void launch(const float* in,
                    int64_t row_len_hint,
                    hipStream_t stream,
                    const int32_t* page_table = nullptr,
+                   const int32_t* pt_row_map = nullptr,
                    int64_t pt_stride         = 0,
                    int page_size             = 1)
 {
@@ -2924,6 +2925,7 @@ static void launch(const float* in,
         p.row_ends   = row_ends;
         p.overflow   = overflow;
         p.page_table = page_table;
+        p.pt_row_map = pt_row_map;
         p.pt_stride  = pt_stride;
         p.page_bits  = page_bits;
         p.page_mask  = page_mask;
@@ -2941,6 +2943,7 @@ static void launch(const float* in,
     p.row_ends   = row_ends;
     p.overflow   = overflow;
     p.page_table = page_table;
+    p.pt_row_map = pt_row_map;
     p.pt_stride  = pt_stride;
     p.page_bits  = page_bits;
     p.page_mask  = page_mask;
@@ -2975,10 +2978,16 @@ static void launch(const float* in,
 // gather, two torch.where, the page split, a torch.gather, the recombine and a
 // masked_fill (see _topk_transform_512_vectorized).
 //
-// pageTable is [numRows, pages] int32, logical page -> physical page, and pageSize
+// pageTable is [ptRows, pages] int32, logical page -> physical page, and pageSize
 // must be a power of two. A null pageTable emits raw positions, which makes this a
 // plain per-row top-k. A null rowStarts means every row begins at 0, which is what
 // the decode path always wants and saves it a per-call zeros tensor.
+//
+// ptRowMap is [numRows] int32 mapping each logits row to its page-table row. Decode
+// has one row per sequence, so ptRows == numRows and the map is null (identity).
+// Speculative decoding hands us several rows per sequence -- one per draft token --
+// against a page table that still has one row per sequence, and ptRowMap is what
+// lets those shapes use this kernel rather than falling back to the unfused chain.
 //
 // A ctypes entry like the *_fast paths in topk.py: per-call binding cost is a
 // visible fraction of a 20 us op.
@@ -2986,6 +2995,7 @@ AITER_C_ITFS void dsa_topk_transform(aiter_tensor_t* logits,
                                      aiter_tensor_t* rowStarts,
                                      aiter_tensor_t* rowEnds,
                                      aiter_tensor_t* pageTable,
+                                     aiter_tensor_t* ptRowMap,
                                      aiter_tensor_t* indices,
                                      int64_t numRows,
                                      int64_t pageSize,
@@ -3013,6 +3023,8 @@ AITER_C_ITFS void dsa_topk_transform(aiter_tensor_t* logits,
                         stream,
                         pageTable ? static_cast<const int32_t*>(pageTable->data_ptr())
                                   : nullptr,
+                        ptRowMap ? static_cast<const int32_t*>(ptRowMap->data_ptr())
+                                 : nullptr,
                         pageTable ? pageTable->stride(0) : 0,
                         static_cast<int>(pageSize));
 }
