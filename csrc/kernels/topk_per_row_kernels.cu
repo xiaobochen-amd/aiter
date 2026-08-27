@@ -2609,6 +2609,7 @@ static void launch(const float* in,
                    int64_t row_len_hint,
                    hipStream_t stream,
                    const int32_t* page_table = nullptr,
+                   const int32_t* pt_row_map = nullptr,
                    int64_t pt_stride         = 0,
                    int page_size             = 1)
 {
@@ -2626,6 +2627,7 @@ static void launch(const float* in,
         p.row_ends   = row_ends;
         p.overflow   = overflow;
         p.page_table = page_table;
+        p.pt_row_map = pt_row_map;
         p.pt_stride  = pt_stride;
         p.page_bits  = page_bits;
         p.page_mask  = page_mask;
@@ -2643,6 +2645,7 @@ static void launch(const float* in,
     p.row_ends   = row_ends;
     p.overflow   = overflow;
     p.page_table = page_table;
+    p.pt_row_map = pt_row_map;
     p.pt_stride  = pt_stride;
     p.page_bits  = page_bits;
     p.page_mask  = page_mask;
@@ -2677,10 +2680,16 @@ static void launch(const float* in,
 // gather, two torch.where, the page split, a torch.gather, the recombine and a
 // masked_fill (see _topk_transform_512_vectorized).
 //
-// pageTable is [numRows, pages] int32, logical page -> physical page, and pageSize
+// pageTable is [ptRows, pages] int32, logical page -> physical page, and pageSize
 // must be a power of two. A null pageTable emits raw positions, which makes this a
 // plain per-row top-k. A null rowStarts means every row begins at 0, which is what
 // the decode path always wants and saves it a per-call zeros tensor.
+//
+// ptRowMap is [numRows] int32 mapping each logits row to its page-table row. Decode
+// has one row per sequence, so ptRows == numRows and the map is null (identity).
+// Speculative decoding hands us several rows per sequence -- one per draft token --
+// against a page table that still has one row per sequence, and ptRowMap is what
+// lets those shapes use this kernel rather than falling back to the unfused chain.
 //
 // A ctypes entry like the *_fast paths in topk.py: per-call binding cost is a
 // visible fraction of a 20 us op.
@@ -2688,6 +2697,7 @@ void dsa_topk_transform(const torch::Tensor& logits,
                         std::optional<torch::Tensor> rowStarts,
                         const torch::Tensor& rowEnds,
                         std::optional<torch::Tensor> pageTable,
+                        std::optional<torch::Tensor> ptRowMap,
                         torch::Tensor& indices,
                         int64_t numRows,
                         int64_t pageSize,
@@ -2713,6 +2723,7 @@ void dsa_topk_transform(const torch::Tensor& logits,
                         /*row_len_hint=*/logits.stride(0),
                         stream,
                         pageTable.has_value() ? pageTable->data_ptr<int>() : nullptr,
+                        ptRowMap.has_value() ? ptRowMap->data_ptr<int>() : nullptr,
                         pageTable.has_value() ? pageTable->stride(0) : 0,
                         static_cast<int>(pageSize));
 }

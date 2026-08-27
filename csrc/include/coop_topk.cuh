@@ -244,6 +244,23 @@ __device__ __forceinline__ int32_t out_base_of(const Params& p, int32_t row_star
     return p.page_table ? 0 : row_start;
 }
 
+// Which page-table row this logits row looks up.
+//
+// Decode is one logits row per sequence, so the map is the identity and the
+// caller passes null. Speculative decoding is not: verify and draft-extend hand
+// us several rows per sequence (one per draft token), while the page table still
+// has one row per sequence. pt_row_map carries that row -> sequence map so those
+// shapes can use this kernel instead of falling back to the unfused chain.
+//
+// Kept as an indirection rather than making the caller materialise an expanded
+// table: at 100k context a page_size=1 row is ~400 KB, so gathering bs*draft
+// copies of it would cost more bandwidth than the whole select.
+template <typename Params>
+__device__ __forceinline__ size_t pt_row_of(const Params& p, uint32_t row)
+{
+    return static_cast<size_t>(p.pt_row_map ? static_cast<uint32_t>(p.pt_row_map[row]) : row);
+}
+
 // Map this row's selected positions to the physical KV slots the DSA indexer's
 // consumer wants, in place:
 //
@@ -293,6 +310,7 @@ struct CoopTopKParams
     const int32_t* __restrict__ row_ends;    // may be null -> full stride
     int32_t* __restrict__ overflow;          // may be null; incremented per bad row
     const int32_t* __restrict__ page_table;  // may be null -> emit raw positions
+    const int32_t* __restrict__ pt_row_map;  // may be null -> page table row == logits row
     int64_t pt_stride;
     uint32_t page_bits;
     uint32_t page_mask;
@@ -745,7 +763,7 @@ __global__ __launch_bounds__(BlockSize) void coop_topk_kernel(CoopTopKParams<Top
     {
         transform_to_pages<TopK, BlockSize>(
             params.out_idx + static_cast<size_t>(blockIdx.x) * TopK,
-            params.page_table + static_cast<size_t>(blockIdx.x) * params.pt_stride,
+            params.page_table + pt_row_of(params, blockIdx.x) * params.pt_stride,
             params.page_bits,
             params.page_mask);
     }
@@ -861,6 +879,7 @@ struct CoopMbParams
     const int32_t* __restrict__ row_ends;
     int32_t* __restrict__ overflow;
     const int32_t* __restrict__ page_table;  // may be null -> emit raw positions
+    const int32_t* __restrict__ pt_row_map;  // may be null -> page table row == logits row
     int64_t pt_stride;
     uint32_t page_bits;
     uint32_t page_mask;
@@ -914,7 +933,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_hist0(CoopMbParams<TopK> p,
             {
                 transform_to_pages<TopK, BlockSize>(
                     out,
-                    p.page_table + static_cast<size_t>(row) * p.pt_stride,
+                    p.page_table + pt_row_of(p, row) * p.pt_stride,
                     p.page_bits,
                     p.page_mask);
             }
@@ -1167,7 +1186,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_refine(CoopMbParams<TopK> p
 
     transform_to_pages<TopK, BlockSize>(
         p.out_idx + static_cast<size_t>(row) * TopK,
-        p.page_table + static_cast<size_t>(row) * p.pt_stride,
+        p.page_table + pt_row_of(p, row) * p.pt_stride,
         p.page_bits,
         p.page_mask);
 }
