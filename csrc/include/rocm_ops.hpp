@@ -2133,7 +2133,17 @@ namespace py = pybind11;
     m.def("topk_use_mulblocks",                  \
           &topk_use_mulblocks,                   \
           py::arg("numRows"),                    \
-          py::arg("stride0"));
+          py::arg("stride0"));                   \
+    m.def("dsa_topk_transform",                  \
+          &dsa_topk_transform,                   \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("pageTable"),                  \
+          py::arg("indices"),                    \
+          py::arg("numRows"),                    \
+          py::arg("pageSize") = 1,               \
+          py::arg("k")        = 2048);
 
 #define MLA_METADATA_PYBIND                               \
     m.def("get_mla_metadata_v1",                          \
