@@ -2976,38 +2976,36 @@ static void launch(const float* in,
 //
 // A ctypes entry like the *_fast paths in topk.py: per-call binding cost is a
 // visible fraction of a 20 us op.
-AITER_C_ITFS void dsa_topk_transform(aiter_tensor_t* logits,
-                                     aiter_tensor_t* rowStarts,
-                                     aiter_tensor_t* rowEnds,
-                                     aiter_tensor_t* pageTable,
-                                     aiter_tensor_t* indices,
-                                     int64_t numRows,
-                                     int64_t pageSize,
-                                     int64_t k,
-                                     hipStream_t stream)
+void dsa_topk_transform(const torch::Tensor& logits,
+                        std::optional<torch::Tensor> rowStarts,
+                        const torch::Tensor& rowEnds,
+                        std::optional<torch::Tensor> pageTable,
+                        torch::Tensor& indices,
+                        int64_t numRows,
+                        int64_t pageSize,
+                        int64_t k)
 {
     if(numRows <= 0) { return; }
     AITER_CHECK(k == 2048, "dsa_topk_transform is instantiated for k=2048 only");
     AITER_CHECK(pageSize > 0 && (pageSize & (pageSize - 1)) == 0,
                 "dsa_topk_transform needs a power-of-two page size");
 
-    const HipDeviceGuard device_guard(logits->device_id);
-    const int batch = static_cast<int>(numRows);
+    const HipDeviceGuard device_guard(logits.device().index());
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const int batch          = static_cast<int>(numRows);
 
-    aiter::coop::launch(static_cast<const float*>(logits->data_ptr()),
-                        static_cast<int32_t*>(indices->data_ptr()),
-                        rowStarts ? static_cast<const int32_t*>(rowStarts->data_ptr())
-                                  : nullptr,
-                        static_cast<const int32_t*>(rowEnds->data_ptr()),
+    aiter::coop::launch(logits.data_ptr<float>(),
+                        indices.data_ptr<int>(),
+                        rowStarts.has_value() ? rowStarts->data_ptr<int>() : nullptr,
+                        rowEnds.data_ptr<int>(),
                         /*overflow=*/nullptr,
                         aiter::coop::coop_scratch(batch),
                         batch,
-                        logits->stride(0),
-                        /*row_len_hint=*/logits->stride(0),
+                        logits.stride(0),
+                        /*row_len_hint=*/logits.stride(0),
                         stream,
-                        pageTable ? static_cast<const int32_t*>(pageTable->data_ptr())
-                                  : nullptr,
-                        pageTable ? pageTable->stride(0) : 0,
+                        pageTable.has_value() ? pageTable->data_ptr<int>() : nullptr,
+                        pageTable.has_value() ? pageTable->stride(0) : 0,
                         static_cast<int>(pageSize));
 }
 
