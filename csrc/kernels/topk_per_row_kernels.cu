@@ -2985,12 +2985,12 @@ static void launch(const float* in,
 //
 // A ctypes entry like the *_fast paths in topk.py: per-call binding cost is a
 // visible fraction of a 20 us op.
-void dsa_topk_transform(const torch::Tensor& logits,
-                        std::optional<torch::Tensor> rowStarts,
-                        const torch::Tensor& rowEnds,
-                        std::optional<torch::Tensor> pageTable,
-                        std::optional<torch::Tensor> ptRowMap,
-                        torch::Tensor& indices,
+void dsa_topk_transform(const aiter_tensor_t& logits,
+                        std::optional<aiter_tensor_t> rowStarts,
+                        const aiter_tensor_t& rowEnds,
+                        std::optional<aiter_tensor_t> pageTable,
+                        std::optional<aiter_tensor_t> ptRowMap,
+                        aiter_tensor_t& indices,
                         int64_t numRows,
                         int64_t pageSize,
                         int64_t k)
@@ -3000,22 +3000,22 @@ void dsa_topk_transform(const torch::Tensor& logits,
     AITER_CHECK(pageSize > 0 && (pageSize & (pageSize - 1)) == 0,
                 "dsa_topk_transform needs a power-of-two page size");
 
-    const HipDeviceGuard device_guard(logits.device().index());
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const HipDeviceGuard device_guard(logits.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     const int batch          = static_cast<int>(numRows);
 
-    aiter::coop::launch(logits.data_ptr<float>(),
-                        indices.data_ptr<int>(),
-                        rowStarts.has_value() ? rowStarts->data_ptr<int>() : nullptr,
-                        rowEnds.data_ptr<int>(),
+    aiter::coop::launch(static_cast<float*>(logits.data_ptr()),
+                        static_cast<int*>(indices.data_ptr()),
+                        rowStarts.has_value() ? static_cast<int*>(rowStarts->data_ptr()) : nullptr,
+                        static_cast<int*>(rowEnds.data_ptr()),
                         /*overflow=*/nullptr,
                         aiter::coop::coop_scratch(batch),
                         batch,
                         logits.stride(0),
                         /*row_len_hint=*/logits.stride(0),
                         stream,
-                        pageTable.has_value() ? pageTable->data_ptr<int>() : nullptr,
-                        ptRowMap.has_value() ? ptRowMap->data_ptr<int>() : nullptr,
+                        pageTable.has_value() ? static_cast<int*>(pageTable->data_ptr()) : nullptr,
+                        ptRowMap.has_value() ? static_cast<int*>(ptRowMap->data_ptr()) : nullptr,
                         pageTable.has_value() ? pageTable->stride(0) : 0,
                         static_cast<int>(pageSize));
 }

@@ -27,12 +27,12 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
                           std::optional<aiter_tensor_t> workspace = std::nullopt,
                           bool stable                             = false);
 
-void dsa_topk_transform(const torch::Tensor& logits,
-                        std::optional<torch::Tensor> rowStarts,
-                        const torch::Tensor& rowEnds,
-                        std::optional<torch::Tensor> pageTable,
-                        std::optional<torch::Tensor> ptRowMap,
-                        torch::Tensor& indices,
+void dsa_topk_transform(const aiter_tensor_t& logits,
+                        std::optional<aiter_tensor_t> rowStarts,
+                        const aiter_tensor_t& rowEnds,
+                        std::optional<aiter_tensor_t> pageTable,
+                        std::optional<aiter_tensor_t> ptRowMap,
+                        aiter_tensor_t& indices,
                         int64_t numRows,
                         int64_t pageSize = 1,
                         int64_t k        = 2048);

@@ -431,7 +431,7 @@ def top_k_per_row_prefill_fast(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row", fc_name="dsa_topk_transform")
+@compile_ops("module_top_k_per_row", fc_name="dsa_topk_transform", develop=True)
 def _dsa_topk_transform(
     logits: torch.Tensor,
     rowStarts: torch.Tensor | None,
