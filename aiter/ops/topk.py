@@ -387,6 +387,55 @@ def top_k_per_row_prefill_fast(
 ) -> None: ...
 
 
+@compile_ops("module_top_k_per_row", fc_name="dsa_topk_transform")
+def _dsa_topk_transform(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor | None,
+    rowEnds: torch.Tensor,
+    pageTable: torch.Tensor | None,
+    indices: torch.Tensor,
+    numRows: int,
+    pageSize: int,
+    k: int,
+) -> None: ...
+
+
+def dsa_topk_transform(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor | None,
+    rowEnds: torch.Tensor,
+    pageTable: torch.Tensor | None,
+    indices: torch.Tensor,
+    pageSize: int = 1,
+    k: int = 2048,
+) -> torch.Tensor:
+    """Per-row top-k of the DSA indexer logits, reported as physical KV slots.
+
+    This is the op sglang calls topk_transform: select the top ``k`` of each row
+    and map each winner through the page table,
+    ``pageTable[pos >> bits] << bits | (pos & mask)``, padding short rows with -1.
+    Both halves run in one kernel, so the [numRows, k] indices are written once and
+    never read back; sglang instead follows its top-k with a chain of tensor ops (a
+    score gather, two ``torch.where``, the page split, a ``torch.gather``, the
+    recombine and a ``masked_fill``).
+
+    ``pageTable`` is [numRows, pages] int32 and ``pageSize`` must be a power of
+    two. Passing ``pageTable=None`` skips the mapping and emits raw positions in
+    the logits buffer's coordinates, which is a plain per-row top-k.
+    ``rowStarts=None`` means every row starts at 0, which is what decode wants and
+    what saves it a per-call zeros tensor.
+
+    Selection is exact except on rows whose values are close enough to collapse
+    into a single fp16 coarse key; see the coop kernel's refine_from_row. Ties are
+    broken by arrival order, so the emitted order is not deterministic across runs
+    and a caller needing rank order must sort.
+    """
+    _dsa_topk_transform(
+        logits, rowStarts, rowEnds, pageTable, indices, logits.shape[0], pageSize, k
+    )
+    return indices
+
+
 @compile_ops("module_top_k_per_row", fc_name="top_k_per_row_decode")
 def _top_k_per_row_decode(
     logits: torch.Tensor,
