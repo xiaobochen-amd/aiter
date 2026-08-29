@@ -22,16 +22,21 @@
 // plus the emit scan, so about four reads of the scores. This reads them twice.
 // For a kernel whose roofline is the score array itself, that ratio is the point.
 //
-// WHY THE BIN COMES FROM fp16 AND WHY THAT IS NOT A PRECISION LOSS. The bin is the
-// top kHistBits of the *fp16* rounding of the score, not of the fp32 key. That
-// looks lossy and is in fact the opposite, because __float2half_rn is monotonic:
-// a <= b implies fp16(a) <= fp16(b), so bin(a) > bin(b) implies a > b and the
-// three-way partition in step 3 is sound. The gain is bin resolution on clustered
-// data. Indexer logits cluster tightly, so the fp32 exponent is near-constant and
-// the top 12 bits of an fp32 key leave only 3 mantissa bits varying -- 8 distinct
-// bins. The same 12 bits of an fp16 key leave 6 mantissa bits -- 64 bins, an 8x
-// finer split of exactly the region that matters. Precision is then recovered in
-// full by step 4, which sorts on the untruncated fp32 key.
+// WHAT THE COARSE BIN IS, AND WHY IT IS THE TOP HALF OF THE fp32 KEY. Steps 1-3 rank
+// on the top 16 bits of the ordered fp32 key -- sign, all 8 exponent bits, 7 mantissa
+// bits. Truncating a monotonic key stays monotonic, so bin(a) > bin(b) implies a > b
+// and the three-way partition in step 3 is sound; step 4 then restores full precision
+// by ranking the survivors on all 32 bits.
+//
+// This used to bin on the fp16 rounding of the score instead, on the reasoning that
+// fp16 spends 10 of its 16 bits on the mantissa against 7 here, so it splits
+// clustered data more finely. That reasoning holds only inside fp16's range, and the
+// cost of leaving it is not a coarser split but no split at all: 5 exponent bits
+// reach down to 2^-24, and GLM-5.2's indexer scores sit near 1e-16, so every score in
+// the row rounded to the same fp16 zero. Both coarse rounds then put the entire row
+// in one bin and every row fell through to the rescan path in step 4 -- measured at
+// 113 of 130 us. Range is what decides ordering; mantissa bits past the point where
+// the tie buffer fits are bits step 4 would have resolved anyway.
 //
 // WHY ONE COARSE PASS IS NOT ENOUGH, AND WHAT THIS PORT ADDS. Step 4 is exact only
 // if the whole threshold bin was retained, so the tie buffer must hold it. Upstream
@@ -39,32 +44,22 @@
 // coarse for clustered rows, and measurement says so: sgl-kernel's recall at length
 // 100500 on clustered logits is 0.32.
 //
-// Widening the bin to 12 bits, as this port first did, does not rescue it either,
-// and the arithmetic shows why no fixed width can. In [1,2) the fp16 mantissa step
-// is 2^-10, so logits with a 0.01 spread cover only about 61 steps; keeping the top
-// 6 of 10 mantissa bits groups 16 steps per bin and lands the entire distribution
-// in roughly four bins. Measured: every row overflowed and recall fell to 0.66.
-//
 // So the coarse stage here is iterated rather than single-shot. Round 0 bins on the
-// top 12 bits of the fp16 key; if the threshold bin already fits the tie buffer --
-// the common case on diffuse logits -- the row is done in two reads of the scores.
-// If it does not fit, round 1 resolves the remaining 4 bits of the fp16 key among
-// that bin's members, which narrows the candidate set 16x and costs a third read.
-// After both rounds the survivors share an identical fp16 key, and step 4 orders
-// them exactly on the untruncated fp32 key.
+// top 12 bits of the key; if the threshold bin already fits the tie buffer -- the
+// common case on diffuse logits -- the row is done in two reads of the scores. If it
+// does not fit, round 1 resolves the remaining 4 bits among that bin's members, which
+// narrows the candidate set 16x and costs a third read.
 //
-// Exactness therefore no longer depends on the distribution: it needs only that
-// fewer than TieCap elements share one fp16 key. The residual failure case is a row
-// where that is false -- most sharply, values outside fp16's range, since everything
-// above 65504 rounds to inf and everything under the subnormal floor collapses to
-// zero. That is counted in CoopTopKParams::overflow rather than hidden; a non-zero
-// overflow means the row's answer is approximate and the caller is expected to
-// notice.
+// Exactness does not depend on the distribution. When the tie buffer cannot hold the
+// threshold bin, step 4 rebuilds the candidate set by rescanning the row under the
+// resolved prefix instead of trusting the truncated buffer, so the number of equal
+// elements a row may contain is unbounded -- the buffer caps only how many can be
+// cached, never how many can be ranked. CoopTopKParams::overflow counts the rows that
+// took that path; it is a cost signal, not a correctness one.
 
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
 #include <cstdint>
 
 namespace aiter {
@@ -80,16 +75,10 @@ __device__ __forceinline__ uint32_t order_key32(float x)
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// Ordered 16-bit key of x rounded to fp16. Monotonic in x, because
-// __float2half_rn is: a <= b implies key16(a) <= key16(b).
-__device__ __forceinline__ uint32_t order_key16(float x)
-{
-    __half h      = __float2half_rn(x);
-    uint16_t bits = __half_as_ushort(h);
-    uint16_t key  = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
-                                    : static_cast<uint16_t>(bits | 0x8000);
-    return static_cast<uint32_t>(key);
-}
+// Coarse key for the histogram rounds: sign, all 8 exponent bits, 7 mantissa bits.
+// Monotonic because truncating a monotonic key is. See the header note on why these
+// 16 bits and not an fp16 rounding's.
+__device__ __forceinline__ uint32_t order_key_hi16(float x) { return order_key32(x) >> 16; }
 
 __device__ __forceinline__ uint32_t wave_inclusive_sum(uint32_t lane, uint32_t v)
 {
@@ -339,6 +328,7 @@ struct CoopSmem
     uint32_t above;       // count strictly above that bin
     uint32_t bin_count;   // population of that bin
     uint32_t emit;        // running output cursor during tie refinement
+    uint32_t emit_eq;     // separate cursor for the final round's equal elements
 };
 
 // Threshold over this block's LDS histogram, into s->thr_bin/above/bin_count.
@@ -424,9 +414,15 @@ __device__ __forceinline__ void hist_add_aggregated(uint32_t* hist, uint32_t bin
 }
 
 // Resolve the undecided set exactly: radix-256 on the full fp32 ordered key, four
-// rounds, which is all 32 bits. Membership in the still-undecided set is derived
-// from the prefix resolved so far rather than tracked per element, so no per-element
-// state is carried between rounds.
+// rounds, which is all 32 bits. Running the full key rather than only the bits the
+// coarse rounds left undecided is deliberate -- how many that is depends on whether
+// round 1 ran, so the coarse stage is a pre-filter that narrows the candidate set,
+// never a prefix this stage can build on. The early rounds are cheap when the coarse
+// stage did resolve those bits: every candidate lands in one bin, `above` is zero,
+// and the round exits before its emit scan.
+//
+// Membership in the still-undecided set is derived from the prefix resolved so far
+// rather than tracked per element, so no per-element state is carried between rounds.
 //
 // The candidate set arrives through `for_each`, which must call its argument with
 // (fp32 ordered key, row-relative index) for every candidate, block-strided, and
@@ -445,18 +441,23 @@ __device__ void refine_candidates(CoopSmem<TopK, kHistBits, TieCap, BlockSize>* 
                                   int32_t* __restrict__ out_idx,
                                   int32_t out_base)
 {
-    constexpr uint32_t kRadix = 256;
+    constexpr uint32_t kRadix  = 256;
+    constexpr uint32_t kRounds = 4;  // 8 bits each, so all 32
 
     uint32_t prefix = 0;              // high bits already pinned to the winners' value
     uint32_t remain = TopK - num_above;  // how many of the tie set are winners
 
-    if(threadIdx.x == 0) { s->emit = num_above; }
+    if(threadIdx.x == 0)
+    {
+        s->emit    = num_above;
+        s->emit_eq = 0;
+    }
     __syncthreads();
 
 #pragma unroll
-    for(int r = 0; r < 4; ++r)
+    for(uint32_t r = 0; r < kRounds; ++r)
     {
-        const uint32_t sh = 24 - r * 8;
+        const uint32_t sh = (kRounds - 1 - r) * 8;
 
         for(uint32_t i = threadIdx.x; i < kRadix; i += BlockSize)
         {
@@ -488,25 +489,39 @@ __device__ void refine_candidates(CoopSmem<TopK, kHistBits, TieCap, BlockSize>* 
         // the emit scan would find nothing. Skipping it matters on tightly clustered
         // rows, where the early rounds are exactly this case and each scan pays the
         // full LDS-atomic contention of a single-bin histogram.
-        if(above == 0 && r != 3)
+        if(above == 0 && r != kRounds - 1)
         {
             prefix |= (thr << sh);
             continue;
         }
 
-        // Elements above this round's threshold bin are settled winners.
+        // Elements above this round's threshold bin are settled winners. They start
+        // at `base`, since every earlier round filled the slots before it.
+        const uint32_t base = TopK - remain;
+        const bool last     = (r == kRounds - 1);
         for_each([&](uint32_t key, uint32_t idx) {
             const bool in_play =
                 (r == 0) || (((key >> (sh + 8)) << (sh + 8)) == prefix);
             if(!in_play) { return; }
             const uint32_t bin = (key >> sh) & 0xFFu;
-            // Last round: survivors in the threshold bin are numerically equal, so
-            // any `remain - above` of them is a correct answer. Take them in
-            // arrival order; the quota is enforced by the TopK bound on the cursor.
-            if(bin > thr || (bin == thr && r == 3))
+            if(bin > thr)
             {
                 const uint32_t p = atomicAdd(&s->emit, 1u);
                 if(p < TopK) { out_idx[p] = static_cast<int32_t>(idx) + out_base; }
+            }
+            else if(last && bin == thr)
+            {
+                // Survivors of the last round are numerically equal, so any
+                // `remain - above` of them completes the answer. They take the slots
+                // after the strictly-greater elements rather than racing them for
+                // the same cursor: sharing it lets a tie that arrives early consume
+                // a slot belonging to an element that outranks it, which drops that
+                // element from the result entirely.
+                const uint32_t p = atomicAdd(&s->emit_eq, 1u);
+                if(p + above < remain)
+                {
+                    out_idx[base + above + p] = static_cast<int32_t>(idx) + out_base;
+                }
             }
         });
         __syncthreads();
@@ -540,16 +555,15 @@ refine_ties(CoopSmem<TopK, kHistBits, TieCap, BlockSize>* s,
 }
 
 // Fallback for when the threshold prefix held more than TieCap elements, so the tie
-// buffer could not hold the candidate set.
+// buffer could not hold the candidate set. It takes a row whose values agree in
+// their top 16 bits -- a relative spread under 2^-7 -- more than TieCap times.
 //
-// This is not a rare-but-harmless case: the coarse key is fp16, whose mantissa step
-// near 1.0 is 2^-10, so any row whose values span less than that collapses into a
-// single 16-bit key that neither coarse round can split. Truncating the buffer there
-// measured 4% recall -- not an approximation but a wrong answer. Re-reading the row
-// per round costs several extra passes, which is why it is reserved for the rows
-// that actually need it, but it restores exactness unconditionally: the refinement
-// runs on the full fp32 key, and once all 32 bits are resolved the survivors are
-// numerically equal and interchangeable.
+// Truncating the buffer instead is not an approximation but a wrong answer, so the
+// row is re-read once per refinement round rather than trusted. That keeps the
+// candidate set derived from the input itself, which is what makes the tie count
+// unbounded: nothing here caps how many elements may be equal, only how many may be
+// buffered. Once all 32 bits are resolved the survivors are numerically equal and
+// interchangeable.
 template <uint32_t TopK, uint32_t kHistBits, uint32_t TieCap, uint32_t BlockSize>
 __device__ __forceinline__ void
 refine_from_row(CoopSmem<TopK, kHistBits, TieCap, BlockSize>* s,
@@ -565,7 +579,7 @@ refine_from_row(CoopSmem<TopK, kHistBits, TieCap, BlockSize>* s,
         s,
         [&](auto fn) {
             scan_slice<BlockSize>(in, Slice{0u, row_len}, [&](float v, uint32_t gi) {
-                if((order_key16(v) >> tie_shift) == tie_prefix)
+                if((order_key_hi16(v) >> tie_shift) == tie_prefix)
                 {
                     fn(order_key32(v), gi);
                 }
@@ -609,7 +623,7 @@ __device__ void coop_topk_select(const CoopTopKParams<TopK>& params)
     }
 
     constexpr uint32_t kHistBins = 1u << kHistBits;
-    constexpr uint32_t kLowBits  = 16 - kHistBits;  // fp16 bits left after round 0
+    constexpr uint32_t kLowBits  = 16 - kHistBits;  // key bits left after round 0
     constexpr uint32_t kLowBins  = 1u << kLowBits;
     static_assert(kHistBits < 16, "round 0 must leave bits for round 1");
     static_assert(kLowBins <= kHistBins, "round 1 reuses the round 0 histogram");
@@ -634,9 +648,9 @@ __device__ void coop_topk_select(const CoopTopKParams<TopK>& params)
     }
     __syncthreads();
 
-    // Round 0: histogram the top kHistBits of the fp16 key over the whole row.
+    // Round 0: histogram the top kHistBits of the coarse key over the whole row.
     scan_row([&](float v, uint32_t) {
-        atomicAdd(&s.histogram[order_key16(v) >> kLowBits], 1u);
+        atomicAdd(&s.histogram[order_key_hi16(v) >> kLowBits], 1u);
     });
     __syncthreads();
 
@@ -660,10 +674,10 @@ __device__ void coop_topk_select(const CoopTopKParams<TopK>& params)
         }
         __syncthreads();
 
-        // Round 1: resolve the remaining fp16 bits, but only among round 0's
+        // Round 1: resolve the remaining coarse-key bits, but only among round 0's
         // threshold bin.
         scan_row([&](float v, uint32_t) {
-            const uint32_t key = order_key16(v);
+            const uint32_t key = order_key_hi16(v);
             if((key >> kLowBits) == thr0)
             {
                 atomicAdd(&s.histogram[key & (kLowBins - 1)], 1u);
@@ -706,9 +720,9 @@ __device__ void coop_topk_select(const CoopTopKParams<TopK>& params)
 
     // Scatter. Everything above the resolved prefix is a winner outright and goes
     // straight to global; everything equal to it becomes a tie. Monotonicity of
-    // order_key16 is what makes this three-way split correct.
+    // order_key_hi16 is what makes this three-way split correct.
     scan_row([&](float v, uint32_t gi) {
-        const uint32_t kb = order_key16(v) >> tie_shift;
+        const uint32_t kb = order_key_hi16(v) >> tie_shift;
         if(kb > tie_prefix)
         {
             out[atomicAdd(&s.cnt_gt, 1u)] = static_cast<int32_t>(gi) + out_base;
@@ -796,7 +810,7 @@ struct RowState
 {
     uint32_t thr0, above0, bin0_count, need1;
     // The prefix the coarse rounds resolved to, and the shift that makes an
-    // order_key16 comparable to it. Written by scatter, read by refinement so it
+    // order_key_hi16 comparable to it. Written by scatter, read by refinement so it
     // can reconstruct the candidate set from the row if the tie buffer overflowed.
     uint32_t prefix, shift;
 };
@@ -946,7 +960,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_hist0(CoopMbParams<TopK> p,
 
     const float* in = p.input + row * p.stride + row_start;
     scan_slice<BlockSize>(in, slice_of(row_len, g, G), [&](float v, uint32_t) {
-        atomicAdd(&hist[order_key16(v) >> kLowBits], 1u);
+        atomicAdd(&hist[order_key_hi16(v) >> kLowBits], 1u);
     });
     __syncthreads();
 
@@ -1006,7 +1020,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_hist1(CoopMbParams<TopK> p,
 
     const float* in = p.input + row * p.stride + row_start;
     scan_slice<BlockSize>(in, slice_of(row_len, g, G), [&](float v, uint32_t) {
-        const uint32_t key = order_key16(v);
+        const uint32_t key = order_key_hi16(v);
         if((key >> kLowBits) == thr0) { atomicAdd(&low[key & (kLowBins - 1)], 1u); }
     });
     __syncthreads();
@@ -1085,7 +1099,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_scatter(CoopMbParams<TopK> 
 
     uint32_t my_w = 0, my_t = 0;
     scan_slice<BlockSize>(in, sl, [&](float v, uint32_t) {
-        const uint32_t kb = order_key16(v) >> shift;
+        const uint32_t kb = order_key_hi16(v) >> shift;
         my_w += (kb > prefix);
         my_t += (kb == prefix);
     });
@@ -1103,7 +1117,7 @@ __global__ __launch_bounds__(BlockSize) void coop_mb_scatter(CoopMbParams<TopK> 
 
     uint32_t wcur = s_wbase + off_w, tcur = s_tbase + off_t;
     scan_slice<BlockSize>(in, sl, [&](float v, uint32_t gi) {
-        const uint32_t kb = order_key16(v) >> shift;
+        const uint32_t kb = order_key_hi16(v) >> shift;
         if(kb > prefix)
         {
             if(wcur < TopK) { out[wcur] = static_cast<int32_t>(gi) + out_base; }
@@ -1140,7 +1154,7 @@ __device__ void coop_mb_refine_row(const CoopMbParams<TopK>& p)
 
     if(eq_full > TieCap)
     {
-        // Same fp16-collapse fallback as the one-block kernel: rebuild the
+        // Same overflow fallback as the one-block kernel: rebuild the
         // candidate set from the row rather than trusting the truncated buffer.
         if(tx == 0 && p.overflow) { atomicAdd(p.overflow, 1); }
         const RowState st = *r.state;
