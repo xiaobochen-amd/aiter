@@ -2880,9 +2880,23 @@ static void* coop_scratch(int batch)
     static size_t have = 0;
     const size_t want  = CoopWs::bytes(static_cast<size_t>(batch));
     if(want > have) {
-        if(buf) (void)hipFree(buf);
-        if(hipMalloc(&buf, want) != hipSuccess) { buf = nullptr; have = 0; return nullptr; }
-        have = want;
+        // A HIP graph captured while `buf` was current bakes this pointer into its
+        // kernel params AND into the hipMemsetAsync below. hipFree()ing it here
+        // leaves every such graph writing to freed VA; once the block is large
+        // enough to own its own mapping that is a Memory access fault on replay.
+        // Retire the old buffer instead of freeing it -- growth is monotone and
+        // driven by the largest batch seen, so the retained set stays small.
+        // Round up to a power of two so a slowly growing batch retires O(log n)
+        // buffers rather than one per step; the retained total stays below the
+        // live allocation.
+        static std::vector<void*> retired;
+        size_t rounded = size_t{1} << 20;
+        while(rounded < want) { rounded <<= 1; }
+        void* nbuf = nullptr;
+        if(hipMalloc(&nbuf, rounded) != hipSuccess) { return nullptr; }
+        if(buf) { retired.push_back(buf); }
+        buf  = nbuf;
+        have = rounded;
     }
     return buf;
 }
