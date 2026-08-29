@@ -2869,23 +2869,15 @@ static int coop_grid_split(int batch, int64_t row_len)
     return g < kMinSplit ? 0 : g;
 }
 
-// Scratch for the row-split path. The caller-provided workspace is sized on the
-// Python side for the mb/ob layouts, so this path cannot borrow it without changing
-// that contract; while coop is opt-in it grows its own buffer instead. Wiring it
-// through top_k_per_row_prefill's workspace argument is the remaining step before
-// this can be a default.
-static void* coop_scratch(int batch)
-{
-    static void* buf   = nullptr;
-    static size_t have = 0;
-    const size_t want  = CoopWs::bytes(static_cast<size_t>(batch));
-    if(want > have) {
-        if(buf) (void)hipFree(buf);
-        if(hipMalloc(&buf, want) != hipSuccess) { buf = nullptr; have = 0; return nullptr; }
-        have = want;
-    }
-    return buf;
-}
+// The row-split path's scratch now comes from the caller, like the mb/ob paths:
+// Python asks dsa_topk_workspace_size(), allocates a torch tensor and passes it
+// in. It used to grow a process-level static buffer with hipMalloc and hipFree
+// the old block, but that address is baked into every HIP graph captured while
+// it was current -- both as CoopTopKParams::ws and as the destination of the
+// hipMemsetAsync below -- so the free left those graphs writing to address space
+// the allocator no longer owned. Under 2 MiB the freed block stayed mapped in a
+// reserved arena and the stale write landed silently on whatever got the memory
+// next; at or above 2 MiB the free unmapped it and the next replay faulted.
 
 // page_table null selects raw positions; non-null makes the kernel emit the
 // physical KV slot instead, which is the DSA indexer's actual output. page_size
@@ -2983,6 +2975,15 @@ static void launch(const float* in,
 // against a page table that still has one row per sequence, and ptRowMap is what
 // lets those shapes use this kernel rather than falling back to the unfused chain.
 //
+// Bytes the row-split (coop) path needs for this shape, or 0 when the shape does
+// not take it. Mirrors topk_mb_workspace_size so the caller owns the lifetime.
+int64_t dsa_topk_workspace_size(int64_t numRows, int64_t stride0)
+{
+    if(numRows <= 0) { return 0; }
+    if(aiter::coop::coop_grid_split(static_cast<int>(numRows), stride0) == 0) { return 0; }
+    return static_cast<int64_t>(aiter::coop::CoopWs::bytes(static_cast<size_t>(numRows)));
+}
+
 // A ctypes entry like the *_fast paths in topk.py: per-call binding cost is a
 // visible fraction of a 20 us op.
 void dsa_topk_transform(const aiter_tensor_t& logits,
@@ -2993,7 +2994,8 @@ void dsa_topk_transform(const aiter_tensor_t& logits,
                         aiter_tensor_t& indices,
                         int64_t numRows,
                         int64_t pageSize,
-                        int64_t k)
+                        int64_t k,
+                        std::optional<aiter_tensor_t> workspace)
 {
     if(numRows <= 0) { return; }
     AITER_CHECK(k == 2048, "dsa_topk_transform is instantiated for k=2048 only");
@@ -3009,7 +3011,7 @@ void dsa_topk_transform(const aiter_tensor_t& logits,
                         rowStarts.has_value() ? static_cast<int*>(rowStarts->data_ptr()) : nullptr,
                         static_cast<int*>(rowEnds.data_ptr()),
                         /*overflow=*/nullptr,
-                        aiter::coop::coop_scratch(batch),
+                        workspace.has_value() ? workspace->data_ptr() : nullptr,
                         batch,
                         logits.stride(0),
                         /*row_len_hint=*/logits.stride(0),

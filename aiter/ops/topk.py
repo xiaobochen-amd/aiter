@@ -330,7 +330,11 @@ def topk_ob_workspace_size(
 def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
 
 
-@functools.lru_cache(maxsize=16)
+# Unbounded on purpose: an LRU eviction here frees a tensor whose address may be
+# baked into a captured HIP graph, which is the same failure mode the coop path
+# had. The power-of-two bucketing below already caps the distinct sizes at
+# ~log2(max_size) per (device, stream), so the cache cannot grow without bound.
+@functools.lru_cache(maxsize=None)
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
@@ -359,6 +363,25 @@ def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:
     alloc = 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
     stream = torch.cuda.current_stream(device)
     return _get_topk_mb_workspace_keyed(device, stream.cuda_stream, alloc)
+
+
+@compile_ops("module_top_k_per_row", fc_name="dsa_topk_workspace_size")
+def _dsa_topk_workspace_size(numRows: int, stride0: int) -> int: ...
+
+
+# The row-split path's scratch is sized in C++ but owned here, so no kernel-side
+# static can be freed out from under a captured HIP graph. Everything below the
+# call site collapses into a single lru_cache lookup: the binding call, the
+# power-of-two bucketing and the tensor are all a pure function of
+# (device, stream, numRows, stride0), and this op is ~20-60 us, so a per-launch
+# round trip into C++ would be a visible fraction of it.
+@functools.lru_cache(maxsize=None)
+def _dsa_topk_workspace(device, stream_id: int, numRows: int, stride0: int):
+    size = _dsa_topk_workspace_size(numRows, stride0)
+    if size <= 0:
+        return None
+    alloc = 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
+    return _get_topk_mb_workspace_keyed(device, stream_id, alloc)
 
 
 def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
@@ -442,6 +465,7 @@ def _dsa_topk_transform(
     numRows: int,
     pageSize: int,
     k: int,
+    workspace: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -489,6 +513,7 @@ def dsa_topk_transform(
     broken by arrival order, so the emitted order is not deterministic across runs
     and a caller needing rank order must sort.
     """
+    num_rows = logits.shape[0]
     _dsa_topk_transform(
         logits,
         rowStarts,
@@ -496,9 +521,15 @@ def dsa_topk_transform(
         pageTable,
         ptRowMap,
         indices,
-        logits.shape[0],
+        num_rows,
         pageSize,
         k,
+        _dsa_topk_workspace(
+            logits.device,
+            torch.cuda.current_stream(logits.device).cuda_stream,
+            num_rows,
+            logits.stride(0),
+        ),
     )
     return indices
 
