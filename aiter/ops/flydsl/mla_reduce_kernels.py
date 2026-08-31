@@ -254,7 +254,11 @@ _ACTUAL_MAX_SPLITS_CACHE: collections.OrderedDict = collections.OrderedDict()
 _ACTUAL_MAX_SPLITS_CACHE_CAP = 512
 
 
-@functools.lru_cache(maxsize=16)
+# ni ranges over 1..33 (see the guard below), so a 16-entry cache starts
+# thrashing as soon as a process sees more than 16 distinct split counts.
+# Re-entering an evicted entry costs about 20 ms even with the on-disk cache
+# warm: a pure host stall with the GPU idle. Size the cache to the domain.
+@functools.lru_cache(maxsize=64)
 def _compile_sparse_decode_direct_combine(ni: int):
     if not 1 <= ni <= 33:
         raise ValueError(f"sparse decode split count must be 1..33, got {ni}")

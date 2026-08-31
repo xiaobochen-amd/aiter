@@ -61,7 +61,9 @@ def _mfma32(a, b, c):
     )
 
 
-@functools.lru_cache(maxsize=32)
+# ng ranges over 1..33, so 32 entries evict at the top of the domain and a
+# re-entry costs about 31 ms with the disk cache warm. Size to the domain.
+@functools.lru_cache(maxsize=64)
 def compile_sparse_mla_partial(
     ng: int,
     waves_per_eu: int = 1,
