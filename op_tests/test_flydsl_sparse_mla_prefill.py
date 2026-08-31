@@ -47,8 +47,8 @@ def _make_case(num_tokens, num_pages=4096, seed=1234):
     indices[:, -64:] = -1
     q = q.cuda()
     return (
-        q[:, :, :_V_HEAD_DIM].contiguous(),
-        q[:, :, _V_HEAD_DIM:].contiguous(),
+        q[:, :, :_V_HEAD_DIM],
+        q[:, :, _V_HEAD_DIM:],
         kv.cuda().contiguous(),
         indices.cuda(),
     )
@@ -78,14 +78,16 @@ def test_flydsl_sparse_mla_prefill_correctness():
     from aiter.ops.flydsl import flydsl_sparse_mla_prefill
 
     q_nope, q_rope, kv, indices = _make_case(512)
+    assert not q_nope.is_contiguous() and not q_rope.is_contiguous()
+    assert q_nope.stride() == q_rope.stride() == (16 * 576, 576, 1)
     actual = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, indices, _SOFTMAX_SCALE)
     torch.cuda.synchronize()
     token_ids = torch.linspace(0, 511, 16, device="cuda", dtype=torch.long)
     expected = _reference(q_nope, q_rope, kv, indices, token_ids)
     snr = _snr_db(actual[token_ids], expected)
-    assert snr >= _MIN_SNR_DB, (
-        f"SNR {snr:.6f} dB is below the {_MIN_SNR_DB} dB no-regression gate"
-    )
+    assert (
+        snr >= _MIN_SNR_DB
+    ), f"SNR {snr:.6f} dB is below the {_MIN_SNR_DB} dB no-regression gate"
 
 
 def test_flydsl_sparse_mla_prefill_cuda_graph_replay():

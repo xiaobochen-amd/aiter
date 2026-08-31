@@ -96,6 +96,10 @@ def _compile_sparse_mla_prefill():
         kv: fx.Tensor,
         indices: fx.Tensor,
         out: fx.Tensor,
+        q_token_stride: fx.Int32,
+        q_head_stride: fx.Int32,
+        q_rope_token_stride: fx.Int32,
+        q_rope_head_stride: fx.Int32,
         scale_bits: fx.Int32,
     ):
         f32 = T.f32
@@ -146,8 +150,11 @@ def _compile_sparse_mla_prefill():
             return Vec(fx.memref_load_vec(fragment))
 
         # Q is the register-resident B operand for every QK tile.
-        q_base = (token * _NUM_HEADS + lane_col) * (_V_HEAD_DIM // 4)
-        q_rope_base = (token * _NUM_HEADS + lane_col) * (_ROPE_HEAD_DIM // 4)
+        # Strides are in i32 words. Production passes the two non-contiguous
+        # 512/64 views of one contiguous [T,16,576] FP8 tensor, while the public
+        # API also accepts separately contiguous tensors.
+        q_base = token * q_token_stride + lane_col * q_head_stride
+        q_rope_base = token * q_rope_token_stride + lane_col * q_rope_head_stride
         q_fragments = []
         for chunk in range_constexpr(4):
             low = load_i32_vector4(q_divided, q_base + 32 * chunk + 4 * lane_group)
@@ -490,6 +497,10 @@ def _compile_sparse_mla_prefill():
         kv: fx.Tensor,
         indices: fx.Tensor,
         out: fx.Tensor,
+        q_token_stride: fx.Int32,
+        q_head_stride: fx.Int32,
+        q_rope_token_stride: fx.Int32,
+        q_rope_head_stride: fx.Int32,
         scale_bits: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream,
@@ -500,6 +511,10 @@ def _compile_sparse_mla_prefill():
             kv,
             indices,
             out,
+            q_token_stride,
+            q_head_stride,
+            q_rope_token_stride,
+            q_rope_head_stride,
             scale_bits,
             value_attrs={
                 "rocdl.waves_per_eu": _WAVES_PER_EU,
@@ -527,6 +542,20 @@ def _require_tensor(tensor, *, name, shape, dtype, device, contiguous=True):
         raise ValueError(f"{name} must be contiguous")
 
 
+def _require_vector_load_layout(tensor, *, name):
+    """Require unit inner stride and i32-aligned outer strides, without copying."""
+    if tensor.stride(2) != 1 or tensor.stride(0) % 4 or tensor.stride(1) % 4:
+        raise ValueError(
+            f"{name} must have unit inner stride and 4-byte-aligned token/head "
+            f"strides, got {tensor.stride()}"
+        )
+
+
+def _pointer_tensor(tensor):
+    """A one-element byte view carrying only the original tensor's data pointer."""
+    return tensor.as_strided((1,), (1,)).view(torch.int8)
+
+
 def flydsl_sparse_mla_prefill(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -551,14 +580,18 @@ def flydsl_sparse_mla_prefill(
         shape=(num_tokens, _NUM_HEADS, _V_HEAD_DIM),
         dtype=fp8_dtype,
         device=device,
+        contiguous=False,
     )
+    _require_vector_load_layout(q_nope, name="q_nope")
     _require_tensor(
         q_rope,
         name="q_rope",
         shape=(num_tokens, _NUM_HEADS, _ROPE_HEAD_DIM),
         dtype=fp8_dtype,
         device=device,
+        contiguous=False,
     )
+    _require_vector_load_layout(q_rope, name="q_rope")
     if kv.ndim == 3 and kv.shape[1] == 1:
         kv = kv.squeeze(1)
     if kv.ndim != 2 or kv.shape[1] != _HEAD_DIM:
@@ -605,11 +638,15 @@ def flydsl_sparse_mla_prefill(
     with torch.cuda.device(device):
         _run_compiled(
             _compile_sparse_mla_prefill(),
-            q_nope.view(torch.int8).reshape(-1),
-            q_rope.view(torch.int8).reshape(-1),
+            _pointer_tensor(q_nope),
+            _pointer_tensor(q_rope),
             kv.view(torch.int8).reshape(-1),
             indices.reshape(-1),
             out.reshape(-1),
+            int(q_nope.stride(0) // 4),
+            int(q_nope.stride(1) // 4),
+            int(q_rope.stride(0) // 4),
+            int(q_rope.stride(1) // 4),
             scale_bits,
             int(num_tokens),
             fx.Stream(torch.cuda.current_stream(device=device)),
