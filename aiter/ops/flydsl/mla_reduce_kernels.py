@@ -15,14 +15,19 @@ from __future__ import annotations
 import collections
 import functools
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr.typing import T
 
 from .kernels.mla_reduce import (
     LDS_MAX_SPLITS,
     NUM_THREADS,
     Tier,
     _get_splitk_scratch,
+    _load_partial_out_narrow,
+    _pointer_buffer_tensor,
+    _store_final_out,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
     derive_actual_max_splits,
@@ -249,44 +254,127 @@ _ACTUAL_MAX_SPLITS_CACHE: collections.OrderedDict = collections.OrderedDict()
 _ACTUAL_MAX_SPLITS_CACHE_CAP = 512
 
 
-@functools.lru_cache(maxsize=64)
-def _sparse_decode_meta(seq: int, ni: int, device_index: int):
-    """Build reducer row maps for ``[seq, split, H, Dv]`` partials."""
-    device = torch.device("cuda", device_index)
-    indptr = (torch.arange(seq + 1, dtype=torch.int32, device=device) * ni).contiguous()
-    partial_map = torch.arange(seq * ni, dtype=torch.int32, device=device)
-    final_map = torch.stack(
-        (
-            torch.arange(seq, dtype=torch.int32, device=device),
-            torch.arange(1, seq + 1, dtype=torch.int32, device=device),
-        ),
-        dim=1,
-    ).contiguous()
-    return indptr, partial_map, final_map
-
-
 @functools.lru_cache(maxsize=16)
-def _compile_sparse_decode_combine(H: int, Dv: int):
-    return compile_mla_reduce(
-        H=H,
-        Dv=Dv,
-        out_dtype="bf16",
-        tier=Tier.ALL,
-        persistent=False,
-        output_lse=False,
-        use_reduce_final_map=True,
-        waves_per_eu=4,
-        adaptive=False,
-        low_direct_pmap_thr=0,
-        partial_dtype="bf16",
-        lse_base2=True,
-        num_threads=128,
-        m64_hi_grp=16,
-        dv_split=4,
+def _compile_sparse_decode_direct_combine(ni: int):
+    if not 1 <= ni <= 33:
+        raise ValueError(f"sparse decode split count must be 1..33, got {ni}")
+
+    @flyc.kernel(
+        name=f"flydsl_sparse_mla_decode_combine_ni{ni}",
+        known_block_size=[256, 1, 1],
     )
+    def kernel(
+        partial_output: fx.Pointer,
+        partial_lse: fx.Pointer,
+        final_output: fx.Pointer,
+        seq: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        wave = tid // fx.Int32(64)
+        lane = tid % fx.Int32(64)
+        row = fx.Int32(fx.block_idx.x) // fx.Int32(4)
+        head_base = (fx.Int32(fx.block_idx.x) % fx.Int32(4)) * fx.Int32(4)
+        head = head_base + wave
+        scale_storage = fx.SharedAllocator(static=False).allocate(4 * 33 * 4, alignment=16)
+        scale_base = fx.index_cast(T.i32, fx.ptrtoint(scale_storage._ptr))
+        scale_ptr_ty = fx.PointerType.get(
+            elem_ty=T.f32,
+            address_space=fx.AddressSpace.Shared,
+            alignment=16,
+        )
+        scale_ptr = fx.inttoptr(scale_ptr_ty, scale_base)
+        partial_buf = _pointer_buffer_tensor(
+            partial_output,
+            fx.BFloat16,
+            (seq * fx.Int32(ni), 16, 512),
+            (16 * 512, 512, 1),
+        )
+        final_buf = _pointer_buffer_tensor(
+            final_output,
+            fx.BFloat16,
+            (seq, 16, 512),
+            (16 * 512, 512, 1),
+        )
 
+        in_split = lane < fx.Int32(ni)
+        safe_split = in_split.select(lane, fx.Int32(0))
+        lse = fx.Float32(
+            fx.ptr_load(
+                partial_lse
+                + (
+                    (fx.Int64(row) * ni + fx.Int64(safe_split)) * 16
+                    + fx.Int64(head)
+                )
+            )
+        )
+        neg_inf = fx.Float32(float("-inf"))
+        zero = fx.Float32(0.0)
+        lse = in_split.select(lse, neg_inf)
+        max_lse = lse
+        for off in [32, 16, 8, 4, 2, 1]:
+            peer = fx.Float32(max_lse).shuffle_xor(
+                fx.Int32(off), fx.Int32(64)
+            )
+            max_lse = fx.Float32(max_lse).maximumf(peer)
+        scale = fx.Float32(fx.rocdl.exp2(T.f32, (lse - max_lse).ir_value()))
+        scale = in_split.select(scale, zero)
+        denom = scale
+        for off in [32, 16, 8, 4, 2, 1]:
+            peer = fx.Float32(denom).shuffle_xor(
+                fx.Int32(off), fx.Int32(64)
+            )
+            denom = denom + peer
+        inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
+        if in_split:
+            fx.ptr_store(scale * inv, scale_ptr + wave * fx.Int32(33) + lane)
+        fx.gpu.barrier()
 
-_SPARSE_DECODE_DUMMY_LSE: dict[int, torch.Tensor] = {}
+        acc = [fx.Float32(0.0) for _ in fx.range_constexpr(8)]
+        for split in fx.range_constexpr(ni):
+            vals = _load_partial_out_narrow(
+                partial_buf,
+                row * fx.Int32(ni) + fx.Int32(split),
+                head,
+                lane,
+                8,
+                fx.BFloat16,
+            )
+            scale = fx.Float32(0.0)
+            if lane == fx.Int32(0):
+                scale = fx.Float32(
+                    fx.ptr_load(scale_ptr + wave * fx.Int32(33) + fx.Int32(split))
+                )
+            scale = fx.Float32(fx.rocdl.readfirstlane(T.f32, scale.ir_value()))
+            acc = [
+                acc[i] + vals[i] * scale
+                for i in fx.range_constexpr(8)
+            ]
+        _store_final_out(
+            final_buf,
+            row,
+            head,
+            lane,
+            acc,
+            8,
+            fx.BFloat16,
+        )
+
+    @flyc.jit
+    def launch(
+        partial_output: fx.Pointer,
+        partial_lse: fx.Pointer,
+        final_output: fx.Pointer,
+        seq: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(partial_output, partial_lse, final_output, seq).launch(
+            grid=(seq * fx.Int32(4), 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
+            value_attrs={"rocdl.waves_per_eu": 4},
+        )
+
+    return launch
 
 
 def _flydsl_sparse_mla_decode_combine(
@@ -334,35 +422,13 @@ def _flydsl_sparse_mla_decode_combine(
         final_output.copy_(partial_output[:, :, 0])
         return
 
-    device_index = final_output.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    indptr, partial_map, final_map = _sparse_decode_meta(seq, ni, device_index)
-    kernel = _compile_sparse_decode_combine(H, Dv)
-    dummy_lse = _SPARSE_DECODE_DUMMY_LSE.get(device_index)
-    if dummy_lse is None:
-        dummy_lse = torch.empty(1, dtype=torch.float32, device=final_output.device)
-        _SPARSE_DECODE_DUMMY_LSE[device_index] = dummy_lse
-
-    po = partial_output.view(seq * ni, H, Dv)
-    pl = partial_lse.view(seq * ni, H)
-    fo = final_output.view(seq, H, Dv)
+    direct = _compile_sparse_decode_direct_combine(ni)
     _run_compiled(
-        kernel,
-        _pointer_arg(po, torch.bfloat16),
-        _pointer_arg(pl, torch.float32),
-        _pointer_arg(indptr, torch.int32),
-        _pointer_arg(partial_map, torch.int32),
-        _pointer_arg(final_map, torch.int32),
-        _pointer_arg(fo, torch.bfloat16),
-        _pointer_arg(dummy_lse, torch.float32),
-        int(fo.stride(-3)),
-        int(fo.stride(-2)),
-        int(torch.cuda.get_device_properties(device_index).multi_processor_count),
+        direct,
+        _pointer_arg(partial_output, torch.bfloat16),
+        _pointer_arg(partial_lse, torch.float32),
+        _pointer_arg(final_output, torch.bfloat16),
         int(seq),
-        1,
-        int(po.size(0)),
-        int(fo.size(0)),
         fx.Stream(torch.cuda.current_stream(final_output.device)),
     )
 
