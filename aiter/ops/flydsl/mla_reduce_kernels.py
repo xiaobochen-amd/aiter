@@ -13,6 +13,7 @@ kernel, device-side per-tile tier selection) mirrors HIP.
 from __future__ import annotations
 
 import collections
+import functools
 
 import flydsl.expr as fx
 import torch
@@ -32,6 +33,7 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 __all__ = [
     "flydsl_mla_reduce_v1",
+    "flydsl_sparse_mla_decode_combine",
 ]
 
 
@@ -100,7 +102,7 @@ def _validate_actual_max_splits(actual_max_splits: int | None) -> None:
         return
     if isinstance(actual_max_splits, bool) or not isinstance(actual_max_splits, int):
         raise TypeError(
-            "`actual_max_splits` must be an int or None, " f"got {actual_max_splits!r}"
+            f"`actual_max_splits` must be an int or None, got {actual_max_splits!r}"
         )
     if not 0 <= actual_max_splits <= LDS_MAX_SPLITS:
         raise ValueError(
@@ -227,7 +229,7 @@ def _validate_mla_reduce_inputs(
         raise TypeError(f"`num_kv_splits` must be an int, got {num_kv_splits!r}")
     if not 0 <= num_kv_splits <= LDS_MAX_SPLITS:
         raise ValueError(
-            f"`num_kv_splits` must be in [0, {LDS_MAX_SPLITS}], " f"got {num_kv_splits}"
+            f"`num_kv_splits` must be in [0, {LDS_MAX_SPLITS}], got {num_kv_splits}"
         )
     if Dv % NUM_THREADS != 0:
         raise ValueError(
@@ -246,6 +248,124 @@ def _validate_mla_reduce_inputs(
 # Cache mapping reduce_indptr buffer identity -> derived actual_max_splits.
 _ACTUAL_MAX_SPLITS_CACHE: collections.OrderedDict = collections.OrderedDict()
 _ACTUAL_MAX_SPLITS_CACHE_CAP = 512
+
+
+@functools.lru_cache(maxsize=64)
+def _sparse_decode_meta(seq: int, ni: int, device_index: int):
+    """Lossless row mapping for TileLang [seq, split, H, Dv] partials."""
+    device = torch.device("cuda", device_index)
+    indptr = (torch.arange(seq + 1, dtype=torch.int32, device=device) * ni).contiguous()
+    partial_map = torch.arange(seq * ni, dtype=torch.int32, device=device)
+    final_map = torch.stack(
+        (
+            torch.arange(seq, dtype=torch.int32, device=device),
+            torch.arange(1, seq + 1, dtype=torch.int32, device=device),
+        ),
+        dim=1,
+    ).contiguous()
+    return indptr, partial_map, final_map
+
+
+@functools.lru_cache(maxsize=16)
+def _compile_sparse_decode_combine(H: int, Dv: int):
+    return compile_mla_reduce(
+        H=H,
+        Dv=Dv,
+        out_dtype="bf16",
+        tier=Tier.ALL,
+        persistent=False,
+        output_lse=False,
+        use_reduce_final_map=True,
+        waves_per_eu=4,
+        adaptive=False,
+        low_direct_pmap_thr=0,
+        partial_dtype="bf16",
+        lse_base2=True,
+        num_threads=64,
+        m64_hi_grp=16,
+        dv_split=8,
+    )
+
+
+_SPARSE_DECODE_DUMMY_LSE: dict[int, torch.Tensor] = {}
+
+
+def flydsl_sparse_mla_decode_combine(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    final_output: torch.Tensor,
+) -> None:
+    """Combine exact sparse-decode BF16 partials and log2 FP32 LSEs."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("FlyDSL sparse MLA decode requires ROCm")
+    tensors = (partial_output, partial_lse, final_output)
+    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
+        raise ValueError("sparse MLA decode tensors must be contiguous ROCm tensors")
+    if partial_output.dtype != torch.bfloat16:
+        raise TypeError(f"partial_output must be bf16, got {partial_output.dtype}")
+    if partial_lse.dtype != torch.float32 or final_output.dtype != torch.bfloat16:
+        raise TypeError("partial_lse must be fp32 and final_output must be bf16")
+    if partial_output.ndim != 5 or partial_lse.ndim != 4 or final_output.ndim != 4:
+        raise ValueError("expected partial_output/partial_lse/final_output ranks 5/4/4")
+    b, seq, ni, H, Dv = partial_output.shape
+    if b != 1 or seq not in (1, 6) or not 1 <= ni <= 33 or (H, Dv) != (16, 512):
+        raise ValueError(
+            "supported sparse decode scope is b=1, seq in {1,6}, "
+            f"1<=splits<=33, H=16, Dv=512; got {tuple(partial_output.shape)}"
+        )
+    if tuple(partial_lse.shape) != (b, seq, ni, H):
+        raise ValueError("partial_lse shape does not match partial_output")
+    if tuple(final_output.shape) != (b, seq, H, Dv):
+        raise ValueError("final_output shape does not match partial_output")
+    if not (partial_output.device == partial_lse.device == final_output.device):
+        raise ValueError("all sparse decode tensors must be on the same device")
+    arch = str(torch.cuda.get_device_properties(final_output.device).gcnArchName).split(
+        ":"
+    )[0]
+    if arch != "gfx950":
+        raise ValueError(
+            f"sparse decode BF16-direct reduce is gated to gfx950, got {arch}"
+        )
+
+    # A one-split softmax is already fully reduced by the partial kernel.  The
+    # generic reducer is tuned for multiple splits and its Dv-split launch
+    # intentionally has no single-split specialization.  A device copy keeps
+    # this edge case exact and remains safe under graph capture/replay.
+    if ni == 1:
+        final_output.copy_(partial_output[:, :, 0])
+        return
+
+    device_index = final_output.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    indptr, partial_map, final_map = _sparse_decode_meta(seq, ni, device_index)
+    kernel = _compile_sparse_decode_combine(H, Dv)
+    dummy_lse = _SPARSE_DECODE_DUMMY_LSE.get(device_index)
+    if dummy_lse is None:
+        dummy_lse = torch.empty(1, dtype=torch.float32, device=final_output.device)
+        _SPARSE_DECODE_DUMMY_LSE[device_index] = dummy_lse
+
+    po = partial_output.view(seq * ni, H, Dv)
+    pl = partial_lse.view(seq * ni, H)
+    fo = final_output.view(seq, H, Dv)
+    _run_compiled(
+        kernel,
+        _pointer_arg(po, torch.bfloat16),
+        _pointer_arg(pl, torch.float32),
+        _pointer_arg(indptr, torch.int32),
+        _pointer_arg(partial_map, torch.int32),
+        _pointer_arg(final_map, torch.int32),
+        _pointer_arg(fo, torch.bfloat16),
+        _pointer_arg(dummy_lse, torch.float32),
+        int(fo.stride(-3)),
+        int(fo.stride(-2)),
+        int(torch.cuda.get_device_properties(device_index).multi_processor_count),
+        int(seq),
+        1,
+        int(po.size(0)),
+        int(fo.size(0)),
+        fx.Stream(torch.cuda.current_stream(final_output.device)),
+    )
 
 
 def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:

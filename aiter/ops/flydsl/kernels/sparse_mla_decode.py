@@ -1,0 +1,336 @@
+# SPDX-License-Identifier: MIT
+
+"""Exact-contract sparse MLA decode producer implemented in FlyDSL.
+
+The producer preserves the production contract's original 64-key split
+boundaries, BF16 split-local rounding, and log2-domain FP32 LSE. The retained
+PR path pairs it with AITER's generalized BF16/log2 reduce launcher rather than
+carrying a second decode-specific combine kernel.
+"""
+
+# FlyDSL kernel annotations must be evaluated eagerly.
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import math as fly_math
+from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.typing import T
+
+H = 16
+DV = 512
+DT = 64
+DIM = DV + DT
+BLOCK_I = 64
+FP8_MAX = 448.0
+PARTIAL_THREADS = 256
+PARTIAL_WAVES = 4
+PITCH = DV + 16
+
+
+def _exp2(value):
+    return fx.Float32(fx.rocdl.exp2(T.f32, fx.Float32(value).ir_value()))
+
+
+def _pack_i32x2(lo, hi):
+    return fx.Vector.from_elements([lo, hi], fx.Int32).bitcast(fx.Int64)[0]
+
+
+def _mfma128(a, b, c):
+    """gfx950 full-rate FP8 MFMA with unity scales (ABID=0)."""
+    return fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+        T.f32x4,
+        [a, b, c, 0, 0, 0, fx.Int32(0), 0, fx.Int32(0)],
+    )
+
+
+def _mfma32(a, b, c):
+    return fx.rocdl.mfma_f32_16x16x32_fp8_fp8(
+        T.f32x4, [_pack_i32x2(a[0], a[1]), _pack_i32x2(b[0], b[1]), c, 0, 0, 0]
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def compile_sparse_mla_partial(
+    ng: int,
+    waves_per_eu: int = 1,
+):
+    """Compile the exact 64-key C25 producer in FlyDSL.
+
+    Four waves cooperatively cover all 64 selected keys and all 512 output
+    columns. Q is published once per workgroup in LDS. Every split writes a
+    BF16 partial plus a log2-domain FP32 LSE, preserving the production tree.
+    """
+    if not 1 <= ng <= 33:
+        raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
+
+    @fx.struct
+    class PartialStorage:
+        vlds: fx.Array[fx.Uint8, BLOCK_I * PITCH, 16]
+        rmax: fx.Array[fx.Float32, PARTIAL_WAVES * H, 16]
+        rsum: fx.Array[fx.Float32, PARTIAL_WAVES * H, 16]
+        plds: fx.Array[fx.Uint8, BLOCK_I * H, 16]
+        ilds: fx.Array[fx.Int32, BLOCK_I, 16]
+        qlds: fx.Array[fx.Uint8, 64 * 144, 16]
+
+    attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
+
+    @flyc.kernel(
+        name=f"flydsl_sparse_mla_partial_ng{ng}",
+        known_block_size=[PARTIAL_THREADS, 1, 1],
+    )
+    def kernel(
+        q_ptr: fx.Pointer,
+        kv_ptr: fx.Pointer,
+        index_ptr: fx.Pointer,
+        partial_ptr: fx.Pointer,
+        lse_ptr: fx.Pointer,
+        scale_log2e: fx.Float32,
+        seq: fx.Int32,
+    ):
+        v4u8_t = fx.Vector.make_type(16, fx.Uint8)
+        v2i32_t = fx.Vector.make_type(2, fx.Int32)
+        tid = fx.Int32(fx.thread_idx.x)
+        wave = tid // fx.Int32(64)
+        lane = tid % fx.Int32(64)
+        group = lane // fx.Int32(16)
+        head = lane % fx.Int32(16)
+        owner = fx.Int32(fx.block_idx.x)
+        tok = owner // fx.Int32(ng)
+        split = owner % fx.Int32(ng)
+        producer_active = fx.Int32(1) == fx.Int32(1)
+        lds = fx.SharedAllocator().allocate(PartialStorage).peek()
+
+        def load16(ptr, offset):
+            return fx.ptr_load(ptr + fx.Int64(offset), result_type=v4u8_t).bitcast(
+                fx.Int32
+            )
+
+        def join8(lo, hi):
+            return fx.Vector.from_elements(
+                [lo[i] for i in fx.range_constexpr(4)]
+                + [hi[i] for i in fx.range_constexpr(4)],
+                fx.Int32,
+            )
+
+        # This predicate is uniformly true. Keeping the producer in one DSL
+        # region avoids branch-local SSA values in the traced kernel.
+        if producer_active:
+            # C25 query publication: wave zero performs the global reads once;
+            # all waves consume the same lane-major fragments from LDS.
+            q_base = (fx.Int64(tok) * H + fx.Int64(head)) * DIM
+            qlane = lds.qlds.ptr + lane * fx.Int32(144)
+            if wave == fx.Int32(0):
+                for cc in fx.range_constexpr(4):
+                    lo = load16(q_ptr, q_base + cc * 128 + fx.Int64(group) * 16)
+                    hi = load16(q_ptr, q_base + cc * 128 + 64 + fx.Int64(group) * 16)
+                    fx.ptr_store(lo.bitcast(fx.Uint8), qlane + fx.Int32(cc * 32))
+                    fx.ptr_store(hi.bitcast(fx.Uint8), qlane + fx.Int32(cc * 32 + 16))
+                tail = load16(q_ptr, q_base + DV + fx.Int64(group) * 16)
+                fx.ptr_store(tail.bitcast(fx.Uint8), qlane + fx.Int32(128))
+            fx.gpu.barrier()
+
+            bq = [None] * 5
+            for cc in fx.range_constexpr(4):
+                lo = fx.ptr_load(qlane + fx.Int32(cc * 32), result_type=v4u8_t).bitcast(
+                    fx.Int32
+                )
+                hi = fx.ptr_load(
+                    qlane + fx.Int32(cc * 32 + 16), result_type=v4u8_t
+                ).bitcast(fx.Int32)
+                bq[cc] = join8(lo, hi)
+            tail = fx.ptr_load(qlane + fx.Int32(128), result_type=v4u8_t).bitcast(
+                fx.Int32
+            )
+            bq[4] = fx.Vector.from_elements(
+                [tail[i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
+                fx.Int32,
+            )
+
+            # keyslot<64,1>(wave, head): exact C25 QK-to-PV lane permutation.
+            slot = (
+                fx.Int32(32) * (wave // fx.Int32(2))
+                + fx.Int32(8) * (head // fx.Int32(4))
+                + fx.Int32(4) * (wave % fx.Int32(2))
+                + head % fx.Int32(4)
+            )
+            index_offset = (
+                fx.Int64(tok) * (ng * BLOCK_I)
+                + fx.Int64(split * BLOCK_I)
+                + fx.Int64(slot)
+            )
+            row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
+            lds.ilds[slot] = row
+            safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
+            kv_base = fx.Int64(safe_row) * DIM
+
+            alo = [None] * 5
+            ahi = [None] * 4
+            for cc in fx.range_constexpr(4):
+                alo[cc] = load16(kv_ptr, kv_base + cc * 128 + fx.Int64(group) * 16)
+                ahi[cc] = load16(kv_ptr, kv_base + cc * 128 + 64 + fx.Int64(group) * 16)
+            alo[4] = load16(kv_ptr, kv_base + DV + fx.Int64(group) * 16)
+
+            score = fx.Vector.filled(4, 0.0, fx.Float32)
+            for cc in fx.range_constexpr(4):
+                score = _mfma128(join8(alo[cc], ahi[cc]), bq[cc], score)
+            score = _mfma128(
+                fx.Vector.from_elements(
+                    [alo[4][i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
+                    fx.Int32,
+                ),
+                bq[4],
+                score,
+            )
+
+            # One key-major FP8 V tile feeds the transpose reads for PV.
+            for cc in fx.range_constexpr(4):
+                vbase = (
+                    lds.vlds.ptr
+                    + slot * fx.Int32(PITCH)
+                    + fx.Int32(cc * 128)
+                    + group * fx.Int32(16)
+                )
+                fx.ptr_store(alo[cc].bitcast(fx.Uint8), vbase)
+                fx.ptr_store(ahi[cc].bitcast(fx.Uint8), vbase + fx.Int32(64))
+
+            ids = fx.ptr_load(
+                lds.ilds.ptr
+                + fx.Int32(32) * (wave // fx.Int32(2))
+                + fx.Int32(8) * group
+                + fx.Int32(4) * (wave % fx.Int32(2)),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            qk = [None] * 4
+            for r in fx.range_constexpr(4):
+                qk[r] = (ids[r] >= fx.Int32(0)).select(
+                    fx.Float32(score[r]) * scale_log2e,
+                    fx.Float32(float("-inf")),
+                )
+            local_max = fx.Float32(float("-inf"))
+            for r in fx.range_constexpr(4):
+                local_max = local_max.maximumf(qk[r])
+            local_max = local_max.maximumf(
+                local_max.shuffle_xor(fx.Int32(16), fx.Int32(64))
+            )
+            local_max = local_max.maximumf(
+                local_max.shuffle_xor(fx.Int32(32), fx.Int32(64))
+            )
+            if lane < fx.Int32(16):
+                lds.rmax[wave * fx.Int32(H) + head] = local_max
+            fx.gpu.barrier()
+
+            split_max = fx.Float32(float("-inf"))
+            for ww in fx.range_constexpr(PARTIAL_WAVES):
+                split_max = split_max.maximumf(fx.Float32(lds.rmax[ww * H + head]))
+            max_safe = (split_max == fx.Float32(float("-inf"))).select(
+                fx.Float32(0.0), split_max
+            )
+            probs = [None] * 4
+            prob_sum = fx.Float32(0.0)
+            for r in fx.range_constexpr(4):
+                probs[r] = _exp2(qk[r] - max_safe)
+                prob_sum = prob_sum + probs[r]
+            packed = fx.rocdl.cvt_pk_fp8_f32(
+                T.i32,
+                probs[0] * fx.Float32(FP8_MAX),
+                probs[1] * fx.Float32(FP8_MAX),
+                fx.Int32(0),
+                False,
+            )
+            packed = fx.rocdl.cvt_pk_fp8_f32(
+                T.i32,
+                probs[2] * fx.Float32(FP8_MAX),
+                probs[3] * fx.Float32(FP8_MAX),
+                packed,
+                True,
+            )
+            fx.ptr_store(
+                fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.Uint8),
+                lds.plds.ptr + lane * fx.Int32(H) + wave * fx.Int32(4),
+            )
+            prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(16), fx.Int32(64))
+            prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(32), fx.Int32(64))
+            if lane < fx.Int32(16):
+                lds.rsum[wave * fx.Int32(H) + head] = prob_sum
+            fx.gpu.barrier()
+
+            denom = fx.Float32(0.0)
+            for ww in fx.range_constexpr(PARTIAL_WAVES):
+                denom = denom + fx.Float32(lds.rsum[ww * H + head])
+            inv = (denom == fx.Float32(0.0)).select(
+                fx.Float32(0.0),
+                fx.Float32(
+                    fx.rocdl.rcp(T.f32, (denom * fx.Float32(FP8_MAX)).ir_value())
+                ),
+            )
+            p4 = fx.ptr_load(
+                lds.plds.ptr + lane * fx.Int32(H),
+                result_type=fx.Vector.make_type(16, fx.Uint8),
+            ).bitcast(fx.Int32)
+            pvec = fx.Vector.from_elements(
+                [p4[i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
+                fx.Int32,
+            )
+            trbase = (fx.Int32(8) * group + head // fx.Int32(2)) * PITCH + fx.Int32(
+                8
+            ) * (head % fx.Int32(2))
+            out_record = (fx.Int64(tok) * ng + fx.Int64(split)) * H + fx.Int64(head)
+            for j in fx.range_constexpr(8):
+                dv_base = (wave * fx.Int32(8) + fx.Int32(j)) * 16
+                acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                for half in fx.range_constexpr(2):
+                    vptr = lds.vlds.ptr + trbase + dv_base + fx.Int32(half * 32 * PITCH)
+                    vaddr = fx.Int64(fx.ptrtoint(vptr))
+                    llvm_vptr = llvm.inttoptr(
+                        ir.Type.parse("!llvm.ptr<3>"), _raw(vaddr)
+                    )
+                    avec = fx.Vector(
+                        fx.rocdl.ds_read_tr8_b64(v2i32_t, llvm_vptr).result
+                    )
+                    bvec = fx.Vector.from_elements(
+                        [pvec[2 * half], pvec[2 * half + 1]], fx.Int32
+                    )
+                    acc = _mfma32(avec, bvec, acc)
+                out_col = dv_base + fx.Int32(4) * group
+                values = fx.Vector(acc) * inv
+                fx.ptr_store(
+                    values.to(fx.BFloat16),
+                    partial_ptr + out_record * DV + fx.Int64(out_col),
+                )
+
+            if wave == fx.Int32(0) and lane < fx.Int32(16):
+                lse = (denom == fx.Float32(0.0)).select(
+                    fx.Float32(-(2**30)), fly_math.log2(denom) + split_max
+                )
+                fx.ptr_store(lse, lse_ptr + out_record)
+
+    @flyc.jit
+    def launch(
+        q_ptr: fx.Pointer,
+        kv_ptr: fx.Pointer,
+        index_ptr: fx.Pointer,
+        partial_ptr: fx.Pointer,
+        lse_ptr: fx.Pointer,
+        scale_log2e: fx.Float32,
+        seq: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(
+            q_ptr,
+            kv_ptr,
+            index_ptr,
+            partial_ptr,
+            lse_ptr,
+            scale_log2e,
+            seq,
+        ).launch(
+            grid=(seq * fx.Int32(ng), 1, 1),
+            block=(PARTIAL_THREADS, 1, 1),
+            stream=stream,
+            value_attrs=attrs,
+        )
+
+    return launch
