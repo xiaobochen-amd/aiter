@@ -43,13 +43,9 @@ def _validate_sparse_decode_inputs(
     if q.ndim != 3 or tuple(q.shape[1:]) != (H, DIM):
         raise ValueError(f"q must have shape [seq,{H},{DIM}], got {tuple(q.shape)}")
     seq = int(q.shape[0])
-    # seq is a runtime scalar; the kernel is compiled per split count `ng`, not
-    # per seq. The production sizes through c=16 are correctness- and
-    # performance-gated against TileLang on MI355X. Other sizes remain excluded.
-    if not (1 <= seq <= 24 or seq in (48, 96)):
-        raise ValueError(
-            f"supported sparse decode seq values are 1..24, 48, and 96; got {seq}"
-        )
+    # seq is runtime; kernels are compiled per split count `ng`, not per seq.
+    if not 1 <= seq <= 96:
+        raise ValueError(f"supported sparse decode seq values are 1..96; got {seq}")
     if not (
         (kv.ndim == 2 and int(kv.shape[1]) == DIM)
         or (kv.ndim == 3 and tuple(kv.shape[1:]) == (1, DIM))

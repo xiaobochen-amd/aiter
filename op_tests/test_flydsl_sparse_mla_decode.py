@@ -37,6 +37,8 @@ class Case:
 CASES = (
     Case("seq1", seq=1, width=2048, valid=2048, context=62000, shift=0, seed=101),
     Case("primary", seq=6, width=2048, valid=2048, context=62000, shift=342, seed=102),
+    Case("seq30", seq=30, width=2048, valid=2048, context=62000, shift=137, seed=108),
+    Case("seq96", seq=96, width=2048, valid=2048, context=62000, shift=73, seed=109),
     Case("ctx64", seq=6, width=2048, valid=64, context=64, shift=0, seed=103),
     Case("ctx2000", seq=6, width=2048, valid=2000, context=2000, shift=88, seed=104),
     Case("ctx1", seq=6, width=2048, valid=1, context=1, shift=0, seed=105),

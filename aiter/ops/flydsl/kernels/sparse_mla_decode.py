@@ -4,13 +4,15 @@
 
 # FlyDSL kernel annotations must be evaluated eagerly.
 import functools
+from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import math as fly_math
-from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr import arith
+from flydsl.expr.arith import CmpIPredicate, _to_raw as _raw
 from flydsl.expr.typing import T
 
 H = 16
@@ -22,6 +24,19 @@ FP8_MAX = 448.0
 PARTIAL_THREADS = 256
 PARTIAL_WAVES = 4
 PITCH = DV + 16
+
+
+@contextmanager
+def _if_then(if_op):
+    with ir.InsertionPoint(if_op.then_block):
+        try:
+            yield if_op.then_block
+        finally:
+            block = if_op.then_block
+            if (not block.operations) or not isinstance(
+                block.operations[-1], scf.YieldOp
+            ):
+                scf.YieldOp([])
 
 
 def _exp2(value):
@@ -89,7 +104,6 @@ def compile_sparse_mla_partial(
         owner = fx.Int32(fx.block_idx.x)
         tok = owner // fx.Int32(ng)
         split = owner % fx.Int32(ng)
-        producer_active = fx.Int32(1) == fx.Int32(1)
         lds = fx.SharedAllocator().allocate(PartialStorage).peek()
 
         def load16(ptr, offset):
@@ -104,9 +118,9 @@ def compile_sparse_mla_partial(
                 fx.Int32,
             )
 
-        # This predicate is uniformly true. Keeping the producer in one DSL
-        # region avoids branch-local SSA values in the traced kernel.
-        if producer_active:
+        # Keep this as a compile-time region. A runtime guard here makes the
+        # FlyDSL rewriter capture LDS handles as branch state.
+        if fx.const_expr(True):
             # Wave zero publishes Q once; every wave reuses its lane-major LDS view.
             q_base = (fx.Int64(tok) * H + fx.Int64(head)) * DIM
             qlane = lds.qlds.ptr + lane * fx.Int32(144)
@@ -206,7 +220,15 @@ def compile_sparse_mla_partial(
             local_max = local_max.maximumf(
                 local_max.shuffle_xor(fx.Int32(32), fx.Int32(64))
             )
-            if lane < fx.Int32(16):
+            with _if_then(
+                scf.IfOp(
+                    arith.cmpi(
+                        CmpIPredicate.slt,
+                        _raw(lane),
+                        arith.constant(16, type=T.i32),
+                    )
+                )
+            ):
                 lds.rmax[wave * fx.Int32(H) + head] = local_max
             fx.gpu.barrier()
 
@@ -241,7 +263,15 @@ def compile_sparse_mla_partial(
             )
             prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(16), fx.Int32(64))
             prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(32), fx.Int32(64))
-            if lane < fx.Int32(16):
+            with _if_then(
+                scf.IfOp(
+                    arith.cmpi(
+                        CmpIPredicate.slt,
+                        _raw(lane),
+                        arith.constant(16, type=T.i32),
+                    )
+                )
+            ):
                 lds.rsum[wave * fx.Int32(H) + head] = prob_sum
             fx.gpu.barrier()
 
@@ -289,7 +319,22 @@ def compile_sparse_mla_partial(
                     partial_ptr + out_record * DV + fx.Int64(out_col),
                 )
 
-            if wave == fx.Int32(0) and lane < fx.Int32(16):
+            with _if_then(
+                scf.IfOp(
+                    arith.andi(
+                        arith.cmpi(
+                            CmpIPredicate.eq,
+                            _raw(wave),
+                            arith.constant(0, type=T.i32),
+                        ),
+                        arith.cmpi(
+                            CmpIPredicate.slt,
+                            _raw(lane),
+                            arith.constant(16, type=T.i32),
+                        ),
+                    )
+                )
+            ):
                 lse = (denom == fx.Float32(0.0)).select(
                     fx.Float32(-(2**30)), fly_math.log2(denom) + split_max
                 )
