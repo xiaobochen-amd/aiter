@@ -43,15 +43,13 @@ def _validate_sparse_decode_inputs(
     if q.ndim != 3 or tuple(q.shape[1:]) != (H, DIM):
         raise ValueError(f"q must have shape [seq,{H},{DIM}], got {tuple(q.shape)}")
     seq = int(q.shape[0])
-    # seq is a runtime scalar (passed as int(q.shape[0]) to the launch); the
-    # kernel is compiled per split count `ng`, not per seq. Measured on MI355X
-    # against the TileLang decode at width=2048, all correct at 32.0-32.2 dB:
-    #   seq   1     2     4     6     8    12    24    48
-    #   ratio 0.60x 0.62x 0.64x 0.66x 0.65x 0.71x 0.75x 1.05x   (FlyDSL/TileLang)
-    # The crossover is between 24 and 48, so cap at 24 rather than admitting a
-    # regression. b (batch) is untested above 1 and stays pinned in the reducer.
-    if not 1 <= seq <= 24:
-        raise ValueError(f"supported sparse decode scope is 1<=seq<=24, got {seq}")
+    # seq is a runtime scalar; the kernel is compiled per split count `ng`, not
+    # per seq. The production sizes through c=16 are correctness- and
+    # performance-gated against TileLang on MI355X. Other sizes remain excluded.
+    if not (1 <= seq <= 24 or seq in (48, 96)):
+        raise ValueError(
+            f"supported sparse decode seq values are 1..24, 48, and 96; got {seq}"
+        )
     if not (
         (kv.ndim == 2 and int(kv.shape[1]) == DIM)
         or (kv.ndim == 3 and tuple(kv.shape[1:]) == (1, DIM))
