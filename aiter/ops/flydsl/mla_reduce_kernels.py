@@ -307,9 +307,9 @@ def _flydsl_sparse_mla_decode_combine(
     if partial_output.ndim != 5 or partial_lse.ndim != 4 or final_output.ndim != 4:
         raise ValueError("expected partial_output/partial_lse/final_output ranks 5/4/4")
     b, seq, ni, H, Dv = partial_output.shape
-    if b != 1 or seq not in (1, 6) or not 1 <= ni <= 33 or (H, Dv) != (16, 512):
+    if b != 1 or not 1 <= seq <= 24 or not 1 <= ni <= 33 or (H, Dv) != (16, 512):
         raise ValueError(
-            "supported sparse decode scope is b=1, seq in {1,6}, "
+            "supported sparse decode scope is b=1, 1<=seq<=24, "
             f"1<=splits<=33, H=16, Dv=512; got {tuple(partial_output.shape)}"
         )
     if tuple(partial_lse.shape) != (b, seq, ni, H):
