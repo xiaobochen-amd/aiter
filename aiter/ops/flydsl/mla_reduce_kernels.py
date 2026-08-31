@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import functools
+import weakref
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -250,8 +251,24 @@ def _validate_mla_reduce_inputs(
 
 
 # Cache mapping reduce_indptr buffer identity -> derived actual_max_splits.
+#
+# The key carries data_ptr, but a raw pointer is not an identity: once a buffer
+# is freed the allocator hands the same address to the next tensor, and a stale
+# entry would then answer for a different CSR -- silently supplying the wrong
+# split bound to a launch that cannot re-derive it under graph capture. Each
+# entry therefore also holds a weak reference to the storage the pointer came
+# from; a hit is only honoured while that storage is still alive and still at
+# that address.
 _ACTUAL_MAX_SPLITS_CACHE: collections.OrderedDict = collections.OrderedDict()
 _ACTUAL_MAX_SPLITS_CACHE_CAP = 512
+
+
+def _storage_ref(t: torch.Tensor):
+    """Weak reference to the tensor's storage, or None if it cannot be taken."""
+    try:
+        return weakref.ref(t.untyped_storage())
+    except (AttributeError, TypeError):
+        return None
 
 
 # ni ranges over 1..33 (see the guard below), so a 16-entry cache starts
@@ -445,14 +462,34 @@ def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:
     it returns the cached value or ``None`` on a miss. The launch path rejects a
     cache miss before launch rather than using an unvalidated split bound.
     """
-    key = (reduce_indptr.data_ptr(), int(reduce_indptr.numel()))
-    if torch.cuda.is_current_stream_capturing():
-        return _ACTUAL_MAX_SPLITS_CACHE.get(key)
-    val = derive_actual_max_splits(reduce_indptr)
+    ptr = reduce_indptr.data_ptr()
+    key = (ptr, int(reduce_indptr.numel()))
     cache = _ACTUAL_MAX_SPLITS_CACHE
+
+    def _live(entry):
+        """True while the cached entry still describes this exact allocation."""
+        ref, cached_ptr, _ = entry
+        if ref is None:
+            return False
+        storage = ref()
+        return storage is not None and storage.data_ptr() == cached_ptr
+
+    if torch.cuda.is_current_stream_capturing():
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        if not _live(entry):
+            # The pointer was recycled: the buffer this value was derived from
+            # is gone. Report a miss -- the launch path rejects that rather than
+            # using an unvalidated bound.
+            del cache[key]
+            return None
+        return entry[2]
+
+    val = derive_actual_max_splits(reduce_indptr)
     if key in cache:
         cache.move_to_end(key)
-    cache[key] = val
+    cache[key] = (_storage_ref(reduce_indptr), ptr, val)
     if len(cache) > _ACTUAL_MAX_SPLITS_CACHE_CAP:
         cache.popitem(last=False)
     return val
