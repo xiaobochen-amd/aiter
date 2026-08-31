@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import functools
 from abc import ABC, abstractmethod
 
@@ -9,14 +10,49 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .tensor_shim import GTensor, get_dtype_in_kernel
 
-SPLIT_K_SEMAPHORE_MAX_LEN = 256
+# Cross-XCD partials need agent scope; system scope evicts past the last level.
+SPLIT_K_CPOL_COHERENT = 0x10
+
+SPLIT_K_CPOL_XCD_LOCAL = 0x1
+
+# One line per tile counter; packed dwords would serialise a launch's arrivals.
+SPLIT_K_SEMAPHORE_STRIDE = 32
+
+NUM_XCD = 8
+
+
+def _pairwise_sum(parts):
+    """Sum a Python list of vectors as a balanced tree.
+
+    Module level because the kernel AST rewriter would turn this ``while`` into
+    an ``scf.while``; it is trace-time metaprogramming over a Python list. The
+    tree also lets every split-K plane load issue before the first add.
+    """
+    while len(parts) > 1:
+        nxt = [lhs + rhs for lhs, rhs in zip(parts[0::2], parts[1::2])]
+        if len(parts) % 2:
+            nxt.append(parts[-1])
+        parts = nxt
+    return parts[0]
+
+
+@contextlib.contextmanager
+def _if_then(cond):
+    """Emit the body under ``cond``, or unguarded when ``cond`` is None."""
+    if cond is None:
+        yield
+        return
+    if_op = scf.IfOp(cond, results_=[], has_else=False)
+    with ir.InsertionPoint(if_op.then_block):
+        yield
+        scf.YieldOp([])
 
 
 def swizzle_xor16(row, col_in_bytes, k_blocks16):
@@ -109,15 +145,24 @@ def compile_hgemm_kernel(
     BLOCK_K_WARPS: int = 1,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
+    XCD_BAND: int = 1,
 ):
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
     if (TILE_M == 256) and (TILE_N == 256):
         assert (TILE_K == 64) and (SPLIT_K == 1) and (STAGES == 2)
     assert STAGES >= 2
-    N_BLOCKS = n // TILE_N
-    assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
+    # Clamping and predicating the last N tile frees tile_n from N's divisors.
+    N_BLOCKS = -(-n // TILE_N)
+    assert N_BLOCKS >= 1
+    assert XCD_BAND >= 1
+    assert (XCD_BAND == 1) or (N_BLOCKS % (NUM_XCD * XCD_BAND) == 0)
     IS_SPLIT_K = SPLIT_K > 1
+    # Split s of tile t is workgroup t + s * grid_x, so a grid_x that is a
+    # multiple of NUM_XCD keeps every split of a tile on one XCD.
+    SPLIT_K_CPOL = (
+        SPLIT_K_CPOL_XCD_LOCAL if (N_BLOCKS % NUM_XCD) == 0 else SPLIT_K_CPOL_COHERENT
+    )
     IS_SLICE_K = BLOCK_K_WARPS > 1
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
@@ -169,7 +214,9 @@ def compile_hgemm_kernel(
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
-    assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
+    assert n >= BLOCK_N
+    N_TAIL_PREDICATE = (n % BLOCK_N) != 0
+    assert (not N_TAIL_PREDICATE) or (B_TO_LDS and (n % LDG_VEC_SIZE == 0))
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
@@ -178,12 +225,14 @@ def compile_hgemm_kernel(
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
     BLOCK_VECS = LDG_VEC_SIZE * BLOCK_THREADS
     LDG_REG_A_COUNT = BLOCK_MK_SIZE // BLOCK_VECS
-    LDG_REG_B_COUNT = BLOCK_NK_SIZE // BLOCK_VECS
-    LDG_REG_C_COUNT = BLOCK_MN_SIZE // BLOCK_VECS
-    assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1) and (LDG_REG_C_COUNT >= 1)
-    assert BLOCK_MK_SIZE % BLOCK_VECS == 0
-    assert BLOCK_NK_SIZE % BLOCK_VECS == 0
-    assert BLOCK_MN_SIZE % BLOCK_VECS == 0
+    if not B_TO_LDS:
+        # This path stages A through registers, which has no tail predicate.
+        assert BLOCK_MK_SIZE % BLOCK_VECS == 0
+        assert BLOCK_NK_SIZE % BLOCK_VECS == 0
+    # Divisibility here would forbid the many-warp narrow tile that narrow N needs.
+    LDG_C_VECS = BLOCK_MN_SIZE // LDG_VEC_SIZE
+    LDG_REG_C_COUNT = -(-LDG_C_VECS // BLOCK_THREADS)
+    C_TAIL_PREDICATE = (LDG_C_VECS % BLOCK_THREADS) != 0
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
     # LDS parameters: the A/B pipeline and C scratch are live at disjoint times,
@@ -209,16 +258,46 @@ def compile_hgemm_kernel(
             a_lds: fx.Array[fx_dtype, AS_ELEMS, 16]
 
     @fx.union
-    class SharedStorage:
+    class TileStorage:
         pipeline: PipelineStorage
         c_lds: fx.Array[fx_dtype, CMN_ELEMS, 16]
 
+    @fx.struct
+    class SharedStorage:
+        tile: TileStorage
+        if IS_SPLIT_K:
+            split_flag: fx.Array[Int32, 1, 4]
+
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
-    LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
-    LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-    LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
+
+    def split_g2s_rounds(tile_vecs):
+        """Spread ``tile_vecs`` DMA chunks over the block's threads.
+
+        Either the block covers the tile in whole rounds, or the tile is
+        smaller than one round and a single round carries it with the trailing
+        waves predicated off. The predicate is wave uniform, so those waves
+        branch over the copy instead of running it under a partial exec mask,
+        which would scatter the LDS destinations the readers expect.
+        """
+        if tile_vecs % BLOCK_THREADS == 0:
+            return tile_vecs // BLOCK_THREADS, False
+        assert (tile_vecs < BLOCK_THREADS) and (tile_vecs % WARP_SIZE == 0)
+        return 1, True
+
+    LDG_REG_A_COUNT_AS, LDG_A_PREDICATE = split_g2s_rounds(
+        BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE
+    )
+    LDG_REG_B_COUNT_AS, LDG_B_PREDICATE = split_g2s_rounds(
+        BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE
+    )
+    LDG_A_VECS_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE
+    LDG_B_VECS_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE
+    # The barrier counter is per wave, so it must hold for a wave issuing none.
+    LDG_WAIT_COUNT = (0 if LDG_B_PREDICATE else LDG_REG_B_COUNT_AS) + (
+        0 if LDG_A_PREDICATE else LDG_REG_A_COUNT_AS
+    )
     assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
 
     USE_8WAVE_PIPE = (
@@ -240,6 +319,8 @@ def compile_hgemm_kernel(
 
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
+    if XCD_BAND > 1:
+        KERNEL_NAME += f"_XB{XCD_BAND}"
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
 
@@ -251,10 +332,9 @@ def compile_hgemm_kernel(
         BIAS: fx.Pointer,
         m: fx.Int32,
         semaphore: fx.Pointer,
-        signal: fx.Pointer,
+        workspace: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
-        c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
@@ -263,11 +343,11 @@ def compile_hgemm_kernel(
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         lds = fx.SharedAllocator().allocate(SharedStorage)
-        a_lds_ptr = lds.pipeline.a_lds.peek().ptr
-        c_lds_ptr = lds.c_lds.peek().ptr
+        a_lds_ptr = lds.tile.pipeline.a_lds.peek().ptr
+        c_lds_ptr = lds.tile.c_lds.peek().ptr
         a_lds_i64 = fx.Int64(fx.ptrtoint(a_lds_ptr))
         if const_expr(B_TO_LDS):
-            b_lds_ptr = lds.pipeline.b_lds.peek().ptr
+            b_lds_ptr = lds.tile.pipeline.b_lds.peek().ptr
             b_lds_i64 = fx.Int64(fx.ptrtoint(b_lds_ptr))
 
         def _lds_a3_ptr(base_i64, elem_off):
@@ -340,9 +420,15 @@ def compile_hgemm_kernel(
             )
 
         if const_expr(IS_SPLIT_K):
-            semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
-            signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
-            signal_idx = fx.Int32(fx.block_idx.x)
+            # Tile-major, so the reducing block reads consecutive lines.
+            WS_ = GTensor(
+                workspace,
+                dtype=dtype_,
+                shape=(-1,),
+                cache_modifier=SPLIT_K_CPOL,
+            )
+            split_flag_ptr = lds.split_flag.peek().ptr
+            tile_idx = fx.Int32(fx.block_idx.x)
 
         tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
@@ -351,8 +437,15 @@ def compile_hgemm_kernel(
         w_tid = tid % WARP_SIZE
 
         def swizzle_for_cache_reuse(pid):
-            # Do nothing currently
-            return pid // N_BLOCKS, pid % N_BLOCKS
+            # n-fastest crowds one XCD's B rows into a few L2 sets; use runs.
+            block_n_idx = pid % N_BLOCKS
+            if const_expr(XCD_BAND > 1):
+                xcd = block_n_idx % NUM_XCD
+                pos = block_n_idx // NUM_XCD
+                block_n_idx = (pos // XCD_BAND * NUM_XCD + xcd) * XCD_BAND + (
+                    pos % XCD_BAND
+                )
+            return pid // N_BLOCKS, block_n_idx
 
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
@@ -398,92 +491,22 @@ def compile_hgemm_kernel(
             )
             return ptr_v
 
-        def zero_c():
-            # zero c if current block is the first block
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
-                for i in range_constexpr(LDG_REG_C_COUNT):
-                    global_tid = BLOCK_THREADS * i + tid
-                    m_local_idx = global_tid // LDG_C_X_THREADS
-                    n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-                    row_idx = m_offset + fx.Index(m_local_idx)
-                    init_vec = zero_vec
-                    if const_expr(HAS_BIAS):
-                        init_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), LDG_VEC_SIZE
-                        )
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, row_idx, fx.Index(m)
-                    )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
-                    )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        bytes_offset = C_.linear_offset(
-                            (row_idx, n_offset + n_local_idx)
-                        )
-                        bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
-                        c_ptr = get_llvm_ptr(C, bytes_offset_i32, DTYPE_BYTES)
-                        llvm.InlineAsmOp(
-                            None,
-                            [c_ptr, init_vec],
-                            "global_store_dwordx4 $0, $1, off sc0 sc1",
-                            "v,v",
-                            has_side_effects=True,
-                        )
-                        scf.YieldOp([])
-                gpu.barrier()
-                # trigger signal when zeroc is done by the first arrived block
-                is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    signal_ptr = get_llvm_ptr(signal, signal_idx, 4)
-                    llvm.InlineAsmOp(
-                        None,
-                        [signal_ptr, arith.constant(1, type=T.i32)],
-                        "global_store_dword $0, $1, off sc0 sc1",
-                        "v,v",
-                        has_side_effects=True,
-                    )
-                    scf.YieldOp([])
-                gpu.barrier()
-                scf.YieldOp([])
+        def split_k_arrive():
+            """Publish this block's partial and read back this tile's arrival count.
 
-        def split_k_barrier():
-            # spin-wait until signal triggered
+            The partial store carries sc0|sc1 and is waited on, which is the whole
+            release: the block that sees ``SPLIT_K - 1`` prior arrivals reduces.
+            No block waits for a designated one, so there is no spin loop and C is
+            never pre-zeroed.
+            """
+            rocdl.s_waitcnt(0)
+            gpu.barrier()
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
             is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
             with ir.InsertionPoint(is_t0_cond_if.then_block):
-                init_cur = arith.constant(0, type=T.i32)
-                w = scf.WhileOp([T.i32], [init_cur])
-                before = ir.Block.create_at_start(w.before, [T.i32])
-                after = ir.Block.create_at_start(w.after, [T.i32])
-                with ir.InsertionPoint(before):
-                    cur = before.arguments[0]
-                    need_wait = arith.CmpIOp(
-                        arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                    ).result
-                    scf.ConditionOp(need_wait, [cur])
-                with ir.InsertionPoint(after):
-                    signal_ptr = get_llvm_ptr(signal, signal_idx, 4)
-                    data = llvm.InlineAsmOp(
-                        T.i32,
-                        [signal_ptr],
-                        "global_load_dword $0, $1, off sc1",
-                        "=v,v",
-                        has_side_effects=True,
-                    ).result
-                    rocdl.s_waitcnt(0)
-                    scf.YieldOp([data])
-                scf.YieldOp([])
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-            # clean semaphore and signal if this is the last block within split-k group
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                semaphore_ptr = get_llvm_ptr(semaphore, signal_idx, 4)
+                semaphore_ptr = get_llvm_ptr(
+                    semaphore, tile_idx * SPLIT_K_SEMAPHORE_STRIDE, 4
+                )
                 arrive_idx = llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.add,
                     semaphore_ptr,
@@ -492,16 +515,25 @@ def compile_hgemm_kernel(
                     syncscope="agent",
                     alignment=4,
                 ).result
-                cond_ksl = arith.cmpi(
-                    arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(SPLIT_K - 1)
-                )
-                cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_ksl_if.then_block):
-                    semaphore_[signal_idx] = arith.constant(0, type=T.i32)
-                    signal_[signal_idx] = arith.constant(0, type=T.i32)
-                    scf.YieldOp([])
+                fx.ptr_store(arrive_idx, split_flag_ptr)
                 scf.YieldOp([])
             gpu.barrier()
+            return fx.Index(fx.ptr_load(split_flag_ptr))
+
+        def split_k_release():
+            # Undo with the same atomic, so a next-launch increment survives.
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(is_t0_cond_if.then_block):
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    get_llvm_ptr(semaphore, tile_idx * SPLIT_K_SEMAPHORE_STRIDE, 4),
+                    arith.constant(-SPLIT_K, type=T.i32),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+                scf.YieldOp([])
 
         def ldg_a(k_offset):
             vecs = []
@@ -539,15 +571,18 @@ def compile_hgemm_kernel(
             )
             return warp_offset
 
-        def buffer_load_lds_inline(rsrc, lds_ptr, global_offset):
+        def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, cpol="sc0"):
             if const_expr(DMA_BYTES == 16):
-                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen sc0 lds"
+                op = "buffer_load_dwordx4"
             elif const_expr(DMA_BYTES == 8):
-                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dwordx2 $1, $2, 0 offen sc0 lds"
+                op = "buffer_load_dwordx2"
             elif const_expr(DMA_BYTES == 4):
-                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, 0 offen sc0 lds"
+                op = "buffer_load_dword"
             else:
                 raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
+            asm = f"s_mov_b32 m0, $0\n\t{op} $1, $2, 0 offen {cpol} lds".replace(
+                "  ", " "
+            )
             llvm.InlineAsmOp(
                 None,
                 [lds_ptr, global_offset, rsrc],
@@ -583,12 +618,19 @@ def compile_hgemm_kernel(
             buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
             return lds_ptr
 
+        def g2s_wave_active(tile_vecs):
+            return arith.cmpi(
+                arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(tile_vecs)
+            )
+
         def ldg_sts_a_async(k_offset, lds_stage):
-            lds_ptr = None
-            for i in range_constexpr(LDG_REG_A_COUNT_AS):
-                lds_ptr = ldg_sts_a_async_one(
-                    i, k_offset, lds_stage, lds_ptr if i > 0 else None
-                )
+            cond = g2s_wave_active(LDG_A_VECS_AS) if LDG_A_PREDICATE else None
+            with _if_then(cond):
+                lds_ptr = None
+                for i in range_constexpr(LDG_REG_A_COUNT_AS):
+                    lds_ptr = ldg_sts_a_async_one(
+                        i, k_offset, lds_stage, lds_ptr if i > 0 else None
+                    )
 
         def ldg_sts_b_async_one(ii, k_offset, write_stage, lds_ptr=None):
             global_tid = BLOCK_THREADS * ii + tid
@@ -618,11 +660,13 @@ def compile_hgemm_kernel(
             return lds_ptr
 
         def ldg_sts_b_async(k_offset, lds_stage):
-            lds_ptr = None
-            for i in range_constexpr(LDG_REG_B_COUNT_AS):
-                lds_ptr = ldg_sts_b_async_one(
-                    i, k_offset, lds_stage, lds_ptr if i > 0 else None
-                )
+            cond = g2s_wave_active(LDG_B_VECS_AS) if LDG_B_PREDICATE else None
+            with _if_then(cond):
+                lds_ptr = None
+                for i in range_constexpr(LDG_REG_B_COUNT_AS):
+                    lds_ptr = ldg_sts_b_async_one(
+                        i, k_offset, lds_stage, lds_ptr if i > 0 else None
+                    )
 
         def ldg_matrix_b(k_offset):
             vecs = []
@@ -866,11 +910,7 @@ def compile_hgemm_kernel(
 
         warp_offset = get_dma_copy_warp_offset()
 
-        if const_expr(IS_SPLIT_K):
-            zero_c()
-
         if const_expr(B_TO_LDS):
-
             for s in range_constexpr(STAGES - 1):
                 ldg_sts_b_async(ks_begin + s * BLOCK_K, s)
                 ldg_sts_a_async(ks_begin + s * BLOCK_K, s)
@@ -945,7 +985,6 @@ def compile_hgemm_kernel(
                 current_stage = (current_stage + 1) % STAGES
 
         else:
-
             assert STAGES == 2
             sts_a(ldg_a(ks_begin), 0)
             b_frags_next = ldg_matrix_b(ks_begin)
@@ -1018,53 +1057,92 @@ def compile_hgemm_kernel(
                     else:
                         cs_store_scalar(0, lds_m_idx, lds_n_idx, val)
 
+        def c_lane_active(global_tid, cond=None):
+            if const_expr(C_TAIL_PREDICATE):
+                lane_cond = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    fx.Index(global_tid),
+                    fx.Index(LDG_C_VECS),
+                )
+                cond = lane_cond if cond is None else arith.andi(cond, lane_cond)
+            return cond
+
+        def c_col_active(n_local_idx, cond=None):
+            if const_expr(N_TAIL_PREDICATE):
+                col_cond = arith.cmpi(
+                    arith.CmpIPredicate.ult, n_offset + n_local_idx, fx.Index(n)
+                )
+                cond = col_cond if cond is None else arith.andi(cond, col_cond)
+            return cond
+
         # write back to global
         if const_expr(IS_SPLIT_K):
-            split_k_barrier()
+            gpu.barrier()
+            # Reduce in f32 rather than rounding at every tree level.
+            acc_vec_type = fx.Vector.make_type(LDG_VEC_SIZE, fx.Float32)
+            out_vec_type = fx.Vector.make_type(LDG_VEC_SIZE, fx_dtype)
+            # Whole tile including rows past M; the reduction drops them.
+            ws_tile_base = (
+                tile_idx * (SPLIT_K * BLOCK_MN_SIZE)
+                + arith.index_cast(T.i32, ks_idx) * BLOCK_MN_SIZE
+            )
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                m_global_idx = m_offset + m_local_idx
-                n_global_idx = n_offset + n_local_idx
-                cond_boundary = arith.cmpi(
-                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
-                )
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
+                with _if_then(c_lane_active(global_tid)):
+                    m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+                    n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                     pk_val = cs_load_vec(0, m_local_idx, n_local_idx, LDG_VEC_SIZE)
                     for ksi in range_constexpr(1, BLOCK_K_WARPS):
                         pk_val += cs_load_vec(
                             ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE
                         )
-                    linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
-                    # split to vec2s
-                    vec2_ty = T.vec(2, dtype_)
-                    for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
-                        e0 = vector.extract(
-                            pk_val, static_position=[vec_idx * 2], dynamic_position=[]
+                    WS_.vec_store(
+                        (ws_tile_base + global_tid * LDG_VEC_SIZE,),
+                        pk_val,
+                        LDG_VEC_SIZE,
+                    )
+
+            is_last = arith.cmpi(
+                arith.CmpIPredicate.eq, split_k_arrive(), fx.Index(SPLIT_K - 1)
+            )
+            is_last_if = scf.IfOp(is_last, results_=[], has_else=False)
+            with ir.InsertionPoint(is_last_if.then_block):
+                for i in range_constexpr(LDG_REG_C_COUNT):
+                    global_tid = BLOCK_THREADS * i + tid
+                    m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+                    n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                    m_global_idx = m_offset + m_local_idx
+                    cond_boundary = arith.cmpi(
+                        arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                    )
+                    cond_boundary = c_lane_active(global_tid, cond_boundary)
+                    cond_boundary = c_col_active(n_local_idx, cond_boundary)
+                    cond_boundary_if = scf.IfOp(
+                        cond_boundary, results_=[], has_else=False
+                    )
+                    with ir.InsertionPoint(cond_boundary_if.then_block):
+                        ws_off = (
+                            tile_idx * (SPLIT_K * BLOCK_MN_SIZE)
+                            + global_tid * LDG_VEC_SIZE
                         )
-                        e1 = vector.extract(
-                            pk_val,
-                            static_position=[vec_idx * 2 + 1],
-                            dynamic_position=[],
+                        planes = [
+                            WS_.vec_load(
+                                (ws_off + s * BLOCK_MN_SIZE,), LDG_VEC_SIZE
+                            ).extf(acc_vec_type)
+                            for s in range_constexpr(SPLIT_K)
+                        ]
+                        vec = _pairwise_sum(planes)
+                        if const_expr(HAS_BIAS):
+                            vec = vec + BIAS_.vec_load(
+                                (n_offset + n_local_idx,), LDG_VEC_SIZE
+                            ).extf(acc_vec_type)
+                        vec = vec.truncf(out_vec_type)
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                         )
-                        pair = vector.from_elements(vec2_ty, [e0, e1])
-                        pair_v = (
-                            pair._value if const_expr(hasattr(pair, "_value")) else pair
-                        )
-                        pair_ptr_v = get_llvm_ptr(
-                            C, fx.Int32(linear_offset_c + vec_idx * 2), DTYPE_BYTES
-                        )
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            pair_ptr_v,
-                            pair_v,
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="agent",
-                            alignment=4,
-                        )
-                    scf.YieldOp([])
+                        scf.YieldOp([])
+                split_k_release()
+                scf.YieldOp([])
         else:
             gpu.barrier()
             for i in range_constexpr(LDG_REG_C_COUNT):
@@ -1075,6 +1153,8 @@ def compile_hgemm_kernel(
                 cond_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
+                cond_boundary = c_lane_active(global_tid, cond_boundary)
+                cond_boundary = c_col_active(n_local_idx, cond_boundary)
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_load_vec(0, m_local_idx, n_local_idx, LDG_VEC_SIZE)
@@ -1098,7 +1178,7 @@ def compile_hgemm_kernel(
         BIAS: fx.Pointer,
         m: fx.Int32,
         semaphore: fx.Pointer,
-        signal: fx.Pointer,
+        workspace: fx.Pointer,
         stream: fx.Stream,
     ):
         bm = (m + BLOCK_M - 1) // BLOCK_M
@@ -1111,7 +1191,7 @@ def compile_hgemm_kernel(
             if USE_8WAVE_PIPE
             else None
         )
-        hgemm_kernel(C, A, B, BIAS, m, semaphore, signal).launch(
+        hgemm_kernel(C, A, B, BIAS, m, semaphore, workspace).launch(
             grid=(bm * N_BLOCKS, SPLIT_K, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

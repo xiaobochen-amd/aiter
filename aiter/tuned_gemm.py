@@ -518,6 +518,7 @@ def flydsl_gemm(
         b_to_lds=flydsl_config["b_to_lds"],
         b_preshuffle=flydsl_config.get("b_preshuffle", False),
         c_to_lds=flydsl_config.get("c_to_lds", False),
+        xcd_band=flydsl_config.get("xcd_band", 1),
     )
 
     if bias is not None and fused_bias is None:

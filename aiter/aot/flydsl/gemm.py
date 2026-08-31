@@ -58,7 +58,7 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     parse_8wave_kernel_name,
 )
 from aiter.ops.flydsl.gemm_kernels import (
-    SPLIT_K_SEMAPHORE_MAX_LEN,
+    SPLIT_K_SEMAPHORE_GRANULE,
     get_flydsl_splitk_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
@@ -293,12 +293,12 @@ def _compile_hgemm_to_cache(
     b = torch.empty((n, k), device=dev, dtype=torch_dtype)
     bias = torch.empty((n,), device=dev, dtype=torch_dtype)
     semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
+        (SPLIT_K_SEMAPHORE_GRANULE,),
         device=dev,
         dtype=torch.int32,
     )
-    signal = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
+    workspace = torch.empty(
+        (SPLIT_K_SEMAPHORE_GRANULE,),
         device=dev,
         dtype=torch.int32,
     )
@@ -338,7 +338,7 @@ def _compile_hgemm_to_cache(
         _ptr_view_safe(launch_bias),
         m,
         _ptr_view_safe(semaphore),
-        _ptr_view_safe(signal),
+        _ptr_view_safe(workspace),
         stream,
     )
 

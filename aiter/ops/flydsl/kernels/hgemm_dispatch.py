@@ -31,6 +31,7 @@ def compile_flydsl_hgemm_kernel(
     b_preshuffle: bool = False,
     c_to_lds: bool = False,
     has_bias: bool = False,
+    xcd_band: int = 1,
 ):
     """Build one FlyDSL HGEMM-family kernel from a unified config surface."""
 
@@ -55,9 +56,12 @@ def compile_flydsl_hgemm_kernel(
             BLOCK_K_WARPS=block_k_warps,
             B_TO_LDS=b_to_lds,
             HAS_BIAS=has_bias,
+            XCD_BAND=xcd_band,
         )
 
     if kernel_family == KERNEL_FAMILY_SMALL_M:
+        if xcd_band != 1:
+            raise ValueError("small-M kernel does not support `xcd_band != 1`")
         return compile_small_m_hgemm_kernel(
             dtype,
             n,
