@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FP8 sparse-MLA prefill for the GLM-5.2 shape on gfx950.
-
-The softmax reduction uses the campaign's accepted COMPOSE form: gfx950
-``v_permlane*_swap`` butterfly pairs plus hardware ``maxnum`` reductions.
-"""
+"""gfx950 FP8 sparse-MLA prefill specialized for the GLM-5.2 shape."""
 
 import functools
 import struct
@@ -173,8 +169,7 @@ def _compile_sparse_mla_prefill():
         key_slot_col = 8 * (lane_col // 4) + (lane_col % 4)
         key_slot_group = 8 * lane_group
 
-        # Stage each token's sparse indices once. This is part of the accepted
-        # configuration and avoids repeating scattered VMEM loads in the hot loop.
+        # Stage indices once to avoid repeating scattered VMEM loads in the key loop.
         for iteration in range_constexpr(_TOPK // (_NUM_THREADS * 4)):
             element = thread * 4 + iteration * (_NUM_THREADS * 4)
             _lds_store_i32x4(
@@ -540,12 +535,7 @@ def flydsl_sparse_mla_prefill(
     softmax_scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the gfx950 FP8 sparse-MLA prefill kernel.
-
-    This implementation is intentionally specialized to Q ``[T, 16, 512+64]``,
-    KV ``[P, 576]``, and 2048 int32 indices per token. Q and KV remain
-    ``float8_e4m3fn`` and the returned output is BF16.
-    """
+    """Run sparse MLA for Q ``[T,16,512+64]`` and 2048 indices per token."""
     if get_gfx() != "gfx950":
         raise RuntimeError(
             f"flydsl_sparse_mla_prefill requires gfx950, got {get_gfx()}"

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Public launchers for the minimal gfx950 FlyDSL sparse MLA decode path."""
+"""Public launcher for gfx950 FlyDSL sparse MLA decode."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import torch
 
 from .kernels.sparse_mla_decode import BLOCK_I, DIM, DV, H, compile_sparse_mla_partial
 from .kernels.tensor_shim import _run_compiled, ptr_arg
-from .mla_reduce_kernels import flydsl_sparse_mla_decode_combine
+from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
 
 def _require_cuda_tensor(
@@ -45,8 +45,13 @@ def _validate_sparse_decode_inputs(
     seq = int(q.shape[0])
     if seq not in (1, 6):
         raise ValueError(f"supported sparse decode scope is seq in {{1,6}}, got {seq}")
-    if kv.ndim not in (2, 3) or int(kv.shape[-1]) != DIM:
-        raise ValueError(f"kv must end in dimension {DIM}, got {tuple(kv.shape)}")
+    if not (
+        (kv.ndim == 2 and int(kv.shape[1]) == DIM)
+        or (kv.ndim == 3 and tuple(kv.shape[1:]) == (1, DIM))
+    ):
+        raise ValueError(
+            f"kv must have shape [P,{DIM}] or [P,1,{DIM}], got {tuple(kv.shape)}"
+        )
     if out is not None and (out.ndim != 3 or tuple(out.shape) != (seq, H, DV)):
         raise ValueError(
             f"out must have shape [{seq},{H},{DV}], got {tuple(out.shape)}"
@@ -123,27 +128,6 @@ def _launch_partial(
     )
 
 
-def flydsl_sparse_mla_decode_partial(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    sm_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Emit exact BF16 partials and log2-domain FP32 split LSEs."""
-    seq, ng = _validate_sparse_decode_inputs(q, kv, indices, None)
-    _validate_workspace(
-        partial_output,
-        partial_lse,
-        seq=seq,
-        ng=ng,
-        device=q.device,
-    )
-    _launch_partial(q, kv, indices, partial_output, partial_lse, sm_scale, ng=ng)
-    return partial_output, partial_lse
-
-
 def flydsl_sparse_mla_decode(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -154,7 +138,7 @@ def flydsl_sparse_mla_decode(
     partial_output: torch.Tensor | None = None,
     partial_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run exact sparse MLA decode via FlyDSL partials plus the shared reducer.
+    """Run sparse MLA decode via FlyDSL partials and the shared reducer.
 
     Provide persistent ``partial_output`` and ``partial_lse`` buffers when
     capturing the call in a HIP graph. If they are omitted, temporary scratch is
@@ -181,7 +165,7 @@ def flydsl_sparse_mla_decode(
         )
 
     _launch_partial(q, kv, indices, partial_output, partial_lse, sm_scale, ng=ng)
-    flydsl_sparse_mla_decode_combine(
+    _flydsl_sparse_mla_decode_combine(
         partial_output.unsqueeze(0),
         partial_lse.unsqueeze(0),
         out.unsqueeze(0),
@@ -189,7 +173,4 @@ def flydsl_sparse_mla_decode(
     return out
 
 
-__all__ = [
-    "flydsl_sparse_mla_decode",
-    "flydsl_sparse_mla_decode_partial",
-]
+__all__ = ["flydsl_sparse_mla_decode"]

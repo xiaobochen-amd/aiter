@@ -54,7 +54,6 @@ if not torch.cuda.is_available():
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import (
     flydsl_sparse_mla_decode,
-    flydsl_sparse_mla_decode_partial,
     is_flydsl_available,
 )
 
@@ -165,9 +164,6 @@ def test_sparse_mla_decode_exact_contract(case: Case):
 
     ref_partial, ref_lse, ref_out = _reference_partials(q, kv, indices, sm_scale)
 
-    flydsl_sparse_mla_decode_partial(
-        q, kv, indices, partial_output, partial_lse, sm_scale
-    )
     flydsl_sparse_mla_decode(
         q,
         kv,
@@ -198,6 +194,29 @@ def test_sparse_mla_decode_exact_contract(case: Case):
     assert _snr_db(out, ref_out) >= 30.0
     assert torch.isfinite(out.to(torch.float32)).all()
     assert torch.equal(out, out_repeat)
+
+
+def test_sparse_mla_decode_rejects_ambiguous_kv_rank3_shape():
+    case = next(item for item in CASES if item.name == "degen_k1")
+    q, kv, indices = _build_case(case)
+    out = torch.empty((case.seq, H, DV), device=q.device, dtype=torch.bfloat16)
+    bad_kv = kv[:, None, :].expand(-1, 2, -1).contiguous()
+    with pytest.raises(ValueError, match=r"kv must have shape"):
+        flydsl_sparse_mla_decode(q, bad_kv, indices, out, 1.0 / math.sqrt(DIM))
+
+
+def test_sparse_mla_decode_accepts_singleton_kv_rank3_shape():
+    case = next(item for item in CASES if item.name == "degen_k1")
+    q, kv, indices = _build_case(case)
+    out_rank2 = torch.empty((case.seq, H, DV), device=q.device, dtype=torch.bfloat16)
+    out_rank3 = torch.empty_like(out_rank2)
+    sm_scale = 1.0 / math.sqrt(DIM)
+
+    flydsl_sparse_mla_decode(q, kv, indices, out_rank2, sm_scale)
+    flydsl_sparse_mla_decode(q, kv[:, None, :], indices, out_rank3, sm_scale)
+    torch.cuda.synchronize()
+
+    assert torch.equal(out_rank3, out_rank2)
 
 
 @pytest.mark.parametrize(

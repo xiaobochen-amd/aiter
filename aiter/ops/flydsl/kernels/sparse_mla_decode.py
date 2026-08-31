@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-"""Exact-contract sparse MLA decode producer implemented in FlyDSL.
-
-The producer preserves the production contract's original 64-key split
-boundaries, BF16 split-local rounding, and log2-domain FP32 LSE. The retained
-PR path pairs it with AITER's generalized BF16/log2 reduce launcher rather than
-carrying a second decode-specific combine kernel.
-"""
+"""gfx950 sparse-MLA decode producer with 64-key split granularity."""
 
 # FlyDSL kernel annotations must be evaluated eagerly.
 import functools
@@ -57,12 +51,7 @@ def compile_sparse_mla_partial(
     ng: int,
     waves_per_eu: int = 1,
 ):
-    """Compile the exact 64-key C25 producer in FlyDSL.
-
-    Four waves cooperatively cover all 64 selected keys and all 512 output
-    columns. Q is published once per workgroup in LDS. Every split writes a
-    BF16 partial plus a log2-domain FP32 LSE, preserving the production tree.
-    """
+    """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
 
@@ -118,8 +107,7 @@ def compile_sparse_mla_partial(
         # This predicate is uniformly true. Keeping the producer in one DSL
         # region avoids branch-local SSA values in the traced kernel.
         if producer_active:
-            # C25 query publication: wave zero performs the global reads once;
-            # all waves consume the same lane-major fragments from LDS.
+            # Wave zero publishes Q once; every wave reuses its lane-major LDS view.
             q_base = (fx.Int64(tok) * H + fx.Int64(head)) * DIM
             qlane = lds.qlds.ptr + lane * fx.Int32(144)
             if wave == fx.Int32(0):
@@ -149,7 +137,7 @@ def compile_sparse_mla_partial(
                 fx.Int32,
             )
 
-            # keyslot<64,1>(wave, head): exact C25 QK-to-PV lane permutation.
+            # QK-to-PV lane permutation for one 64-key split.
             slot = (
                 fx.Int32(32) * (wave // fx.Int32(2))
                 + fx.Int32(8) * (head // fx.Int32(4))

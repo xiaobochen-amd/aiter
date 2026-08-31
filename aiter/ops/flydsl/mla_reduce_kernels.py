@@ -33,7 +33,6 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 __all__ = [
     "flydsl_mla_reduce_v1",
-    "flydsl_sparse_mla_decode_combine",
 ]
 
 
@@ -252,7 +251,7 @@ _ACTUAL_MAX_SPLITS_CACHE_CAP = 512
 
 @functools.lru_cache(maxsize=64)
 def _sparse_decode_meta(seq: int, ni: int, device_index: int):
-    """Lossless row mapping for TileLang [seq, split, H, Dv] partials."""
+    """Build reducer row maps for ``[seq, split, H, Dv]`` partials."""
     device = torch.device("cuda", device_index)
     indptr = (torch.arange(seq + 1, dtype=torch.int32, device=device) * ni).contiguous()
     partial_map = torch.arange(seq * ni, dtype=torch.int32, device=device)
@@ -290,7 +289,7 @@ def _compile_sparse_decode_combine(H: int, Dv: int):
 _SPARSE_DECODE_DUMMY_LSE: dict[int, torch.Tensor] = {}
 
 
-def flydsl_sparse_mla_decode_combine(
+def _flydsl_sparse_mla_decode_combine(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
     final_output: torch.Tensor,
