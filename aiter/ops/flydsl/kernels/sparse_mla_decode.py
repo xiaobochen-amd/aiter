@@ -188,7 +188,8 @@ def compile_sparse_mla_partial(
                     + fx.Int64(slot)
                 )
                 row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
-                lds.ilds[slot] = row
+                if group == fx.Int32(0):
+                    lds.ilds[slot] = row
                 safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
                 kv_base = fx.Int64(safe_row) * DIM
 
