@@ -352,12 +352,6 @@ def _compile_sparse_decode_direct_combine(ni: int):
 
         acc = [fx.Float32(0.0) for _ in fx.range_constexpr(8)]
         for split in fx.range_constexpr(ni):
-            scale = fx.Float32(0.0)
-            if lane == fx.Int32(0):
-                scale = fx.Float32(
-                    fx.ptr_load(scale_ptr + wave * fx.Int32(33) + fx.Int32(split))
-                )
-            scale = fx.Float32(fx.rocdl.readfirstlane(T.f32, scale.ir_value()))
             vals = _load_partial_out_narrow(
                 partial_buf,
                 row * fx.Int32(ni) + fx.Int32(split),
@@ -366,6 +360,12 @@ def _compile_sparse_decode_direct_combine(ni: int):
                 8,
                 fx.BFloat16,
             )
+            scale = fx.Float32(0.0)
+            if lane == fx.Int32(0):
+                scale = fx.Float32(
+                    fx.ptr_load(scale_ptr + wave * fx.Int32(33) + fx.Int32(split))
+                )
+            scale = fx.Float32(fx.rocdl.readfirstlane(T.f32, scale.ir_value()))
             acc = [
                 acc[i] + vals[i] * scale
                 for i in fx.range_constexpr(8)
