@@ -462,18 +462,28 @@ def _compile_sparse_mla_prefill():
                 fx.add_offset(shared.row_sum.ptr, wave * 16 + lane_col),
             )
         fx.barrier()
-        total_sum = zero_f
-        for other_wave in range_constexpr(_NUM_WAVES):
-            total_sum = total_sum + fx.Float32(
-                fx.ptr_load(
-                    fx.add_offset(
-                        shared.row_sum.ptr,
-                        fx.Int32(other_wave * 16) + lane_col,
+        if wave == fx.Int32(0):
+            if lane_group == fx.Int32(0):
+                total_sum = zero_f
+                for other_wave in range_constexpr(_NUM_WAVES):
+                    total_sum = total_sum + fx.Float32(
+                        fx.ptr_load(
+                            fx.add_offset(
+                                shared.row_sum.ptr,
+                                fx.Int32(other_wave * 16) + lane_col,
+                            )
+                        )
                     )
+                inverse = (total_sum > zero_f).select(
+                    fx.Float32(1.0) / (total_sum * fx.Float32(_FP8_MAX)), zero_f
                 )
-            )
-        inverse = (total_sum > zero_f).select(
-            fx.Float32(1.0) / (total_sum * fx.Float32(_FP8_MAX)), zero_f
+                fx.ptr_store(
+                    inverse,
+                    fx.add_offset(shared.row_sum.ptr, lane_col),
+                )
+        fx.barrier()
+        inverse = fx.Float32(
+            fx.ptr_load(fx.add_offset(shared.row_sum.ptr, lane_col))
         )
         inverse4 = Vec.from_elements([inverse] * 4, dtype=fx.Float32)
 
