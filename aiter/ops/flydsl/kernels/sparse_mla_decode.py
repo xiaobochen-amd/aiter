@@ -309,11 +309,15 @@ def compile_sparse_mla_partial(
                     lds.rsum[wave * fx.Int32(H) + head] = prob_sum
                 fx.gpu.barrier()
 
-                tile_denom = fx.Float32(0.0)
-                for ww in fx.range_constexpr(PARTIAL_WAVES):
-                    tile_denom = tile_denom + fx.Float32(
-                        lds.rsum[ww * H + head]
-                    )
+                tile_denom = fx.Float32(
+                    lds.rsum[group * fx.Int32(H) + head]
+                )
+                tile_denom = tile_denom + tile_denom.shuffle_xor(
+                    fx.Int32(16), fx.Int32(64)
+                )
+                tile_denom = tile_denom + tile_denom.shuffle_xor(
+                    fx.Int32(32), fx.Int32(64)
+                )
                 if fx.const_expr(inner_iter == 1):
                     output_scale = (tile_denom == fx.Float32(0.0)).select(
                         fx.Float32(0.0),
