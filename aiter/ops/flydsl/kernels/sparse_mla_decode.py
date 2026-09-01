@@ -181,32 +181,14 @@ def compile_sparse_mla_partial(
             ]
 
             for k_i in fx.range_constexpr(inner_iter):
-                # slot is identical across the four 16-lane groups. Load and
-                # publish its index once, then broadcast it within the wave.
-                load_row_if = scf.IfOp(
-                    arith.cmpi(
-                        CmpIPredicate.eq,
-                        _raw(group),
-                        arith.constant(0, type=T.i32),
-                    ),
-                    results_=[T.i32],
-                    has_else=True,
+                tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
+                index_offset = (
+                    fx.Int64(tok) * (ng * BLOCK_I)
+                    + fx.Int64(tile * fx.Int32(BLOCK_I))
+                    + fx.Int64(slot)
                 )
-                with ir.InsertionPoint(load_row_if.then_block):
-                    tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
-                    index_offset = (
-                        fx.Int64(tok) * (ng * BLOCK_I)
-                        + fx.Int64(tile * fx.Int32(BLOCK_I))
-                        + fx.Int64(slot)
-                    )
-                    loaded_row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
-                    lds.ilds[slot] = loaded_row
-                    scf.YieldOp([_raw(loaded_row)])
-                with ir.InsertionPoint(load_row_if.else_block):
-                    scf.YieldOp([arith.constant(0, type=T.i32)])
-                row = fx.Int32(load_row_if.results[0])
-                row = row + row.shuffle_xor(fx.Int32(16), fx.Int32(64))
-                row = row + row.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
+                lds.ilds[slot] = row
                 safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
                 kv_base = fx.Int64(safe_row) * DIM
 
