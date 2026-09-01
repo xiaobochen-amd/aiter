@@ -342,10 +342,6 @@ def compile_sparse_mla_partial(
                             ),
                         )
 
-                if fx.const_expr(inner_iter > 1 and k_i + 1 == inner_iter):
-                    final_running_scale = alpha * final_inv_denom
-                    final_tile_scale = output_scale * final_inv_denom
-
                 p4 = fx.ptr_load(
                     lds.plds.ptr + lane * fx.Int32(H),
                     result_type=fx.Vector.make_type(16, fx.Uint8),
@@ -385,21 +381,21 @@ def compile_sparse_mla_partial(
                             (fx.Vector(acc) * output_scale).to(fx.BFloat16),
                             partial_ptr + out_record * DV + fx.Int64(out_col),
                         )
-                    elif fx.const_expr(k_i + 1 == inner_iter):
-                        out_col = dv_base + fx.Int32(4) * group
-                        final_acc = (
-                            fx.Vector(running_acc[j]) * final_running_scale
-                            + fx.Vector(acc) * final_tile_scale
-                        )
-                        fx.ptr_store(
-                            fx.Vector(final_acc).to(fx.BFloat16),
-                            partial_ptr + out_record * DV + fx.Int64(out_col),
-                        )
                     else:
-                        running_acc[j] = (
+                        next_acc = (
                             fx.Vector(running_acc[j]) * alpha
                             + fx.Vector(acc) * output_scale
                         )
+                        if fx.const_expr(k_i + 1 == inner_iter):
+                            out_col = dv_base + fx.Int32(4) * group
+                            fx.ptr_store(
+                                (fx.Vector(next_acc) * final_inv_denom).to(
+                                    fx.BFloat16
+                                ),
+                                partial_ptr + out_record * DV + fx.Int64(out_col),
+                            )
+                        else:
+                            running_acc[j] = next_acc
 
                 if fx.const_expr(inner_iter > 1):
                     running_max = next_max
