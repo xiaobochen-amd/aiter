@@ -79,7 +79,6 @@ def compile_sparse_mla_partial(
         rsum: fx.Array[fx.Float32, PARTIAL_WAVES * H, 16]
         plds: fx.Array[fx.Uint8, BLOCK_I * H, 16]
         ilds: fx.Array[fx.Int32, BLOCK_I, 16]
-        qlds: fx.Array[fx.Uint8, 64 * 144, 16]
 
     attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
 
@@ -123,31 +122,17 @@ def compile_sparse_mla_partial(
         # Keep this as a compile-time region. A runtime guard here makes the
         # FlyDSL rewriter capture LDS handles as branch state.
         if fx.const_expr(True):
-            # Wave zero publishes Q once; every wave reuses its lane-major LDS view.
+            # Q is shared across splits and remains cache-hot; direct wave loads
+            # avoid its LDS allocation, publication stores, reloads, and barrier.
             q_base = (fx.Int64(tok) * H + fx.Int64(head)) * DIM
-            qlane = lds.qlds.ptr + lane * fx.Int32(144)
-            if wave == fx.Int32(0):
-                for cc in fx.range_constexpr(4):
-                    lo = load16(q_ptr, q_base + cc * 128 + fx.Int64(group) * 16)
-                    hi = load16(q_ptr, q_base + cc * 128 + 64 + fx.Int64(group) * 16)
-                    fx.ptr_store(lo.bitcast(fx.Uint8), qlane + fx.Int32(cc * 32))
-                    fx.ptr_store(hi.bitcast(fx.Uint8), qlane + fx.Int32(cc * 32 + 16))
-                tail = load16(q_ptr, q_base + DV + fx.Int64(group) * 16)
-                fx.ptr_store(tail.bitcast(fx.Uint8), qlane + fx.Int32(128))
-            fx.gpu.barrier()
-
             bq = [None] * 5
             for cc in fx.range_constexpr(4):
-                lo = fx.ptr_load(qlane + fx.Int32(cc * 32), result_type=v4u8_t).bitcast(
-                    fx.Int32
+                lo = load16(q_ptr, q_base + cc * 128 + fx.Int64(group) * 16)
+                hi = load16(
+                    q_ptr, q_base + cc * 128 + 64 + fx.Int64(group) * 16
                 )
-                hi = fx.ptr_load(
-                    qlane + fx.Int32(cc * 32 + 16), result_type=v4u8_t
-                ).bitcast(fx.Int32)
                 bq[cc] = join8(lo, hi)
-            tail = fx.ptr_load(qlane + fx.Int32(128), result_type=v4u8_t).bitcast(
-                fx.Int32
-            )
+            tail = load16(q_ptr, q_base + DV + fx.Int64(group) * 16)
             bq[4] = fx.Vector.from_elements(
                 [tail[i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
                 fx.Int32,
