@@ -25,12 +25,14 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """
     inner_iter = 1
     min_producer_ctas = 512
-    while inner_iter < 4:
+    while inner_iter < 8:
         candidate = inner_iter * 2
         if ng_total % candidate != 0:
             break
-        if seq * (ng_total // candidate) < min_producer_ctas:
-            break
+        candidate_ctas = seq * (ng_total // candidate)
+        if candidate_ctas < min_producer_ctas:
+            if candidate != 8 or candidate_ctas < 384:
+                break
         inner_iter = candidate
     return inner_iter
 
