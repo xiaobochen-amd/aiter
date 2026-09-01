@@ -348,6 +348,7 @@ def _compile_sparse_decode_direct_combine(ni: int):
         inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
         if in_split:
             fx.ptr_store(scale * inv, scale_ptr + wave * fx.Int32(33) + lane)
+        fx.gpu.barrier()
 
         acc = [fx.Float32(0.0) for _ in fx.range_constexpr(8)]
         for split in fx.range_constexpr(ni):
