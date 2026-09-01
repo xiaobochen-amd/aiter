@@ -280,6 +280,11 @@ def _compile_sparse_decode_direct_combine(ni: int):
     if not 1 <= ni <= 33:
         raise ValueError(f"sparse decode split count must be 1..33, got {ni}")
 
+    reduce_width = 1 << (ni - 1).bit_length()
+    reduce_offsets = tuple(
+        off for off in (32, 16, 8, 4, 2, 1) if off < reduce_width
+    )
+
     @flyc.kernel(
         name=f"flydsl_sparse_mla_decode_combine_ni{ni}",
         known_block_size=[256, 1, 1],
@@ -332,17 +337,17 @@ def _compile_sparse_decode_direct_combine(ni: int):
         zero = fx.Float32(0.0)
         lse = in_split.select(lse, neg_inf)
         max_lse = lse
-        for off in [32, 16, 8, 4, 2, 1]:
+        for off in reduce_offsets:
             peer = fx.Float32(max_lse).shuffle_xor(
-                fx.Int32(off), fx.Int32(64)
+                fx.Int32(off), fx.Int32(reduce_width)
             )
             max_lse = fx.Float32(max_lse).maximumf(peer)
         scale = fx.Float32(fx.rocdl.exp2(T.f32, (lse - max_lse).ir_value()))
         scale = in_split.select(scale, zero)
         denom = scale
-        for off in [32, 16, 8, 4, 2, 1]:
+        for off in reduce_offsets:
             peer = fx.Float32(denom).shuffle_xor(
-                fx.Int32(off), fx.Int32(64)
+                fx.Int32(off), fx.Int32(reduce_width)
             )
             denom = denom + peer
         inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
