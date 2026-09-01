@@ -15,6 +15,25 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
 
+def _pick_inner_iter(seq: int, ng_total: int) -> int:
+    """Return the producer grouping factor for this shape.
+
+    The producer currently implements only the legacy one-64-key-tile path.
+    Keeping this shape decision centralized makes the upcoming inner-iteration
+    path a wrapper+producer change instead of leaking scratch geometry into
+    callers.
+    """
+    return 1
+
+
+def _partial_groups(ng_total: int, inner_iter: int) -> int:
+    if inner_iter < 1 or ng_total % inner_iter != 0:
+        raise ValueError(
+            f"ng_total={ng_total} must be divisible by inner_iter={inner_iter}"
+        )
+    return ng_total // inner_iter
+
+
 def _require_cuda_tensor(
     name: str, tensor: torch.Tensor, *, dtype: torch.dtype
 ) -> None:
@@ -86,21 +105,21 @@ def _validate_workspace(
     partial_lse: torch.Tensor,
     *,
     seq: int,
-    ng: int,
+    ng_partial: int,
     device: torch.device,
 ) -> None:
     _require_cuda_tensor("partial_output", partial_output, dtype=torch.bfloat16)
     _require_cuda_tensor("partial_lse", partial_lse, dtype=torch.float32)
     if partial_output.device != device or partial_lse.device != device:
         raise ValueError("sparse decode workspace must share the decode device")
-    if tuple(partial_output.shape) != (seq, ng, H, DV):
+    if tuple(partial_output.shape) != (seq, ng_partial, H, DV):
         raise ValueError(
-            f"partial_output must have shape [{seq},{ng},{H},{DV}], got "
+            f"partial_output must have shape [{seq},{ng_partial},{H},{DV}], got "
             f"{tuple(partial_output.shape)}"
         )
-    if tuple(partial_lse.shape) != (seq, ng, H):
+    if tuple(partial_lse.shape) != (seq, ng_partial, H):
         raise ValueError(
-            f"partial_lse must have shape [{seq},{ng},{H}], got "
+            f"partial_lse must have shape [{seq},{ng_partial},{H}], got "
             f"{tuple(partial_lse.shape)}"
         )
 
@@ -114,8 +133,9 @@ def _launch_partial(
     sm_scale: float,
     *,
     ng: int,
+    inner_iter: int,
 ) -> None:
-    launch = compile_sparse_mla_partial(ng)
+    launch = compile_sparse_mla_partial(ng, inner_iter=inner_iter)
     _run_compiled(
         launch,
         ptr_arg(q, fx.Uint8),
@@ -146,6 +166,8 @@ def flydsl_sparse_mla_decode(
     allocated eagerly for convenience.
     """
     seq, ng = _validate_sparse_decode_inputs(q, kv, indices, out)
+    inner_iter = _pick_inner_iter(seq, ng)
+    ng_partial = _partial_groups(ng, inner_iter)
     if (partial_output is None) != (partial_lse is None):
         raise ValueError(
             "partial_output and partial_lse must be provided together for "
@@ -153,19 +175,30 @@ def flydsl_sparse_mla_decode(
         )
     if partial_output is None:
         partial_output = torch.empty(
-            (seq, ng, H, DV), device=q.device, dtype=torch.bfloat16
+            (seq, ng_partial, H, DV), device=q.device, dtype=torch.bfloat16
         )
-        partial_lse = torch.empty((seq, ng, H), device=q.device, dtype=torch.float32)
+        partial_lse = torch.empty(
+            (seq, ng_partial, H), device=q.device, dtype=torch.float32
+        )
     else:
         _validate_workspace(
             partial_output,
             partial_lse,
             seq=seq,
-            ng=ng,
+            ng_partial=ng_partial,
             device=q.device,
         )
 
-    _launch_partial(q, kv, indices, partial_output, partial_lse, sm_scale, ng=ng)
+    _launch_partial(
+        q,
+        kv,
+        indices,
+        partial_output,
+        partial_lse,
+        sm_scale,
+        ng=ng,
+        inner_iter=inner_iter,
+    )
     _flydsl_sparse_mla_decode_combine(
         partial_output.unsqueeze(0),
         partial_lse.unsqueeze(0),

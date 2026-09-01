@@ -66,11 +66,14 @@ def _mfma32(a, b, c):
 @functools.lru_cache(maxsize=64)
 def compile_sparse_mla_partial(
     ng: int,
+    inner_iter: int = 1,
     waves_per_eu: int = 1,
 ):
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
+    if inner_iter != 1:
+        raise NotImplementedError("sparse MLA decode inner_iter > 1 is not wired yet")
 
     @fx.struct
     class PartialStorage:
@@ -84,7 +87,7 @@ def compile_sparse_mla_partial(
     attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
 
     @flyc.kernel(
-        name=f"flydsl_sparse_mla_partial_ng{ng}",
+        name=f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}",
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
     def kernel(
