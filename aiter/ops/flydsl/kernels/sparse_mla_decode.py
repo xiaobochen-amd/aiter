@@ -334,6 +334,13 @@ def compile_sparse_mla_partial(
                     )
                     next_denom = running_denom * alpha + tile_denom * beta
                     output_scale = beta * fx.Float32(1.0 / FP8_MAX)
+                    if fx.const_expr(k_i + 1 == inner_iter):
+                        final_inv_denom = (next_denom == fx.Float32(0.0)).select(
+                            fx.Float32(0.0),
+                            fx.Float32(
+                                fx.rocdl.rcp(T.f32, next_denom.ir_value())
+                            ),
+                        )
 
                 p4 = fx.ptr_load(
                     lds.plds.ptr + lane * fx.Int32(H),
@@ -375,29 +382,26 @@ def compile_sparse_mla_partial(
                             partial_ptr + out_record * DV + fx.Int64(out_col),
                         )
                     else:
-                        running_acc[j] = (
+                        next_acc = (
                             fx.Vector(running_acc[j]) * alpha
                             + fx.Vector(acc) * output_scale
                         )
+                        if fx.const_expr(k_i + 1 == inner_iter):
+                            out_col = dv_base + fx.Int32(4) * group
+                            fx.ptr_store(
+                                (fx.Vector(next_acc) * final_inv_denom).to(
+                                    fx.BFloat16
+                                ),
+                                partial_ptr + out_record * DV + fx.Int64(out_col),
+                            )
+                        else:
+                            running_acc[j] = next_acc
 
                 if fx.const_expr(inner_iter > 1):
                     running_max = next_max
                     running_denom = next_denom
                     if fx.const_expr(k_i + 1 < inner_iter):
                         fx.gpu.barrier()
-
-            if fx.const_expr(inner_iter > 1):
-                inv_denom = (running_denom == fx.Float32(0.0)).select(
-                    fx.Float32(0.0),
-                    fx.Float32(fx.rocdl.rcp(T.f32, running_denom.ir_value())),
-                )
-                for j in fx.range_constexpr(8):
-                    dv_base = (wave * fx.Int32(8) + fx.Int32(j)) * 16
-                    out_col = dv_base + fx.Int32(4) * group
-                    fx.ptr_store(
-                        (fx.Vector(running_acc[j]) * inv_denom).to(fx.BFloat16),
-                        partial_ptr + out_record * DV + fx.Int64(out_col),
-                    )
 
             with _if_then(
                 scf.IfOp(
