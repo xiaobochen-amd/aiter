@@ -339,17 +339,17 @@ def _compile_sparse_mla_prefill():
                 )
             fx.barrier()
 
-            new_max = running_max
-            for other_wave in range_constexpr(_NUM_WAVES):
-                value = fx.Float32(
-                    fx.ptr_load(
-                        fx.add_offset(
-                            shared.row_max.ptr,
-                            fx.Int32(other_wave * 16) + lane_col,
-                        )
+            value = fx.Float32(
+                fx.ptr_load(
+                    fx.add_offset(
+                        shared.row_max.ptr, lane_group * 16 + lane_col
                     )
                 )
-                new_max = max_f32(value, new_max)
+            )
+            new_max = max_f32(value, running_max)
+            for xor_mask in (16, 32):
+                first, second = cross_lane_pair(new_max, xor_mask)
+                new_max = max_f32(first, second)
             safe_max = (new_max > neg_inf).select(new_max, zero_f)
             alpha = fx.Float32(rocdl.exp2(f32, _raw(running_max - safe_max)))
 
