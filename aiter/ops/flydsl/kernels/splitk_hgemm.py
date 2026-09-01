@@ -27,6 +27,10 @@ SPLIT_K_SEMAPHORE_STRIDE = 32
 
 NUM_XCD = 8
 
+# B's cache policy is a per-config choice: the default keeps both levels, and a
+# long read-once stream opts into skipping them.
+B_CPOL_OPTIONS = ("", "nt sc0 sc1")
+
 
 def _pairwise_sum(parts):
     """Sum a Python list of vectors as a balanced tree.
@@ -146,7 +150,11 @@ def compile_hgemm_kernel(
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
     XCD_BAND: int = 1,
+    K_ROT: int = 0,
+    M_ROWS: int = 0,
+    B_CPOL: int = 0,
 ):
+    assert 0 <= B_CPOL < len(B_CPOL_OPTIONS)
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
     if (TILE_M == 256) and (TILE_N == 256):
@@ -156,7 +164,10 @@ def compile_hgemm_kernel(
     N_BLOCKS = -(-n // TILE_N)
     assert N_BLOCKS >= 1
     assert XCD_BAND >= 1
-    assert (XCD_BAND == 1) or (N_BLOCKS % (NUM_XCD * XCD_BAND) == 0)
+    assert (K_ROT == 0) or B_TO_LDS
+    XCD_SPAN_FULL = N_BLOCKS // (NUM_XCD * XCD_BAND) * (NUM_XCD * XCD_BAND)
+    XCD_SPAN_TAIL = N_BLOCKS - XCD_SPAN_FULL
+    assert (XCD_BAND == 1) or (XCD_SPAN_FULL > 0)
     IS_SPLIT_K = SPLIT_K > 1
     # Split s of tile t is workgroup t + s * grid_x, so a grid_x that is a
     # multiple of NUM_XCD keeps every split of a tile on one XCD.
@@ -286,13 +297,20 @@ def compile_hgemm_kernel(
         assert (tile_vecs < BLOCK_THREADS) and (tile_vecs % WARP_SIZE == 0)
         return 1, True
 
-    LDG_REG_A_COUNT_AS, LDG_A_PREDICATE = split_g2s_rounds(
-        BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE
-    )
+    # The MFMA tile is 16 rows wide, so a caller with fewer rows spends part of
+    # every A g2s round on padding; fetch only the rows the caller can use and
+    # let the rest of the LDS tile feed accumulators the epilogue drops.
+    A_ROWS = BLOCK_M if M_ROWS <= 0 else min(M_ROWS, BLOCK_M)
+    assert A_ROWS >= 1
+    LDG_A_VECS_AS = A_ROWS * BLOCK_K // LDG_ASYNC_VEC_SIZE
+    LDG_REG_A_COUNT_AS, LDG_A_PREDICATE = split_g2s_rounds(LDG_A_VECS_AS)
+    # A wave that issues no load shortens the graded wait for every wave, so a
+    # row count that turns a whole-block A stream into a predicated one is not
+    # a valid trade and is rejected rather than silently shallowing the pipe.
+    assert LDG_A_PREDICATE == split_g2s_rounds(BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE)[1]
     LDG_REG_B_COUNT_AS, LDG_B_PREDICATE = split_g2s_rounds(
         BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE
     )
-    LDG_A_VECS_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE
     LDG_B_VECS_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE
     # The barrier counter is per wave, so it must hold for a wave issuing none.
     LDG_WAIT_COUNT = (0 if LDG_B_PREDICATE else LDG_REG_B_COUNT_AS) + (
@@ -321,6 +339,12 @@ def compile_hgemm_kernel(
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     if XCD_BAND > 1:
         KERNEL_NAME += f"_XB{XCD_BAND}"
+    if K_ROT:
+        KERNEL_NAME += f"_KR{K_ROT}"
+    if A_ROWS != BLOCK_M:
+        KERNEL_NAME += f"_MR{A_ROWS}"
+    if B_CPOL:
+        KERNEL_NAME += f"_CP{B_CPOL}"
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
 
@@ -442,14 +466,32 @@ def compile_hgemm_kernel(
             if const_expr(XCD_BAND > 1):
                 xcd = block_n_idx % NUM_XCD
                 pos = block_n_idx // NUM_XCD
-                block_n_idx = (pos // XCD_BAND * NUM_XCD + xcd) * XCD_BAND + (
-                    pos % XCD_BAND
-                )
+                banded = (pos // XCD_BAND * NUM_XCD + xcd) * XCD_BAND + (pos % XCD_BAND)
+                # Band whole spans only; the leftover tail stays identity so the
+                # map is a bijection for any N_BLOCKS, not just exact multiples.
+                if const_expr(XCD_SPAN_TAIL):
+                    banded = (block_n_idx < XCD_SPAN_FULL).select(banded, block_n_idx)
+                block_n_idx = banded
             return pid // N_BLOCKS, block_n_idx
 
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
+        if const_expr(K_ROT):
+            # Every block otherwise streams the same k window at the same time,
+            # so their B bursts crowd one set of DRAM pages; stagger the starts.
+            k_rot_tiles = (block_n_idx * K_ROT) % BLOCK_K_LOOPS
+            ks_first = arith.index_cast(T.i32, ks_idx * ks + k_rot_tiles * BLOCK_K)
+            ks_wrap = ks_begin + (ks - BLOCK_K)
+        else:
+            ks_first = ks_begin
+
+        def k_next(k_offset):
+            nxt = k_offset + fx.Int32(BLOCK_K)
+            if const_expr(K_ROT):
+                # Wrap, so a rotated start still visits every k tile exactly once.
+                nxt = (k_offset < ks_wrap).select(nxt, ks_begin)
+            return nxt
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -656,7 +698,9 @@ def compile_hgemm_kernel(
                 lds_ptr = buffer_ops.get_element_ptr(
                     lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
                 )
-            buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
+            buffer_load_lds_inline(
+                B_.rsrc, lds_ptr, global_offset, cpol=B_CPOL_OPTIONS[B_CPOL]
+            )
             return lds_ptr
 
         def ldg_sts_b_async(k_offset, lds_stage):
@@ -911,9 +955,11 @@ def compile_hgemm_kernel(
         warp_offset = get_dma_copy_warp_offset()
 
         if const_expr(B_TO_LDS):
+            k_load = ks_first
             for s in range_constexpr(STAGES - 1):
-                ldg_sts_b_async(ks_begin + s * BLOCK_K, s)
-                ldg_sts_a_async(ks_begin + s * BLOCK_K, s)
+                ldg_sts_b_async(k_load, s)
+                ldg_sts_a_async(k_load, s)
+                k_load = k_next(k_load)
             rocdl.sched_barrier(0)
 
             def hot_loop_scheduler():
@@ -951,11 +997,11 @@ def compile_hgemm_kernel(
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
 
-            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
+            init_state = [k_load, arith.constant(0, index=True)] + c_frags
             for bki, state in range(
                 0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state
             ):
-                k_offset = state[0]
+                k_load = state[0]
                 current_stage = fx.Index(state[1])
                 c_frags = state[2:]
                 next_stage = (current_stage + 1) % STAGES
@@ -965,18 +1011,18 @@ def compile_hgemm_kernel(
                     c_frags_new = async_copy_ldmatrix_compute_tile_streaming(
                         current_stage,
                         c_frags,
-                        k_offset + (STAGES - 1) * BLOCK_K,
+                        k_load,
                         write_stage,
                     )
                 else:
-                    ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
-                    ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
+                    ldg_sts_b_async(k_load, write_stage)
+                    ldg_sts_a_async(k_load, write_stage)
                     c_frags_new = ldmatrix_compute_tile_streaming(
                         current_stage, c_frags
                     )
-                k_offset_next = k_offset + fx.Int32(BLOCK_K)
+                k_load_next = k_next(k_load)
                 hot_loop_scheduler()
-                results = yield [k_offset_next, next_stage] + c_frags_new
+                results = yield [k_load_next, next_stage] + c_frags_new
             current_stage = fx.Index(results[1])
             c_frags = results[2:]
             for s in range_constexpr(0, STAGES - 1):
@@ -1191,7 +1237,19 @@ def compile_hgemm_kernel(
             if USE_8WAVE_PIPE
             else None
         )
-        hgemm_kernel(C, A, B, BIAS, m, semaphore, workspace).launch(
+        # Preloading the leading kernarg dwords into user SGPRs removes the
+        # scalar round trip every block serialises before its first B load.
+        preload = [{"llvm.inreg": ir.UnitAttr.get()}] * 5 + [{}] * 2
+        hgemm_kernel(
+            C,
+            A,
+            B,
+            BIAS,
+            m,
+            semaphore,
+            workspace,
+            value_attrs={"arg_attrs": preload},
+        ).launch(
             grid=(bm * N_BLOCKS, SPLIT_K, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

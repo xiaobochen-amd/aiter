@@ -20,7 +20,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from .kernels.splitk_hgemm import SPLIT_K_SEMAPHORE_STRIDE
+from .kernels.splitk_hgemm import B_CPOL_OPTIONS, SPLIT_K_SEMAPHORE_STRIDE
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
@@ -66,6 +66,9 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
     r")?"
     r"(?:_xb(?P<xcd_band>\d+))?"
+    r"(?:_kr(?P<k_rot>\d+))?"
+    r"(?:_mr(?P<m_rows>\d+))?"
+    r"(?:_cp(?P<b_cpol>\d+))?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
 
@@ -367,6 +370,7 @@ def _validate_hgemm_tiling(
     block_n_warps: int,
     block_k_warps: int,
     b_to_lds: bool,
+    b_cpol: int = 0,
 ) -> None:
     config = {
         "TILE_M": tile_m,
@@ -406,6 +410,10 @@ def _validate_hgemm_tiling(
     if pack_n != 1:
         raise ValueError(
             f"Current kernel only supports `pack_n=1`; got pack_n={pack_n}"
+        )
+    if not 0 <= b_cpol < len(B_CPOL_OPTIONS):
+        raise ValueError(
+            f"Invalid b_cpol={b_cpol}; expected 0..{len(B_CPOL_OPTIONS) - 1}"
         )
 
     warp_atom_m = 16
@@ -568,6 +576,9 @@ def _parse_hgemm_kernel_params(name: str) -> dict | None:
         "b_preshuffle": m.group("b_preshuffle") == "True",
         "c_to_lds": m.group("c_to_lds") == "True",
         "xcd_band": int(m.group("xcd_band") or 1),
+        "k_rot": int(m.group("k_rot") or 0),
+        "m_rows": int(m.group("m_rows") or 0),
+        "b_cpol": int(m.group("b_cpol") or 0),
         "dtype": m.group("a_dtype"),
         "out_dtype": m.group("out_dtype"),
         "target_gfx": m.group("target_gfx"),
@@ -784,6 +795,9 @@ def _compile_flydsl_hgemm(
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
     xcd_band: int = 1,
+    k_rot: int = 0,
+    m_rows: int = 0,
+    b_cpol: int = 0,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -810,6 +824,7 @@ def _compile_flydsl_hgemm(
             block_n_warps=block_n_warps,
             block_k_warps=block_k_warps,
             b_to_lds=b_to_lds,
+            b_cpol=b_cpol,
         )
     elif kernel_family == KERNEL_FAMILY_SMALL_M:
         if dtype != "bf16":
@@ -853,6 +868,9 @@ def _compile_flydsl_hgemm(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
         xcd_band=xcd_band,
+        k_rot=k_rot,
+        m_rows=m_rows,
+        b_cpol=b_cpol,
     )
 
     def launcher(
@@ -873,6 +891,10 @@ def _compile_flydsl_hgemm(
             )
         launch_bias = b if bias is None else bias
         runtime_m = int(a.shape[0])
+        if m_rows and runtime_m > m_rows:
+            raise ValueError(
+                f"This launcher fetches {m_rows} A rows; got m={runtime_m}."
+            )
         launch_stream = _normalize_launch_stream(a.device, stream)
         if split_k > 1:
             _check_split_k_capacity(runtime_m, n, tile_m, tile_n, split_k)
@@ -924,6 +946,9 @@ def flydsl_hgemm(
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
     xcd_band: int = 1,
+    k_rot: int = 0,
+    m_rows: int = 0,
+    b_cpol: int = 0,
     kernel_family: str | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
@@ -979,6 +1004,9 @@ def flydsl_hgemm(
         split_k=split_k,
         c_to_lds=c_to_lds,
         xcd_band=xcd_band,
+        k_rot=k_rot,
+        m_rows=m_rows,
+        b_cpol=b_cpol,
         kernel_family=resolved_kernel_family,
         has_bias=bias is not None,
     )
