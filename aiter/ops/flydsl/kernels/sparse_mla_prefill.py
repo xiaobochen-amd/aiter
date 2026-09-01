@@ -202,7 +202,9 @@ def _compile_sparse_mla_prefill():
                 Vec(state[2 + item]) for item in range_constexpr(_DV_TILES_PER_WAVE)
             ]
 
-            scores = []
+            # Issue all gathered KV loads before the QK MFMAs.
+            kv_low = []
+            kv_high = []
             for tile_index in range_constexpr(_QK_TILES_PER_WAVE):
                 tile = wave * _QK_TILES_PER_WAVE + tile_index
                 row = fx.Int32(
@@ -217,22 +219,41 @@ def _compile_sparse_mla_prefill():
                 )
                 safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
                 kv_base = safe_row * (_HEAD_DIM // 4)
-                key_location = fx.Int32(_key_slot(tile, 0)) + key_slot_col
-                value_offset = key_location * _KV_LDS_PITCH
+                low_chunks = []
+                high_chunks = []
+                for chunk in range_constexpr(4):
+                    low_chunks.append(
+                        load_i32_vector4(
+                            kv_divided,
+                            kv_base + 32 * chunk + 4 * lane_group,
+                        )
+                    )
+                    high_chunks.append(
+                        load_i32_vector4(
+                            kv_divided,
+                            kv_base + 32 * chunk + 16 + 4 * lane_group,
+                        )
+                    )
+                low_chunks.append(
+                    load_i32_vector4(
+                        kv_divided, kv_base + (_V_HEAD_DIM // 4) + 4 * lane_group
+                    )
+                )
+                kv_low.append(low_chunks)
+                kv_high.append(high_chunks)
 
+            scores = []
+            for tile_index in range_constexpr(_QK_TILES_PER_WAVE):
+                tile = wave * _QK_TILES_PER_WAVE + tile_index
                 score_fragment = fx.make_rmem_tensor(4, fx.Float32)
                 score_fragment.store(zero4)
                 for chunk in range_constexpr(4):
-                    low = load_i32_vector4(
-                        kv_divided,
-                        kv_base + 32 * chunk + 4 * lane_group,
-                    )
-                    high = load_i32_vector4(
-                        kv_divided,
-                        kv_base + 32 * chunk + 16 + 4 * lane_group,
-                    )
                     kv_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                    kv_fragment.store(low.shuffle(high, list(range(8))))
+                    kv_fragment.store(
+                        kv_low[tile_index][chunk].shuffle(
+                            kv_high[tile_index][chunk], list(range(8))
+                        )
+                    )
                     fx.gemm(
                         qk_mma,
                         score_fragment,
@@ -240,22 +261,8 @@ def _compile_sparse_mla_prefill():
                         q_fragments[chunk],
                         score_fragment,
                     )
-                    _lds_store_i32x4(
-                        values_base,
-                        value_offset + 128 * chunk + 16 * lane_group,
-                        low,
-                    )
-                    _lds_store_i32x4(
-                        values_base,
-                        value_offset + 128 * chunk + 64 + 16 * lane_group,
-                        high,
-                    )
-
-                rope_kv = load_i32_vector4(
-                    kv_divided, kv_base + (_V_HEAD_DIM // 4) + 4 * lane_group
-                )
                 kv_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                kv_fragment.store(rope_kv.shuffle(zero4i, list(range(8))))
+                kv_fragment.store(kv_low[tile_index][4].shuffle(zero4i, list(range(8))))
                 fx.gemm(
                     qk_mma,
                     score_fragment,
@@ -264,6 +271,20 @@ def _compile_sparse_mla_prefill():
                     score_fragment,
                 )
                 score = Vec(score_fragment.load().ir_value())
+
+                key_location = fx.Int32(_key_slot(tile, 0)) + key_slot_col
+                value_offset = key_location * _KV_LDS_PITCH
+                for chunk in range_constexpr(4):
+                    _lds_store_i32x4(
+                        values_base,
+                        value_offset + 128 * chunk + 16 * lane_group,
+                        kv_low[tile_index][chunk],
+                    )
+                    _lds_store_i32x4(
+                        values_base,
+                        value_offset + 128 * chunk + 64 + 16 * lane_group,
+                        kv_high[tile_index][chunk],
+                    )
 
                 validity = Vec(
                     _llvm.load(
