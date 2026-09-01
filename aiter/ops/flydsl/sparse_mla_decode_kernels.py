@@ -34,6 +34,21 @@ def _partial_groups(ng_total: int, inner_iter: int) -> int:
     return ng_total // inner_iter
 
 
+def sparse_mla_decode_workspace_shape(
+    seq: int, width: int
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int]]:
+    """Return the partial-output and partial-LSE shapes for sparse MLA decode."""
+    if not 1 <= seq <= 96:
+        raise ValueError(f"supported sparse decode seq values are 1..96; got {seq}")
+    if width % BLOCK_I != 0:
+        raise ValueError(f"index width must be padded to {BLOCK_I}, got {width}")
+    ng = width // BLOCK_I
+    if not 1 <= ng <= 33:
+        raise ValueError(f"supported split count is 1..33, got {ng}")
+    ng_partial = _partial_groups(ng, _pick_inner_iter(seq, ng))
+    return (seq, ng_partial, H, DV), (seq, ng_partial, H)
+
+
 def _require_cuda_tensor(
     name: str, tensor: torch.Tensor, *, dtype: torch.dtype
 ) -> None:
@@ -207,4 +222,4 @@ def flydsl_sparse_mla_decode(
     return out
 
 
-__all__ = ["flydsl_sparse_mla_decode"]
+__all__ = ["flydsl_sparse_mla_decode", "sparse_mla_decode_workspace_shape"]
