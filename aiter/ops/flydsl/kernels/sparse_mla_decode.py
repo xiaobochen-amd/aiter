@@ -325,22 +325,14 @@ def compile_sparse_mla_partial(
                         ),
                     )
                 else:
-                    if fx.const_expr(k_i == 0):
-                        next_max = tile_max
-                        alpha = fx.Float32(0.0)
-                        beta = (tile_denom == fx.Float32(0.0)).select(
-                            fx.Float32(0.0), fx.Float32(1.0)
-                        )
-                        next_denom = tile_denom
-                    else:
-                        next_max = running_max.maximumf(tile_max)
-                        alpha = (running_denom == fx.Float32(0.0)).select(
-                            fx.Float32(0.0), _exp2(running_max - next_max)
-                        )
-                        beta = (tile_denom == fx.Float32(0.0)).select(
-                            fx.Float32(0.0), _exp2(tile_max - next_max)
-                        )
-                        next_denom = running_denom * alpha + tile_denom * beta
+                    next_max = running_max.maximumf(tile_max)
+                    alpha = (running_denom == fx.Float32(0.0)).select(
+                        fx.Float32(0.0), _exp2(running_max - next_max)
+                    )
+                    beta = (tile_denom == fx.Float32(0.0)).select(
+                        fx.Float32(0.0), _exp2(tile_max - next_max)
+                    )
+                    next_denom = running_denom * alpha + tile_denom * beta
                     output_scale = beta * fx.Float32(1.0 / FP8_MAX)
                     if fx.const_expr(k_i + 1 == inner_iter):
                         final_inv_denom = (next_denom == fx.Float32(0.0)).select(
