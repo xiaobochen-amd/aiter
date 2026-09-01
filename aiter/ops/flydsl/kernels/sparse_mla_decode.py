@@ -188,7 +188,20 @@ def compile_sparse_mla_partial(
                     + fx.Int64(slot)
                 )
                 row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
-                lds.ilds[slot] = row
+                # slot is group-invariant, so all 4 lane-groups would write the
+                # same ilds address with the same value: a 4-way same-address LDS
+                # bank conflict. Publish once from group 0 (lane<16); the ids
+                # reader only needs a single populated copy per slot.
+                with _if_then(
+                    scf.IfOp(
+                        arith.cmpi(
+                            CmpIPredicate.slt,
+                            _raw(lane),
+                            arith.constant(16, type=T.i32),
+                        )
+                    )
+                ):
+                    lds.ilds[slot] = row
                 safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
                 kv_base = fx.Int64(safe_row) * DIM
 
