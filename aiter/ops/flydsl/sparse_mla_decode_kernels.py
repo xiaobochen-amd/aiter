@@ -18,12 +18,21 @@ from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
 
-    The producer currently implements only the legacy one-64-key-tile path.
-    Keeping this shape decision centralized makes the upcoming inner-iteration
-    path a wrapper+producer change instead of leaking scratch geometry into
-    callers.
+    Merge adjacent 64-key tiles only while the reduced producer grid still has
+    enough CTAs to cover the GPU. This keeps small decode batches on the
+    lower-latency one-tile path and lets wide/large decode cases reduce scratch
+    traffic and combine work without a shape whitelist.
     """
-    return 1
+    inner_iter = 1
+    min_producer_ctas = 512
+    while inner_iter < 4:
+        candidate = inner_iter * 2
+        if ng_total % candidate != 0:
+            break
+        if seq * (ng_total // candidate) < min_producer_ctas:
+            break
+        inner_iter = candidate
+    return inner_iter
 
 
 def _partial_groups(ng_total: int, inner_iter: int) -> int:
