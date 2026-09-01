@@ -561,9 +561,9 @@ def flydsl_mla_reduce_v1(
     use_reduce_final_map = reduce_final_map is not None
 
     if final_lse is None:
-        final_lse = torch.empty(1, dtype=torch.float32, device=final_output.device)
+        final_lse = partial_lse
     if reduce_final_map is None:
-        reduce_final_map = torch.empty(1, dtype=torch.int32, device=final_output.device)
+        reduce_final_map = reduce_indptr
     if stream is None:
         stream = torch.cuda.current_stream(final_output.device)
 
