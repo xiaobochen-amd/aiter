@@ -272,9 +272,6 @@ def _compile_sparse_mla_prefill():
                 )
                 score = Vec(score_fragment.load().ir_value())
 
-                if key_start > fx.Int32(0):
-                    fx.barrier()
-
                 key_location = fx.Int32(_key_slot(tile, 0)) + key_slot_col
                 value_offset = key_location * _KV_LDS_PITCH
                 for chunk in range_constexpr(4):
@@ -445,6 +442,7 @@ def _compile_sparse_mla_prefill():
                         output_fragment,
                     )
                 accumulators[tile] = Vec(output_fragment.load().ir_value())
+            fx.barrier()
 
             loop_result = yield (
                 [_raw(running_max), _raw(running_sum)]
