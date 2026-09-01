@@ -180,10 +180,12 @@ def compile_sparse_mla_partial(
                 for _ in fx.range_constexpr(8)
             ]
 
+            first_tile = split * fx.Int32(inner_iter)
+            index_token_offset = fx.Int64(tok) * (ng * BLOCK_I)
             for k_i in fx.range_constexpr(inner_iter):
-                tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
+                tile = first_tile + fx.Int32(k_i)
                 index_offset = (
-                    fx.Int64(tok) * (ng * BLOCK_I)
+                    index_token_offset
                     + fx.Int64(tile * fx.Int32(BLOCK_I))
                     + fx.Int64(slot)
                 )
