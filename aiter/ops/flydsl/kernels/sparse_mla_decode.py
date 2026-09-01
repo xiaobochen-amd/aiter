@@ -357,14 +357,10 @@ def compile_sparse_mla_partial(
                 for j in fx.range_constexpr(8):
                     dv_base = (wave * fx.Int32(8) + fx.Int32(j)) * 16
                     acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    vptr = lds.vlds.ptr + trbase + dv_base
                     for half in fx.range_constexpr(2):
-                        vptr = (
-                            lds.vlds.ptr
-                            + trbase
-                            + dv_base
-                            + fx.Int32(half * 32 * PITCH)
-                        )
-                        vaddr = fx.Int64(fx.ptrtoint(vptr))
+                        half_vptr = vptr + fx.Int32(half * 32 * PITCH)
+                        vaddr = fx.Int64(fx.ptrtoint(half_vptr))
                         llvm_vptr = llvm.inttoptr(
                             ir.Type.parse("!llvm.ptr<3>"), _raw(vaddr)
                         )
