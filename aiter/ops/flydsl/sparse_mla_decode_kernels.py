@@ -24,7 +24,7 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
     traffic and combine work without a shape whitelist.
     """
     inner_iter = 1
-    min_producer_ctas = 512
+    min_producer_ctas = 256
     while inner_iter < 4:
         candidate = inner_iter * 2
         if ng_total % candidate != 0:
