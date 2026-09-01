@@ -318,19 +318,19 @@ def _compile_sparse_decode_direct_combine(ni: int):
         )
 
         in_split = lane < fx.Int32(ni)
-        safe_split = in_split.select(lane, fx.Int32(0))
-        lse = fx.Float32(
-            fx.ptr_load(
-                partial_lse
-                + (
-                    (fx.Int64(row) * ni + fx.Int64(safe_split)) * 16
-                    + fx.Int64(head)
-                )
-            )
-        )
         neg_inf = fx.Float32(float("-inf"))
         zero = fx.Float32(0.0)
-        lse = in_split.select(lse, neg_inf)
+        lse = neg_inf
+        if in_split:
+            lse = fx.Float32(
+                fx.ptr_load(
+                    partial_lse
+                    + (
+                        (fx.Int64(row) * ni + fx.Int64(lane)) * 16
+                        + fx.Int64(head)
+                    )
+                )
+            )
         max_lse = lse
         for off in [32, 16, 8, 4, 2, 1]:
             peer = fx.Float32(max_lse).shuffle_xor(
