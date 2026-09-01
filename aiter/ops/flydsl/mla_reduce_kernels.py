@@ -296,6 +296,14 @@ def _compile_sparse_decode_direct_combine(ni: int):
         row = fx.Int32(fx.block_idx.x) // fx.Int32(4)
         head_base = (fx.Int32(fx.block_idx.x) % fx.Int32(4)) * fx.Int32(4)
         head = head_base + wave
+        scale_storage = fx.SharedAllocator(static=False).allocate(4 * 33 * 4, alignment=16)
+        scale_base = fx.index_cast(T.i32, fx.ptrtoint(scale_storage._ptr))
+        scale_ptr_ty = fx.PointerType.get(
+            elem_ty=T.f32,
+            address_space=fx.AddressSpace.Shared,
+            alignment=16,
+        )
+        scale_ptr = fx.inttoptr(scale_ptr_ty, scale_base)
         partial_buf = _pointer_buffer_tensor(
             partial_output,
             fx.BFloat16,
@@ -338,7 +346,9 @@ def _compile_sparse_decode_direct_combine(ni: int):
             )
             denom = denom + peer
         inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
-        scale = scale * inv
+        if in_split:
+            fx.ptr_store(scale * inv, scale_ptr + wave * fx.Int32(33) + lane)
+        fx.gpu.barrier()
 
         acc = [fx.Float32(0.0) for _ in fx.range_constexpr(8)]
         for split in fx.range_constexpr(ni):
@@ -350,11 +360,14 @@ def _compile_sparse_decode_direct_combine(ni: int):
                 8,
                 fx.BFloat16,
             )
-            split_scale = fx.Float32(scale).shuffle_xor(
-                lane ^ fx.Int32(split), fx.Int32(64)
-            )
+            scale = fx.Float32(0.0)
+            if lane == fx.Int32(0):
+                scale = fx.Float32(
+                    fx.ptr_load(scale_ptr + wave * fx.Int32(33) + fx.Int32(split))
+                )
+            scale = fx.Float32(fx.rocdl.readfirstlane(T.f32, scale.ir_value()))
             acc = [
-                acc[i] + vals[i] * split_scale
+                acc[i] + vals[i] * scale
                 for i in fx.range_constexpr(8)
             ]
         _store_final_out(
