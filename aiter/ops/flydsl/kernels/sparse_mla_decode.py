@@ -269,10 +269,9 @@ def compile_sparse_mla_partial(
                     fx.Float32(0.0), tile_max
                 )
                 probs = [None] * 4
-                prob_sum = fx.Float32(0.0)
                 for r in fx.range_constexpr(4):
                     probs[r] = _exp2(qk[r] - max_safe)
-                    prob_sum = prob_sum + probs[r]
+                prob_sum = (probs[0] + probs[1]) + (probs[2] + probs[3])
                 packed = fx.rocdl.cvt_pk_fp8_f32(
                     T.i32,
                     probs[0] * fx.Float32(FP8_MAX),
@@ -309,11 +308,13 @@ def compile_sparse_mla_partial(
                     lds.rsum[wave * fx.Int32(H) + head] = prob_sum
                 fx.gpu.barrier()
 
-                tile_denom = fx.Float32(0.0)
-                for ww in fx.range_constexpr(PARTIAL_WAVES):
-                    tile_denom = tile_denom + fx.Float32(
-                        lds.rsum[ww * H + head]
-                    )
+                tile_sums = [
+                    fx.Float32(lds.rsum[ww * H + head])
+                    for ww in fx.range_constexpr(PARTIAL_WAVES)
+                ]
+                tile_denom = (tile_sums[0] + tile_sums[1]) + (
+                    tile_sums[2] + tile_sums[3]
+                )
                 if fx.const_expr(inner_iter == 1):
                     output_scale = (tile_denom == fx.Float32(0.0)).select(
                         fx.Float32(0.0),
