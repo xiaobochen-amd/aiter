@@ -18,26 +18,29 @@ from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
 
-    Merge adjacent 64-key tiles only while the tail-safe reduced producer grid
-    still has enough CTAs to cover the GPU. This keeps small decode batches on
-    the lower-latency one-tile path and lets wide/large decode cases reduce
-    scratch traffic and combine work without a shape whitelist.
+    Merge adjacent 64-key tiles only while the reduced producer grid still has
+    enough CTAs to cover the GPU. This keeps small decode batches on the
+    lower-latency one-tile path and lets wide/large decode cases reduce scratch
+    traffic and combine work without a shape whitelist.
     """
     inner_iter = 1
-    min_producer_ctas = 384
+    min_producer_ctas = 512
     while inner_iter < 4:
         candidate = inner_iter * 2
-        ng_partial = (ng_total + candidate - 1) // candidate
-        if seq * ng_partial < min_producer_ctas:
+        if ng_total % candidate != 0:
+            break
+        if seq * (ng_total // candidate) < min_producer_ctas:
             break
         inner_iter = candidate
     return inner_iter
 
 
 def _partial_groups(ng_total: int, inner_iter: int) -> int:
-    if inner_iter < 1 or inner_iter & (inner_iter - 1):
-        raise ValueError(f"inner_iter={inner_iter} must be a power of two")
-    return (ng_total + inner_iter - 1) // inner_iter
+    if inner_iter < 1 or ng_total % inner_iter != 0:
+        raise ValueError(
+            f"ng_total={ng_total} must be divisible by inner_iter={inner_iter}"
+        )
+    return ng_total // inner_iter
 
 
 def sparse_mla_decode_workspace_shape(

@@ -72,9 +72,15 @@ def compile_sparse_mla_partial(
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
-    if inner_iter < 1 or inner_iter & (inner_iter - 1):
-        raise ValueError(f"inner_iter={inner_iter} must be a power of two")
-    n_groups = (ng + inner_iter - 1) // inner_iter
+    if (
+        inner_iter < 1
+        or inner_iter & (inner_iter - 1)
+        or ng % inner_iter != 0
+    ):
+        raise ValueError(
+            f"inner_iter={inner_iter} must be a power-of-two divisor of ng={ng}"
+        )
+    n_groups = ng // inner_iter
 
     @fx.struct
     class PartialStorage:
@@ -176,15 +182,12 @@ def compile_sparse_mla_partial(
 
             for k_i in fx.range_constexpr(inner_iter):
                 tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
-                valid_tile = tile < fx.Int32(ng)
-                safe_tile = valid_tile.select(tile, fx.Int32(0))
                 index_offset = (
                     fx.Int64(tok) * (ng * BLOCK_I)
-                    + fx.Int64(safe_tile * fx.Int32(BLOCK_I))
+                    + fx.Int64(tile * fx.Int32(BLOCK_I))
                     + fx.Int64(slot)
                 )
-                loaded_row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
-                row = valid_tile.select(loaded_row, fx.Int32(-1))
+                row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
                 lds.ilds[slot] = row
                 safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
                 kv_base = fx.Int64(safe_row) * DIM
@@ -322,15 +325,6 @@ def compile_sparse_mla_partial(
                         ),
                     )
                 else:
-                    tile_output_scale = (tile_denom == fx.Float32(0.0)).select(
-                        fx.Float32(0.0),
-                        fx.Float32(
-                            fx.rocdl.rcp(
-                                T.f32,
-                                (tile_denom * fx.Float32(FP8_MAX)).ir_value(),
-                            )
-                        ),
-                    )
                     next_max = running_max.maximumf(tile_max)
                     alpha = (running_denom == fx.Float32(0.0)).select(
                         fx.Float32(0.0), _exp2(running_max - next_max)
@@ -338,8 +332,8 @@ def compile_sparse_mla_partial(
                     beta = (tile_denom == fx.Float32(0.0)).select(
                         fx.Float32(0.0), _exp2(tile_max - next_max)
                     )
-                    merge_weight = tile_denom * beta
-                    next_denom = running_denom * alpha + merge_weight
+                    next_denom = running_denom * alpha + tile_denom * beta
+                    output_scale = beta * fx.Float32(1.0 / FP8_MAX)
                     if fx.const_expr(k_i + 1 == inner_iter):
                         final_inv_denom = (next_denom == fx.Float32(0.0)).select(
                             fx.Float32(0.0),
@@ -388,12 +382,9 @@ def compile_sparse_mla_partial(
                             partial_ptr + out_record * DV + fx.Int64(out_col),
                         )
                     else:
-                        tile_partial = (
-                            fx.Vector(acc) * tile_output_scale
-                        ).to(fx.BFloat16).to(fx.Float32)
                         next_acc = (
                             fx.Vector(running_acc[j]) * alpha
-                            + tile_partial * merge_weight
+                            + fx.Vector(acc) * output_scale
                         )
                         if fx.const_expr(k_i + 1 == inner_iter):
                             out_col = dv_base + fx.Int32(4) * group
