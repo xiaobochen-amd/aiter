@@ -341,6 +341,11 @@ def compile_sparse_mla_partial(
                                 fx.rocdl.rcp(T.f32, next_denom.ir_value())
                             ),
                         )
+                        final_inv_denom = final_inv_denom * (
+                            fx.Float32(2.0) - next_denom * final_inv_denom
+                        )
+                        final_prev_scale = alpha * final_inv_denom
+                        final_tile_scale = output_scale * final_inv_denom
 
                 p4 = fx.ptr_load(
                     lds.plds.ptr + lane * fx.Int32(H),
@@ -382,20 +387,21 @@ def compile_sparse_mla_partial(
                             partial_ptr + out_record * DV + fx.Int64(out_col),
                         )
                     else:
-                        next_acc = (
-                            fx.Vector(running_acc[j]) * alpha
-                            + fx.Vector(acc) * output_scale
-                        )
                         if fx.const_expr(k_i + 1 == inner_iter):
+                            next_acc = (
+                                fx.Vector(running_acc[j]) * final_prev_scale
+                                + fx.Vector(acc) * final_tile_scale
+                            )
                             out_col = dv_base + fx.Int32(4) * group
                             fx.ptr_store(
-                                (fx.Vector(next_acc) * final_inv_denom).to(
-                                    fx.BFloat16
-                                ),
+                                fx.Vector(next_acc).to(fx.BFloat16),
                                 partial_ptr + out_record * DV + fx.Int64(out_col),
                             )
                         else:
-                            running_acc[j] = next_acc
+                            running_acc[j] = (
+                                fx.Vector(running_acc[j]) * alpha
+                                + fx.Vector(acc) * output_scale
+                            )
 
                 if fx.const_expr(inner_iter > 1):
                     running_max = next_max
