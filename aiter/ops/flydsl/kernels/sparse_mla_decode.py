@@ -236,7 +236,7 @@ def compile_sparse_mla_partial(
                 qk = [None] * 4
                 for r in fx.range_constexpr(4):
                     qk[r] = (ids[r] >= fx.Int32(0)).select(
-                        fx.Float32(score[r]) * scale_log2e,
+                        fx.Float32(score[r]),
                         fx.Float32(float("-inf")),
                     )
                 local_max = fx.Float32(float("-inf"))
@@ -271,8 +271,9 @@ def compile_sparse_mla_partial(
                 probs = [None] * 4
                 prob_sum = fx.Float32(0.0)
                 for r in fx.range_constexpr(4):
-                    probs[r] = _exp2(qk[r] - max_safe)
+                    probs[r] = _exp2((qk[r] - max_safe) * scale_log2e)
                     prob_sum = prob_sum + probs[r]
+                tile_max = tile_max * scale_log2e
                 packed = fx.rocdl.cvt_pk_fp8_f32(
                     T.i32,
                     probs[0] * fx.Float32(FP8_MAX),
