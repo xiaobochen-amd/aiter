@@ -13,15 +13,22 @@ kernel, device-side per-tile tier selection) mirrors HIP.
 from __future__ import annotations
 
 import collections
+import functools
+import weakref
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr.typing import T
 
 from .kernels.mla_reduce import (
     LDS_MAX_SPLITS,
     NUM_THREADS,
     Tier,
     _get_splitk_scratch,
+    _load_partial_out_narrow,
+    _pointer_buffer_tensor,
+    _store_final_out,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
     derive_actual_max_splits,
@@ -100,7 +107,7 @@ def _validate_actual_max_splits(actual_max_splits: int | None) -> None:
         return
     if isinstance(actual_max_splits, bool) or not isinstance(actual_max_splits, int):
         raise TypeError(
-            "`actual_max_splits` must be an int or None, " f"got {actual_max_splits!r}"
+            f"`actual_max_splits` must be an int or None, got {actual_max_splits!r}"
         )
     if not 0 <= actual_max_splits <= LDS_MAX_SPLITS:
         raise ValueError(
@@ -227,7 +234,7 @@ def _validate_mla_reduce_inputs(
         raise TypeError(f"`num_kv_splits` must be an int, got {num_kv_splits!r}")
     if not 0 <= num_kv_splits <= LDS_MAX_SPLITS:
         raise ValueError(
-            f"`num_kv_splits` must be in [0, {LDS_MAX_SPLITS}], " f"got {num_kv_splits}"
+            f"`num_kv_splits` must be in [0, {LDS_MAX_SPLITS}], got {num_kv_splits}"
         )
     if Dv % NUM_THREADS != 0:
         raise ValueError(
@@ -244,8 +251,199 @@ def _validate_mla_reduce_inputs(
 
 
 # Cache mapping reduce_indptr buffer identity -> derived actual_max_splits.
+#
+# The key carries data_ptr, but a raw pointer is not an identity: once a buffer
+# is freed the allocator hands the same address to the next tensor, and a stale
+# entry would then answer for a different CSR -- silently supplying the wrong
+# split bound to a launch that cannot re-derive it under graph capture. Each
+# entry therefore also holds a weak reference to the storage the pointer came
+# from; a hit is only honoured while that storage is still alive and still at
+# that address.
 _ACTUAL_MAX_SPLITS_CACHE: collections.OrderedDict = collections.OrderedDict()
 _ACTUAL_MAX_SPLITS_CACHE_CAP = 512
+
+
+def _storage_ref(t: torch.Tensor):
+    """Weak reference to the tensor's storage, or None if it cannot be taken."""
+    try:
+        return weakref.ref(t.untyped_storage())
+    except (AttributeError, TypeError):
+        return None
+
+
+# ni ranges over 1..33 (see the guard below), so a 16-entry cache starts
+# thrashing as soon as a process sees more than 16 distinct split counts.
+# Re-entering an evicted entry costs about 20 ms even with the on-disk cache
+# warm: a pure host stall with the GPU idle. Size the cache to the domain.
+@functools.lru_cache(maxsize=64)
+def _compile_sparse_decode_direct_combine(ni: int):
+    if not 1 <= ni <= 33:
+        raise ValueError(f"sparse decode split count must be 1..33, got {ni}")
+
+    @flyc.kernel(
+        name=f"flydsl_sparse_mla_decode_combine_ni{ni}",
+        known_block_size=[256, 1, 1],
+    )
+    def kernel(
+        partial_output: fx.Pointer,
+        partial_lse: fx.Pointer,
+        final_output: fx.Pointer,
+        seq: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        wave = tid // fx.Int32(64)
+        lane = tid % fx.Int32(64)
+        row = fx.Int32(fx.block_idx.x) // fx.Int32(4)
+        head_base = (fx.Int32(fx.block_idx.x) % fx.Int32(4)) * fx.Int32(4)
+        head = head_base + wave
+        scale_storage = fx.SharedAllocator(static=False).allocate(
+            4 * 33 * 4, alignment=16
+        )
+        scale_base = fx.index_cast(T.i32, fx.ptrtoint(scale_storage._ptr))
+        scale_ptr_ty = fx.PointerType.get(
+            elem_ty=T.f32,
+            address_space=fx.AddressSpace.Shared,
+            alignment=16,
+        )
+        scale_ptr = fx.inttoptr(scale_ptr_ty, scale_base)
+        partial_buf = _pointer_buffer_tensor(
+            partial_output,
+            fx.BFloat16,
+            (seq * fx.Int32(ni), 16, 512),
+            (16 * 512, 512, 1),
+        )
+        final_buf = _pointer_buffer_tensor(
+            final_output,
+            fx.BFloat16,
+            (seq, 16, 512),
+            (16 * 512, 512, 1),
+        )
+
+        in_split = lane < fx.Int32(ni)
+        safe_split = in_split.select(lane, fx.Int32(0))
+        lse = fx.Float32(
+            fx.ptr_load(
+                partial_lse
+                + ((fx.Int64(row) * ni + fx.Int64(safe_split)) * 16 + fx.Int64(head))
+            )
+        )
+        neg_inf = fx.Float32(float("-inf"))
+        zero = fx.Float32(0.0)
+        lse = in_split.select(lse, neg_inf)
+        max_lse = lse
+        for off in [32, 16, 8, 4, 2, 1]:
+            peer = fx.Float32(max_lse).shuffle_xor(fx.Int32(off), fx.Int32(64))
+            max_lse = fx.Float32(max_lse).maximumf(peer)
+        scale = fx.Float32(fx.rocdl.exp2(T.f32, (lse - max_lse).ir_value()))
+        scale = in_split.select(scale, zero)
+        denom = scale
+        for off in [32, 16, 8, 4, 2, 1]:
+            peer = fx.Float32(denom).shuffle_xor(fx.Int32(off), fx.Int32(64))
+            denom = denom + peer
+        inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
+        if in_split:
+            fx.ptr_store(scale * inv, scale_ptr + wave * fx.Int32(33) + lane)
+        fx.gpu.barrier()
+
+        acc = [fx.Float32(0.0) for _ in fx.range_constexpr(8)]
+        for split in fx.range_constexpr(ni):
+            vals = _load_partial_out_narrow(
+                partial_buf,
+                row * fx.Int32(ni) + fx.Int32(split),
+                head,
+                lane,
+                8,
+                fx.BFloat16,
+            )
+            scale = fx.Float32(0.0)
+            if lane == fx.Int32(0):
+                scale = fx.Float32(
+                    fx.ptr_load(scale_ptr + wave * fx.Int32(33) + fx.Int32(split))
+                )
+            scale = fx.Float32(fx.rocdl.readfirstlane(T.f32, scale.ir_value()))
+            acc = [acc[i] + vals[i] * scale for i in fx.range_constexpr(8)]
+        _store_final_out(
+            final_buf,
+            row,
+            head,
+            lane,
+            acc,
+            8,
+            fx.BFloat16,
+        )
+
+    @flyc.jit
+    def launch(
+        partial_output: fx.Pointer,
+        partial_lse: fx.Pointer,
+        final_output: fx.Pointer,
+        seq: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(partial_output, partial_lse, final_output, seq).launch(
+            grid=(seq * fx.Int32(4), 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
+            value_attrs={"rocdl.waves_per_eu": 4},
+        )
+
+    return launch
+
+
+def _flydsl_sparse_mla_decode_combine(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    final_output: torch.Tensor,
+) -> None:
+    """Combine exact sparse-decode BF16 partials and log2 FP32 LSEs."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("FlyDSL sparse MLA decode requires ROCm")
+    tensors = (partial_output, partial_lse, final_output)
+    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
+        raise ValueError("sparse MLA decode tensors must be contiguous ROCm tensors")
+    if partial_output.dtype != torch.bfloat16:
+        raise TypeError(f"partial_output must be bf16, got {partial_output.dtype}")
+    if partial_lse.dtype != torch.float32 or final_output.dtype != torch.bfloat16:
+        raise TypeError("partial_lse must be fp32 and final_output must be bf16")
+    if partial_output.ndim != 5 or partial_lse.ndim != 4 or final_output.ndim != 4:
+        raise ValueError("expected partial_output/partial_lse/final_output ranks 5/4/4")
+    b, seq, ni, H, Dv = partial_output.shape
+    if b != 1 or not 1 <= seq <= 96 or not 1 <= ni <= 33 or (H, Dv) != (16, 512):
+        raise ValueError(
+            "supported sparse decode scope is b=1, 1<=seq<=96, "
+            f"1<=splits<=33, H=16, Dv=512; got {tuple(partial_output.shape)}"
+        )
+    if tuple(partial_lse.shape) != (b, seq, ni, H):
+        raise ValueError("partial_lse shape does not match partial_output")
+    if tuple(final_output.shape) != (b, seq, H, Dv):
+        raise ValueError("final_output shape does not match partial_output")
+    if not (partial_output.device == partial_lse.device == final_output.device):
+        raise ValueError("all sparse decode tensors must be on the same device")
+    arch = str(torch.cuda.get_device_properties(final_output.device).gcnArchName).split(
+        ":"
+    )[0]
+    if arch != "gfx950":
+        raise ValueError(
+            f"sparse decode BF16-direct reduce is gated to gfx950, got {arch}"
+        )
+
+    # A one-split softmax is already fully reduced by the partial kernel.  The
+    # generic reducer is tuned for multiple splits and its Dv-split launch
+    # intentionally has no single-split specialization.  A device copy keeps
+    # this edge case exact and remains safe under graph capture/replay.
+    if ni == 1:
+        final_output.copy_(partial_output[:, :, 0])
+        return
+
+    direct = _compile_sparse_decode_direct_combine(ni)
+    _run_compiled(
+        direct,
+        _pointer_arg(partial_output, torch.bfloat16),
+        _pointer_arg(partial_lse, torch.float32),
+        _pointer_arg(final_output, torch.bfloat16),
+        int(seq),
+        fx.Stream(torch.cuda.current_stream(final_output.device)),
+    )
 
 
 def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:
@@ -256,14 +454,34 @@ def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:
     it returns the cached value or ``None`` on a miss. The launch path rejects a
     cache miss before launch rather than using an unvalidated split bound.
     """
-    key = (reduce_indptr.data_ptr(), int(reduce_indptr.numel()))
-    if torch.cuda.is_current_stream_capturing():
-        return _ACTUAL_MAX_SPLITS_CACHE.get(key)
-    val = derive_actual_max_splits(reduce_indptr)
+    ptr = reduce_indptr.data_ptr()
+    key = (ptr, int(reduce_indptr.numel()))
     cache = _ACTUAL_MAX_SPLITS_CACHE
+
+    def _live(entry):
+        """True while the cached entry still describes this exact allocation."""
+        ref, cached_ptr, _ = entry
+        if ref is None:
+            return False
+        storage = ref()
+        return storage is not None and storage.data_ptr() == cached_ptr
+
+    if torch.cuda.is_current_stream_capturing():
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        if not _live(entry):
+            # The pointer was recycled: the buffer this value was derived from
+            # is gone. Report a miss -- the launch path rejects that rather than
+            # using an unvalidated bound.
+            del cache[key]
+            return None
+        return entry[2]
+
+    val = derive_actual_max_splits(reduce_indptr)
     if key in cache:
         cache.move_to_end(key)
-    cache[key] = val
+    cache[key] = (_storage_ref(reduce_indptr), ptr, val)
     if len(cache) > _ACTUAL_MAX_SPLITS_CACHE_CAP:
         cache.popitem(last=False)
     return val
