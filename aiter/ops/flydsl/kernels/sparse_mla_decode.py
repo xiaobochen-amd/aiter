@@ -66,22 +66,21 @@ def _mfma32(a, b, c):
 @functools.lru_cache(maxsize=64)
 def compile_sparse_mla_partial(
     ng: int,
-    tiles_per_cta: int = 1,
+    inner_iter: int = 1,
     waves_per_eu: int = 1,
 ):
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
     if (
-        tiles_per_cta < 1
-        or tiles_per_cta & (tiles_per_cta - 1)
-        or ng % tiles_per_cta != 0
+        inner_iter < 1
+        or inner_iter & (inner_iter - 1)
+        or ng % inner_iter != 0
     ):
         raise ValueError(
-            f"tiles_per_cta={tiles_per_cta} must be a power-of-two divisor "
-            f"of ng={ng}"
+            f"inner_iter={inner_iter} must be a power-of-two divisor of ng={ng}"
         )
-    n_groups = ng // tiles_per_cta
+    n_groups = ng // inner_iter
 
     @fx.struct
     class PartialStorage:
@@ -95,7 +94,7 @@ def compile_sparse_mla_partial(
     attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
 
     @flyc.kernel(
-        name=f"flydsl_sparse_mla_partial_ng{ng}_tc{tiles_per_cta}",
+        name=f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}",
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
     def kernel(
@@ -171,11 +170,18 @@ def compile_sparse_mla_partial(
                 + fx.Int32(4) * (wave % fx.Int32(2))
                 + head % fx.Int32(4)
             )
-            for k_i in fx.range_constexpr(tiles_per_cta):
-                tile = split * fx.Int32(tiles_per_cta) + fx.Int32(k_i)
-                out_record = (
-                    (fx.Int64(tok) * ng + fx.Int64(tile)) * H + fx.Int64(head)
-                )
+            out_record = (
+                (fx.Int64(tok) * n_groups + fx.Int64(split)) * H + fx.Int64(head)
+            )
+            running_max = fx.Float32(float("-inf"))
+            running_denom = fx.Float32(0.0)
+            running_acc = [
+                fx.Vector.filled(4, 0.0, fx.Float32)
+                for _ in fx.range_constexpr(8)
+            ]
+
+            for k_i in fx.range_constexpr(inner_iter):
+                tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
                 index_offset = (
                     fx.Int64(tok) * (ng * BLOCK_I)
                     + fx.Int64(tile * fx.Int32(BLOCK_I))
@@ -308,15 +314,33 @@ def compile_sparse_mla_partial(
                     tile_denom = tile_denom + fx.Float32(
                         lds.rsum[ww * H + head]
                     )
-                output_scale = (tile_denom == fx.Float32(0.0)).select(
-                    fx.Float32(0.0),
-                    fx.Float32(
-                        fx.rocdl.rcp(
-                            T.f32,
-                            (tile_denom * fx.Float32(FP8_MAX)).ir_value(),
+                if fx.const_expr(inner_iter == 1):
+                    output_scale = (tile_denom == fx.Float32(0.0)).select(
+                        fx.Float32(0.0),
+                        fx.Float32(
+                            fx.rocdl.rcp(
+                                T.f32,
+                                (tile_denom * fx.Float32(FP8_MAX)).ir_value(),
+                            )
+                        ),
+                    )
+                else:
+                    next_max = running_max.maximumf(tile_max)
+                    alpha = (running_denom == fx.Float32(0.0)).select(
+                        fx.Float32(0.0), _exp2(running_max - next_max)
+                    )
+                    beta = (tile_denom == fx.Float32(0.0)).select(
+                        fx.Float32(0.0), _exp2(tile_max - next_max)
+                    )
+                    next_denom = running_denom * alpha + tile_denom * beta
+                    output_scale = beta * fx.Float32(1.0 / FP8_MAX)
+                    if fx.const_expr(k_i + 1 == inner_iter):
+                        final_inv_denom = (next_denom == fx.Float32(0.0)).select(
+                            fx.Float32(0.0),
+                            fx.Float32(
+                                fx.rocdl.rcp(T.f32, next_denom.ir_value())
+                            ),
                         )
-                    ),
-                )
 
                 p4 = fx.ptr_load(
                     lds.plds.ptr + lane * fx.Int32(H),
@@ -351,34 +375,60 @@ def compile_sparse_mla_partial(
                             [pvec[2 * half], pvec[2 * half + 1]], fx.Int32
                         )
                         acc = _mfma32(avec, bvec, acc)
-                    out_col = dv_base + fx.Int32(4) * group
-                    fx.ptr_store(
-                        (fx.Vector(acc) * output_scale).to(fx.BFloat16),
-                        partial_ptr + out_record * DV + fx.Int64(out_col),
-                    )
-
-                with _if_then(
-                    scf.IfOp(
-                        arith.andi(
-                            arith.cmpi(
-                                CmpIPredicate.eq,
-                                _raw(wave),
-                                arith.constant(0, type=T.i32),
-                            ),
-                            arith.cmpi(
-                                CmpIPredicate.slt,
-                                _raw(lane),
-                                arith.constant(16, type=T.i32),
-                            ),
+                    if fx.const_expr(inner_iter == 1):
+                        out_col = dv_base + fx.Int32(4) * group
+                        fx.ptr_store(
+                            (fx.Vector(acc) * output_scale).to(fx.BFloat16),
+                            partial_ptr + out_record * DV + fx.Int64(out_col),
                         )
+                    else:
+                        next_acc = (
+                            fx.Vector(running_acc[j]) * alpha
+                            + fx.Vector(acc) * output_scale
+                        )
+                        if fx.const_expr(k_i + 1 == inner_iter):
+                            out_col = dv_base + fx.Int32(4) * group
+                            fx.ptr_store(
+                                (fx.Vector(next_acc) * final_inv_denom).to(
+                                    fx.BFloat16
+                                ),
+                                partial_ptr + out_record * DV + fx.Int64(out_col),
+                            )
+                        else:
+                            running_acc[j] = next_acc
+
+                if fx.const_expr(inner_iter > 1):
+                    running_max = next_max
+                    running_denom = next_denom
+                    if fx.const_expr(k_i + 1 < inner_iter):
+                        fx.gpu.barrier()
+
+            with _if_then(
+                scf.IfOp(
+                    arith.andi(
+                        arith.cmpi(
+                            CmpIPredicate.eq,
+                            _raw(wave),
+                            arith.constant(0, type=T.i32),
+                        ),
+                        arith.cmpi(
+                            CmpIPredicate.slt,
+                            _raw(lane),
+                            arith.constant(16, type=T.i32),
+                        ),
                     )
-                ):
+                )
+            ):
+                if fx.const_expr(inner_iter == 1):
                     lse = (tile_denom == fx.Float32(0.0)).select(
                         fx.Float32(-(2**30)), fly_math.log2(tile_denom) + tile_max
                     )
-                    fx.ptr_store(lse, lse_ptr + out_record)
-                if fx.const_expr(k_i + 1 < tiles_per_cta):
-                    fx.gpu.barrier()
+                else:
+                    lse = (running_denom == fx.Float32(0.0)).select(
+                        fx.Float32(-(2**30)),
+                        fly_math.log2(running_denom) + running_max,
+                    )
+                fx.ptr_store(lse, lse_ptr + out_record)
 
     @flyc.jit
     def launch(
