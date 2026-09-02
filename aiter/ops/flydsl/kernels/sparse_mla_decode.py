@@ -94,7 +94,7 @@ def compile_sparse_mla_partial(
     attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
 
     @flyc.kernel(
-        name=f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}",
+        name=f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}_xor_partner",
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
     def kernel(
@@ -181,7 +181,11 @@ def compile_sparse_mla_partial(
             ]
 
             for k_i in fx.range_constexpr(inner_iter):
-                tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
+                # Preserve the direct reducer's XOR tree: for ng=32 and
+                # inner_iter=2, merge (0,16), (1,17), ... rather than adjacent
+                # rows.  This removes one real partial row per pair while
+                # matching the reducer's first active shuffle level.
+                tile = split + fx.Int32(k_i * n_groups)
                 index_offset = (
                     fx.Int64(tok) * (ng * BLOCK_I)
                     + fx.Int64(tile * fx.Int32(BLOCK_I))
