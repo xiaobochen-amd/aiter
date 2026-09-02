@@ -24,23 +24,23 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
     traffic and combine work without a shape whitelist.
     """
     inner_iter = 1
-    min_producer_ctas = 512
+    min_producer_ctas = 256
     while inner_iter < 4:
         candidate = inner_iter * 2
-        if ng_total % candidate != 0:
+        current_groups = (ng_total + inner_iter - 1) // inner_iter
+        candidate_groups = (ng_total + candidate - 1) // candidate
+        if candidate_groups >= current_groups:
             break
-        if seq * (ng_total // candidate) < min_producer_ctas:
+        if seq * candidate_groups < min_producer_ctas:
             break
         inner_iter = candidate
     return inner_iter
 
 
 def _partial_groups(ng_total: int, inner_iter: int) -> int:
-    if inner_iter < 1 or ng_total % inner_iter != 0:
-        raise ValueError(
-            f"ng_total={ng_total} must be divisible by inner_iter={inner_iter}"
-        )
-    return ng_total // inner_iter
+    if inner_iter < 1 or inner_iter & (inner_iter - 1):
+        raise ValueError(f"inner_iter={inner_iter} must be a power of two")
+    return (ng_total + inner_iter - 1) // inner_iter
 
 
 def sparse_mla_decode_workspace_shape(

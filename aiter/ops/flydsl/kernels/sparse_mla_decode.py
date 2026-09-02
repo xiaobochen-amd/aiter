@@ -72,15 +72,9 @@ def compile_sparse_mla_partial(
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
-    if (
-        inner_iter < 1
-        or inner_iter & (inner_iter - 1)
-        or ng % inner_iter != 0
-    ):
-        raise ValueError(
-            f"inner_iter={inner_iter} must be a power-of-two divisor of ng={ng}"
-        )
-    n_groups = ng // inner_iter
+    if inner_iter < 1 or inner_iter & (inner_iter - 1):
+        raise ValueError(f"inner_iter={inner_iter} must be a power of two")
+    n_groups = (ng + inner_iter - 1) // inner_iter
 
     @fx.struct
     class PartialStorage:
@@ -182,9 +176,11 @@ def compile_sparse_mla_partial(
 
             for k_i in fx.range_constexpr(inner_iter):
                 tile = split * fx.Int32(inner_iter) + fx.Int32(k_i)
+                tile_in_range = tile < fx.Int32(ng)
+                safe_tile = tile_in_range.select(tile, fx.Int32(0))
                 index_offset = (
                     fx.Int64(tok) * (ng * BLOCK_I)
-                    + fx.Int64(tile * fx.Int32(BLOCK_I))
+                    + fx.Int64(safe_tile * fx.Int32(BLOCK_I))
                     + fx.Int64(slot)
                 )
                 row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
@@ -235,8 +231,11 @@ def compile_sparse_mla_partial(
                 )
                 qk = [None] * 4
                 for r in fx.range_constexpr(4):
-                    qk[r] = (ids[r] >= fx.Int32(0)).select(
-                        fx.Float32(score[r]) * scale_log2e,
+                    qk[r] = tile_in_range.select(
+                        (ids[r] >= fx.Int32(0)).select(
+                            fx.Float32(score[r]) * scale_log2e,
+                            fx.Float32(float("-inf")),
+                        ),
                         fx.Float32(float("-inf")),
                     )
                 local_max = fx.Float32(float("-inf"))
