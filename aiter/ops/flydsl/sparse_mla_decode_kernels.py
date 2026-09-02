@@ -15,32 +15,23 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
 
-def _pick_inner_iter(seq: int, ng_total: int) -> int:
-    """Return the producer grouping factor for this shape.
+def _pick_tiles_per_cta(seq: int, ng_total: int) -> int:
+    """Return how many independent split rows each producer CTA computes.
 
-    Merge adjacent 64-key tiles only while the reduced producer grid still has
-    enough CTAs to cover the GPU. This keeps small decode batches on the
-    lower-latency one-tile path and lets wide/large decode cases reduce scratch
-    traffic and combine work without a shape whitelist.
+    Reuse a CTA's published query only while the smaller producer grid still has
+    enough work to cover the GPU. Each tile remains a separately rounded BF16
+    partial, preserving the reducer's split order.
     """
-    inner_iter = 1
-    min_producer_ctas = 512
-    while inner_iter < 4:
-        candidate = inner_iter * 2
+    tiles_per_cta = 1
+    min_producer_ctas = 384
+    while tiles_per_cta < 2:
+        candidate = tiles_per_cta * 2
         if ng_total % candidate != 0:
             break
         if seq * (ng_total // candidate) < min_producer_ctas:
             break
-        inner_iter = candidate
-    return inner_iter
-
-
-def _partial_groups(ng_total: int, inner_iter: int) -> int:
-    if inner_iter < 1 or ng_total % inner_iter != 0:
-        raise ValueError(
-            f"ng_total={ng_total} must be divisible by inner_iter={inner_iter}"
-        )
-    return ng_total // inner_iter
+        tiles_per_cta = candidate
+    return tiles_per_cta
 
 
 def sparse_mla_decode_workspace_shape(
@@ -54,8 +45,7 @@ def sparse_mla_decode_workspace_shape(
     ng = width // BLOCK_I
     if not 1 <= ng <= 33:
         raise ValueError(f"supported split count is 1..33, got {ng}")
-    ng_partial = _partial_groups(ng, _pick_inner_iter(seq, ng))
-    return (seq, ng_partial, H, DV), (seq, ng_partial, H)
+    return (seq, ng, H, DV), (seq, ng, H)
 
 
 def _require_cuda_tensor(
@@ -157,9 +147,9 @@ def _launch_partial(
     sm_scale: float,
     *,
     ng: int,
-    inner_iter: int,
+    tiles_per_cta: int,
 ) -> None:
-    launch = compile_sparse_mla_partial(ng, inner_iter=inner_iter)
+    launch = compile_sparse_mla_partial(ng, tiles_per_cta=tiles_per_cta)
     _run_compiled(
         launch,
         ptr_arg(q, fx.Uint8),
@@ -190,8 +180,8 @@ def flydsl_sparse_mla_decode(
     allocated eagerly for convenience.
     """
     seq, ng = _validate_sparse_decode_inputs(q, kv, indices, out)
-    inner_iter = _pick_inner_iter(seq, ng)
-    ng_partial = _partial_groups(ng, inner_iter)
+    tiles_per_cta = _pick_tiles_per_cta(seq, ng)
+    ng_partial = ng
     if (partial_output is None) != (partial_lse is None):
         raise ValueError(
             "partial_output and partial_lse must be provided together for "
@@ -221,7 +211,7 @@ def flydsl_sparse_mla_decode(
         partial_lse,
         sm_scale,
         ng=ng,
-        inner_iter=inner_iter,
+        tiles_per_cta=tiles_per_cta,
     )
     _flydsl_sparse_mla_decode_combine(
         partial_output.unsqueeze(0),
