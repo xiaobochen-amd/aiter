@@ -102,7 +102,7 @@ def compile_hgemm_kernel(
     TILE_M: int = 128,
     TILE_N: int = 128,
     TILE_K: int = 64,
-    STAGES: int = int(__import__("os").environ.get("FLYDSL_HGEMM_STAGES", "2")),
+    STAGES: int = 2,
     SPLIT_K: int = 1,
     BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 2,
