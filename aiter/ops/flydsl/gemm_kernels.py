@@ -82,6 +82,9 @@ SPLIT_K_GLOBAL_WORKSPACE: dict[SplitKStreamKey, torch.Tensor] = {}
 # gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
 # and higher split-K values are now capped at 8 for better accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
+# XCD banding is a pure WG->tile bijection (bit-identical); tune it per shape.
+HGEMM_XCD_BAND_OPTIONS = (1, 2)
+NUM_XCD = 8
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
 HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
@@ -663,7 +666,23 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["b_preshuffle"],
                 config["c_to_lds"],
             )
-            kernels[name] = config
+            # Enumerate the XCD banding axis so the tuner can pick it, instead of
+            # every candidate silently defaulting to xcd_band=1. The WG->tile
+            # bijection is bit-identical; it only changes L2/HBM residency, so a
+            # per-shape choice can be worth a few percent on long-K streams.
+            for xcd_band in HGEMM_XCD_BAND_OPTIONS:
+                if xcd_band > 1:
+                    n_blocks = None if n is None else n // config["tile_n"]
+                    if n_blocks is not None and (
+                        n_blocks // (NUM_XCD * xcd_band) * (NUM_XCD * xcd_band) <= 0
+                    ):
+                        continue
+                    banded = dict(config)
+                    banded["xcd_band"] = xcd_band
+                    kernels[f"{name}_xb{xcd_band}"] = banded
+                else:
+                    config["xcd_band"] = 1
+                    kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
     # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.
     #
