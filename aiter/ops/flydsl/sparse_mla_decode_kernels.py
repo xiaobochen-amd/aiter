@@ -24,11 +24,11 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
     traffic and combine work without a shape whitelist.
     """
     inner_iter = 1
-    min_producer_ctas = 384
     while inner_iter < 4:
         candidate = inner_iter * 2
         if ng_total % candidate != 0:
             break
+        min_producer_ctas = 192 if candidate == 2 else 384
         if seq * (ng_total // candidate) < min_producer_ctas:
             break
         inner_iter = candidate
@@ -41,6 +41,11 @@ def _partial_groups(ng_total: int, inner_iter: int) -> int:
             f"ng_total={ng_total} must be divisible by inner_iter={inner_iter}"
         )
     return ng_total // inner_iter
+
+
+def _use_split_major(seq: int, n_groups: int, num_cu: int) -> bool:
+    """Use split-major ownership only once the producer grid is saturated."""
+    return seq * n_groups >= 2 * num_cu
 
 
 def sparse_mla_decode_workspace_shape(
@@ -159,7 +164,12 @@ def _launch_partial(
     ng: int,
     inner_iter: int,
 ) -> None:
-    launch = compile_sparse_mla_partial(ng, inner_iter=inner_iter)
+    n_groups = _partial_groups(ng, inner_iter)
+    num_cu = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
+    split_major = _use_split_major(int(q.shape[0]), n_groups, num_cu)
+    launch = compile_sparse_mla_partial(
+        ng, inner_iter=inner_iter, split_major=split_major
+    )
     _run_compiled(
         launch,
         ptr_arg(q, fx.Uint8),

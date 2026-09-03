@@ -271,18 +271,23 @@ def _storage_ref(t: torch.Tensor):
         return None
 
 
-# ni ranges over 1..33 (see the guard below), so a 16-entry cache starts
-# thrashing as soon as a process sees more than 16 distinct split counts.
-# Re-entering an evicted entry costs about 20 ms even with the on-disk cache
-# warm: a pure host stall with the GPU idle. Size the cache to the domain.
-@functools.lru_cache(maxsize=64)
-def _compile_sparse_decode_direct_combine(ni: int):
+# Cache the complete 33-split x 2-topology domain. Recompiling an evicted entry
+# costs about 20 ms even with the on-disk cache warm.
+@functools.lru_cache(maxsize=128)
+def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
     if not 1 <= ni <= 33:
         raise ValueError(f"sparse decode split count must be 1..33, got {ni}")
 
+    # One wave owns one head. Fine mode splits Dv into four independent slices;
+    # coarse mode keeps eight values per lane while retaining wave-local scales.
+    dv_slices_per_head = 4 if fine else 1
+    blocks_per_row = 16 * dv_slices_per_head
+    values_per_lane = 2 if fine else 8
+    topology = "fine" if fine else "coarse"
+
     @flyc.kernel(
-        name=f"flydsl_sparse_mla_decode_combine_ni{ni}",
-        known_block_size=[256, 1, 1],
+        name=f"flydsl_sparse_mla_decode_combine_ni{ni}_{topology}",
+        known_block_size=[64, 1, 1],
     )
     def kernel(
         partial_output: fx.Pointer,
@@ -290,22 +295,13 @@ def _compile_sparse_decode_direct_combine(ni: int):
         final_output: fx.Pointer,
         seq: fx.Int32,
     ):
-        tid = fx.Int32(fx.thread_idx.x)
-        wave = tid // fx.Int32(64)
-        lane = tid % fx.Int32(64)
-        row = fx.Int32(fx.block_idx.x) // fx.Int32(4)
-        head_base = (fx.Int32(fx.block_idx.x) % fx.Int32(4)) * fx.Int32(4)
-        head = head_base + wave
-        scale_storage = fx.SharedAllocator(static=False).allocate(
-            4 * 33 * 4, alignment=16
-        )
-        scale_base = fx.index_cast(T.i32, fx.ptrtoint(scale_storage._ptr))
-        scale_ptr_ty = fx.PointerType.get(
-            elem_ty=T.f32,
-            address_space=fx.AddressSpace.Shared,
-            alignment=16,
-        )
-        scale_ptr = fx.inttoptr(scale_ptr_ty, scale_base)
+        lane = fx.Int32(fx.thread_idx.x)
+        block = fx.Int32(fx.block_idx.x)
+        block_in_row = block % fx.Int32(blocks_per_row)
+        row = block // fx.Int32(blocks_per_row)
+        head = block_in_row // fx.Int32(dv_slices_per_head)
+        dv_slice = block_in_row % fx.Int32(dv_slices_per_head)
+        out_lane = dv_slice * fx.Int32(64) + lane
         partial_buf = _pointer_buffer_tensor(
             partial_output,
             fx.BFloat16,
@@ -341,34 +337,36 @@ def _compile_sparse_decode_direct_combine(ni: int):
             peer = fx.Float32(denom).shuffle_xor(fx.Int32(off), fx.Int32(64))
             denom = denom + peer
         inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
-        if in_split:
-            fx.ptr_store(scale * inv, scale_ptr + wave * fx.Int32(33) + lane)
-        fx.gpu.barrier()
+        scale = scale * inv
 
-        acc = [fx.Float32(0.0) for _ in fx.range_constexpr(8)]
+        acc = [fx.Float32(0.0) for _ in fx.range_constexpr(values_per_lane)]
         for split in fx.range_constexpr(ni):
             vals = _load_partial_out_narrow(
                 partial_buf,
                 row * fx.Int32(ni) + fx.Int32(split),
                 head,
-                lane,
-                8,
+                out_lane,
+                values_per_lane,
                 fx.BFloat16,
             )
-            scale = fx.Float32(0.0)
-            if lane == fx.Int32(0):
-                scale = fx.Float32(
-                    fx.ptr_load(scale_ptr + wave * fx.Int32(33) + fx.Int32(split))
+            split_scale = fx.Float32(
+                fx.rocdl.readlane(
+                    T.f32,
+                    scale.ir_value(),
+                    fx.Int32(split).ir_value(),
                 )
-            scale = fx.Float32(fx.rocdl.readfirstlane(T.f32, scale.ir_value()))
-            acc = [acc[i] + vals[i] * scale for i in fx.range_constexpr(8)]
+            )
+            acc = [
+                acc[i] + vals[i] * split_scale
+                for i in fx.range_constexpr(values_per_lane)
+            ]
         _store_final_out(
             final_buf,
             row,
             head,
-            lane,
+            out_lane,
             acc,
-            8,
+            values_per_lane,
             fx.BFloat16,
         )
 
@@ -381,13 +379,19 @@ def _compile_sparse_decode_direct_combine(ni: int):
         stream: fx.Stream,
     ):
         kernel(partial_output, partial_lse, final_output, seq).launch(
-            grid=(seq * fx.Int32(4), 1, 1),
-            block=(256, 1, 1),
+            grid=(seq * fx.Int32(blocks_per_row), 1, 1),
+            block=(64, 1, 1),
             stream=stream,
             value_attrs={"rocdl.waves_per_eu": 4},
         )
 
     return launch
+
+
+def _use_fine_decode_combine(seq: int, ni: int, num_cu: int) -> bool:
+    """Select the Dv-sliced reducer only over its measured occupancy window."""
+    fine_ctas = seq * 64
+    return ni > 16 and num_cu <= fine_ctas <= 3 * num_cu
 
 
 def _flydsl_sparse_mla_decode_combine(
@@ -435,7 +439,11 @@ def _flydsl_sparse_mla_decode_combine(
         final_output.copy_(partial_output[:, :, 0])
         return
 
-    direct = _compile_sparse_decode_direct_combine(ni)
+    num_cu = torch.cuda.get_device_properties(
+        final_output.device.index
+    ).multi_processor_count
+    fine = _use_fine_decode_combine(seq, ni, num_cu)
+    direct = _compile_sparse_decode_direct_combine(ni, fine)
     _run_compiled(
         direct,
         _pointer_arg(partial_output, torch.bfloat16),

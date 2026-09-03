@@ -61,11 +61,40 @@ from aiter.ops.flydsl import (
     flydsl_sparse_mla_decode,
     is_flydsl_available,
 )
+from aiter.ops.flydsl.mla_reduce_kernels import _use_fine_decode_combine
+from aiter.ops.flydsl.sparse_mla_decode_kernels import (
+    _pick_inner_iter,
+    _use_split_major,
+)
 
 pytestmark = pytest.mark.skipif(
     get_gfx() != "gfx950" or not is_flydsl_available(),
     reason="FlyDSL sparse MLA decode requires gfx950 with FlyDSL installed",
 )
+
+
+@pytest.mark.parametrize(
+    ("seq", "ng", "expected"),
+    ((11, 32, 1), (12, 32, 2), (47, 32, 2), (48, 32, 4), (96, 32, 4), (96, 33, 1)),
+)
+def test_sparse_mla_decode_inner_iter_policy(seq: int, ng: int, expected: int):
+    assert _pick_inner_iter(seq, ng) == expected
+
+
+@pytest.mark.parametrize(
+    ("seq", "groups", "expected"),
+    ((48, 8, False), (64, 8, True), (96, 8, True)),
+)
+def test_sparse_mla_decode_split_major_policy(seq: int, groups: int, expected: bool):
+    assert _use_split_major(seq, groups, num_cu=256) is expected
+
+
+@pytest.mark.parametrize(
+    ("seq", "splits", "expected"),
+    ((1, 32, False), (4, 32, True), (8, 32, True), (12, 16, False), (13, 32, False)),
+)
+def test_sparse_mla_decode_reducer_policy(seq: int, splits: int, expected: bool):
+    assert _use_fine_decode_combine(seq, splits, num_cu=256) is expected
 
 
 def _snr_db(actual: torch.Tensor, ref: torch.Tensor) -> float:
@@ -197,6 +226,8 @@ def test_sparse_mla_decode_exact_contract(case: Case):
         partial_output=partial_output,
         partial_lse=partial_lse,
     )
+    partial_output.fill_(float("nan"))
+    partial_lse.fill_(float("nan"))
     out_repeat = torch.empty_like(out)
     flydsl_sparse_mla_decode(
         q,
@@ -337,8 +368,8 @@ def test_sparse_mla_decode_graph_replay(case_name: str):
         kv_live.copy_(kv_src)
         indices_live.copy_(indices_src)
         out_live.zero_()
-        po_live.zero_()
-        pl_live.zero_()
+        po_live.fill_(float("nan"))
+        pl_live.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out_live, expected_by_tag[tag])

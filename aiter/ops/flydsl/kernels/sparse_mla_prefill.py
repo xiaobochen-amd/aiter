@@ -150,25 +150,34 @@ def _compile_sparse_mla_prefill():
             )
             return Vec(fx.memref_load_vec(fragment))
 
-        # Q is the register-resident B operand for every QK tile.
-        # Strides are in i32 words. Production passes the two non-contiguous
-        # 512/64 views of one contiguous [T,16,576] FP8 tensor, while the public
-        # API also accepts separately contiguous tensors.
+        i32_type = ir.IntegerType.get_signless(32)
+        i32x4_type = ir.VectorType.get([4], i32_type)
+
+        # Stage one shared Q copy, distributing its four nope chunks across waves.
+        # The existing index barrier also makes this copy visible before QK begins.
         q_base = token * q_token_stride + lane_col * q_head_stride
         q_rope_base = token * q_rope_token_stride + lane_col * q_rope_head_stride
-        q_fragments = []
-        for chunk in range_constexpr(4):
-            low = load_i32_vector4(q_divided, q_base + 32 * chunk + 4 * lane_group)
-            high = load_i32_vector4(
-                q_divided, q_base + 32 * chunk + 16 + 4 * lane_group
+        q_stage_head = lane_col * _HEAD_DIM
+        q_stage_chunk = wave
+        q_stage_offset = 128 * q_stage_chunk + 16 * lane_group
+        _lds_store_i32x4(
+            values_base,
+            q_stage_head + q_stage_offset,
+            load_i32_vector4(q_divided, q_base + 32 * q_stage_chunk + 4 * lane_group),
+        )
+        _lds_store_i32x4(
+            values_base,
+            q_stage_head + q_stage_offset + 64,
+            load_i32_vector4(
+                q_divided, q_base + 32 * q_stage_chunk + 16 + 4 * lane_group
+            ),
+        )
+        if wave == fx.Int32(0):
+            _lds_store_i32x4(
+                values_base,
+                q_stage_head + _V_HEAD_DIM + 16 * lane_group,
+                load_i32_vector4(q_rope_divided, q_rope_base + 4 * lane_group),
             )
-            fragment = fx.make_rmem_tensor(8, fx.Int32)
-            fragment.store(low.shuffle(high, list(range(8))))
-            q_fragments.append(fragment)
-        rope = load_i32_vector4(q_rope_divided, q_rope_base + 4 * lane_group)
-        fragment = fx.make_rmem_tensor(8, fx.Int32)
-        fragment.store(rope.shuffle(zero4i, list(range(8))))
-        q_fragments.append(fragment)
 
         transpose_base = (8 * lane_group + (lane_col // 2)) * _KV_LDS_PITCH + 8 * (
             lane_col % 2
@@ -187,8 +196,46 @@ def _compile_sparse_mla_prefill():
             )
         fx.barrier()
 
-        i32_type = ir.IntegerType.get_signless(32)
-        i32x4_type = ir.VectorType.get([4], i32_type)
+        q_fragments = []
+        for chunk in range_constexpr(4):
+            low = Vec(
+                _llvm.load(
+                    i32x4_type,
+                    _lds_ptr(
+                        values_base,
+                        q_stage_head + 128 * chunk + 16 * lane_group,
+                    ),
+                )
+            )
+            high = Vec(
+                _llvm.load(
+                    i32x4_type,
+                    _lds_ptr(
+                        values_base,
+                        q_stage_head + 128 * chunk + 64 + 16 * lane_group,
+                    ),
+                )
+            )
+            fragment = fx.make_rmem_tensor(8, fx.Int32)
+            fragment.store(low.shuffle(high, list(range(8))))
+            q_fragments.append(fragment)
+        rope = Vec(
+            _llvm.load(
+                i32x4_type,
+                _lds_ptr(
+                    values_base,
+                    q_stage_head + _V_HEAD_DIM + 16 * lane_group,
+                ),
+            )
+        )
+        fragment = fx.make_rmem_tensor(8, fx.Int32)
+        fragment.store(rope.shuffle(zero4i, list(range(8))))
+        q_fragments.append(fragment)
+
+        # The key loop reuses values LDS for KV. Wait until every wave has
+        # consumed the staged Q before any wave can overwrite that storage.
+        fx.barrier()
+
         i32_pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
         init = [_raw(neg_inf), _raw(zero_f)] + [
             _raw(zero4) for _ in range_constexpr(_DV_TILES_PER_WAVE)

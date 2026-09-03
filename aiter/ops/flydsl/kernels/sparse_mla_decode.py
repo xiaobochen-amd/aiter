@@ -69,6 +69,7 @@ def compile_sparse_mla_partial(
     ng: int,
     inner_iter: int = 1,
     waves_per_eu: int = 1,
+    split_major: bool = False,
 ):
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
@@ -91,7 +92,10 @@ def compile_sparse_mla_partial(
     attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
 
     @flyc.kernel(
-        name=f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}_xor_partner",
+        name=(
+            f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}_xor_partner"
+            + ("_split_major" if split_major else "")
+        ),
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
     def kernel(
@@ -111,8 +115,12 @@ def compile_sparse_mla_partial(
         group = lane // fx.Int32(16)
         head = lane % fx.Int32(16)
         owner = fx.Int32(fx.block_idx.x)
-        tok = owner // fx.Int32(n_groups)
-        split = owner % fx.Int32(n_groups)
+        if fx.const_expr(split_major):
+            split = owner // seq
+            tok = owner % seq
+        else:
+            tok = owner // fx.Int32(n_groups)
+            split = owner % fx.Int32(n_groups)
         lds = fx.SharedAllocator().allocate(PartialStorage).peek()
 
         def load16(ptr, offset):
