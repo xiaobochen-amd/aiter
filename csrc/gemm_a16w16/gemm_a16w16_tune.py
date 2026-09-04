@@ -319,6 +319,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         stages=stages,
         async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
+        xcd_band=config.get("xcd_band", 1),
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),

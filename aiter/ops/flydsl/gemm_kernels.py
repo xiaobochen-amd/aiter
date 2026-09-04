@@ -20,6 +20,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from .kernels.splitk_hgemm import B_CPOL_OPTIONS, SPLIT_K_SEMAPHORE_STRIDE
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
@@ -36,7 +37,10 @@ def _get_dtypes():
     return dtypes
 
 
-SPLIT_K_SEMAPHORE_MAX_LEN = 256
+# The ceiling only rejects an absurd (tile, split_k) pair, not sizes the workspace.
+SPLIT_K_MAX_WORKSPACE_BYTES = 512 * 1024 * 1024
+SPLIT_K_SEMAPHORE_GRANULE = 1024
+SPLIT_K_WORKSPACE_GRANULE = 1 << 20
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
@@ -61,12 +65,16 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?:_wpe(?P<waves_per_eu>\d+))?"
     r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
     r")?"
+    r"(?:_xb(?P<xcd_band>\d+))?"
+    r"(?:_kr(?P<k_rot>\d+))?"
+    r"(?:_mr(?P<m_rows>\d+))?"
+    r"(?:_cp(?P<b_cpol>\d+))?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
 
 SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
-SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
+SPLIT_K_GLOBAL_WORKSPACE: dict[SplitKStreamKey, torch.Tensor] = {}
 
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
@@ -74,6 +82,9 @@ SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 # gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
 # and higher split-K values are now capped at 8 for better accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
+# XCD banding is a pure WG->tile bijection (bit-identical); tune it per shape.
+HGEMM_XCD_BAND_OPTIONS = (1, 2)
+NUM_XCD = 8
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
 HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
@@ -232,6 +243,7 @@ def _estimate_hgemm_lds_bytes(
     tile_n: int,
     tile_k: int,
     stages: int,
+    split_k: int,
     block_k_warps: int,
     b_to_lds: bool,
 ) -> int:
@@ -243,7 +255,9 @@ def _estimate_hgemm_lds_bytes(
     if b_to_lds:
         pipeline_lds_bytes += stages * tile_n * tile_k * dtype_bytes
     c_lds_bytes = block_k_warps * tile_m * tile_n * dtype_bytes
-    return max(pipeline_lds_bytes, c_lds_bytes)
+    # The arrival dword sits beside the tile union, so it is counted here too.
+    split_k_flag_bytes = 4 if split_k > 1 else 0
+    return max(pipeline_lds_bytes, c_lds_bytes) + split_k_flag_bytes
 
 
 def _validate_hgemm_inputs(
@@ -319,7 +333,7 @@ def selection_filter(m, n, k, kwargs):
         if B_TO_LDS:
             SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
         SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
-        return SMEM_USE
+        return SMEM_USE + (4 if SPLIT_K > 1 else 0)
 
     smem_use_s0 = get_stage_smem_use(STAGES)
     # smem_use_s1 = get_stage_smem_use(STAGES + 3)
@@ -359,6 +373,7 @@ def _validate_hgemm_tiling(
     block_n_warps: int,
     block_k_warps: int,
     b_to_lds: bool,
+    b_cpol: int = 0,
 ) -> None:
     config = {
         "TILE_M": tile_m,
@@ -399,6 +414,10 @@ def _validate_hgemm_tiling(
         raise ValueError(
             f"Current kernel only supports `pack_n=1`; got pack_n={pack_n}"
         )
+    if not 0 <= b_cpol < len(B_CPOL_OPTIONS):
+        raise ValueError(
+            f"Invalid b_cpol={b_cpol}; expected 0..{len(B_CPOL_OPTIONS) - 1}"
+        )
 
     warp_atom_m = 16
     warp_atom_n = 16
@@ -415,9 +434,14 @@ def _validate_hgemm_tiling(
         )
 
     block_n = tile_n
-    if n < block_n or n % block_n != 0:
+    if n < block_n:
         raise ValueError(
-            f"Invalid N for this kernel: N={n} must satisfy N >= {block_n} and N % {block_n} == 0"
+            f"Invalid N for this kernel: N={n} must satisfy N >= {block_n}"
+        )
+    if n % block_n != 0 and not (b_to_lds and n % 8 == 0):
+        raise ValueError(
+            f"Invalid N for this kernel: N={n} is not a multiple of tile_n={block_n}, "
+            "which needs b_to_lds and N % 8 == 0"
         )
 
     if k % split_k != 0:
@@ -434,37 +458,26 @@ def _validate_hgemm_tiling(
 
     block_threads = block_m_warps * block_n_warps * block_k_warps * 64
     ldg_vec_size = 8
-    block_vecs = ldg_vec_size * block_threads
     block_mk_size = tile_m * tile_k
     block_nk_size = tile_n * tile_k
     block_mn_size = tile_m * tile_n
-    if block_mk_size % block_vecs != 0:
-        raise ValueError(
-            "Invalid tile combination: tile_m * tile_k must be divisible by "
-            f"ldg_vec_size * block_threads = {block_vecs}; got {block_mk_size}"
-        )
-    if block_nk_size % block_vecs != 0:
-        raise ValueError(
-            "Invalid tile combination: tile_n * tile_k must be divisible by "
-            f"ldg_vec_size * block_threads = {block_vecs}; got {block_nk_size}"
-        )
-    if block_mn_size % block_vecs != 0:
+    for name, size in (
+        ("tile_m * tile_k", block_mk_size),
+        ("tile_n * tile_k", block_nk_size),
+    ):
+        vecs = size // ldg_vec_size
+        if vecs % block_threads != 0 and (
+            not b_to_lds or vecs >= block_threads or vecs % 64 != 0 or vecs < 64
+        ):
+            raise ValueError(
+                f"Invalid tile combination: {name} / ldg_vec_size = {vecs} must be a "
+                f"multiple of block_threads = {block_threads} or a whole number of "
+                "waves' worth of vectors below it"
+            )
+    if block_mn_size % ldg_vec_size != 0:
         raise ValueError(
             "Invalid tile combination: tile_m * tile_n must be divisible by "
-            f"ldg_vec_size * block_threads = {block_vecs}; got {block_mn_size}"
-        )
-    ldg_reg_a_count = block_mk_size // block_vecs
-    ldg_reg_b_count = block_nk_size // block_vecs
-    ldg_reg_c_count = block_mn_size // block_vecs
-    if ldg_reg_a_count < 1 or ldg_reg_b_count < 1:
-        raise ValueError(
-            "Invalid tile combination: requires at least one vectorized global load per thread "
-            f"(got ldg_reg_a_count={ldg_reg_a_count}, ldg_reg_b_count={ldg_reg_b_count})"
-        )
-    if ldg_reg_c_count < 1:
-        raise ValueError(
-            "Invalid tile combination: requires at least one vectorized C load/store per thread "
-            f"(got ldg_reg_c_count={ldg_reg_c_count})"
+            f"ldg_vec_size = {ldg_vec_size}; got {block_mn_size}"
         )
 
     lds_bytes = _estimate_hgemm_lds_bytes(
@@ -473,6 +486,7 @@ def _validate_hgemm_tiling(
         tile_n=tile_n,
         tile_k=tile_k,
         stages=stages,
+        split_k=split_k,
         block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
@@ -564,6 +578,10 @@ def _parse_hgemm_kernel_params(name: str) -> dict | None:
         "b_to_lds": m.group("b_to_lds") == "True",
         "b_preshuffle": m.group("b_preshuffle") == "True",
         "c_to_lds": m.group("c_to_lds") == "True",
+        "xcd_band": int(m.group("xcd_band") or 1),
+        "k_rot": int(m.group("k_rot") or 0),
+        "m_rows": int(m.group("m_rows") or 0),
+        "b_cpol": int(m.group("b_cpol") or 0),
         "dtype": m.group("a_dtype"),
         "out_dtype": m.group("out_dtype"),
         "target_gfx": m.group("target_gfx"),
@@ -648,7 +666,23 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["b_preshuffle"],
                 config["c_to_lds"],
             )
-            kernels[name] = config
+            # Enumerate the XCD banding axis so the tuner can pick it, instead of
+            # every candidate silently defaulting to xcd_band=1. The WG->tile
+            # bijection is bit-identical; it only changes L2/HBM residency, so a
+            # per-shape choice can be worth a few percent on long-K streams.
+            for xcd_band in HGEMM_XCD_BAND_OPTIONS:
+                if xcd_band > 1:
+                    n_blocks = None if n is None else n // config["tile_n"]
+                    if n_blocks is not None and (
+                        n_blocks // (NUM_XCD * xcd_band) * (NUM_XCD * xcd_band) <= 0
+                    ):
+                        continue
+                    banded = dict(config)
+                    banded["xcd_band"] = xcd_band
+                    kernels[f"{name}_xb{xcd_band}"] = banded
+                else:
+                    config["xcd_band"] = 1
+                    kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
     # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.
     #
@@ -697,31 +731,60 @@ def _register_all_configs():
 _register_all_configs()
 
 
-@functools.lru_cache(maxsize=128)
-def _get_split_k_tensors(
-    device: torch.device,
-    stream: torch.cuda.Stream,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+def _split_k_launch_shape(
+    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+) -> tuple[int, int]:
+    """Counters and workspace bytes one split-K launch of this tiling needs."""
+    tiles = ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n)
+    return (
+        tiles * SPLIT_K_SEMAPHORE_STRIDE,
+        tiles * split_k * tile_m * tile_n * 2,
     )
-    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
-    return semaphore, signal
 
 
-def _check_split_k_semaphore_capacity(
+def _check_split_k_capacity(
     m: int, n: int, tile_m: int, tile_n: int, split_k: int
 ) -> None:
     if split_k <= 1:
         return
-    bm = (m + tile_m - 1) // tile_m
-    bn = n // tile_n
-    required = bm * bn
-    if required > SPLIT_K_SEMAPHORE_MAX_LEN:
+    _, ws_bytes = _split_k_launch_shape(m, n, tile_m, tile_n, split_k)
+    if ws_bytes > SPLIT_K_MAX_WORKSPACE_BYTES:
         raise ValueError(
-            "Split-K semaphore capacity exceeded: "
-            f"requires {required} counters, max supported is {SPLIT_K_SEMAPHORE_MAX_LEN}"
+            f"Split-K workspace too large: needs {ws_bytes} bytes, "
+            f"max supported is {SPLIT_K_MAX_WORKSPACE_BYTES}"
         )
+
+
+def _get_split_k_buffers(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+    tiles: int,
+    ws_bytes: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-stream split-K bookkeeping, grown in place and never shrunk.
+
+    Safe to share: launches on a stream are ordered and the reduction hands the
+    counters back at zero.  Growing only on a larger launch keeps the allocation
+    out of any graph capture that follows a warm-up call.
+    """
+    key = _stream_cache_key(stream)
+    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
+    if semaphore is None or semaphore.numel() < tiles:
+        semaphore = torch.zeros(
+            _align_up(max(tiles, 1), SPLIT_K_SEMAPHORE_GRANULE),
+            dtype=torch.int32,
+            device=device,
+        )
+        SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
+    workspace = SPLIT_K_GLOBAL_WORKSPACE.get(key)
+    if workspace is None or workspace.numel() < ws_bytes:
+        workspace = torch.empty(
+            _align_up(max(ws_bytes, 1), SPLIT_K_WORKSPACE_GRANULE),
+            dtype=torch.uint8,
+            device=device,
+        )
+        SPLIT_K_GLOBAL_WORKSPACE[key] = workspace
+    return semaphore, workspace
 
 
 @functools.lru_cache(maxsize=16384)
@@ -750,6 +813,10 @@ def _compile_flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
+    xcd_band: int = 1,
+    k_rot: int = 0,
+    m_rows: int = 0,
+    b_cpol: int = 0,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -776,6 +843,7 @@ def _compile_flydsl_hgemm(
             block_n_warps=block_n_warps,
             block_k_warps=block_k_warps,
             b_to_lds=b_to_lds,
+            b_cpol=b_cpol,
         )
     elif kernel_family == KERNEL_FAMILY_SMALL_M:
         if dtype != "bf16":
@@ -818,6 +886,10 @@ def _compile_flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
+        xcd_band=xcd_band,
+        k_rot=k_rot,
+        m_rows=m_rows,
+        b_cpol=b_cpol,
     )
 
     def launcher(
@@ -838,9 +910,21 @@ def _compile_flydsl_hgemm(
             )
         launch_bias = b if bias is None else bias
         runtime_m = int(a.shape[0])
+        if m_rows and runtime_m > m_rows:
+            raise ValueError(
+                f"This launcher fetches {m_rows} A rows; got m={runtime_m}."
+            )
         launch_stream = _normalize_launch_stream(a.device, stream)
-        _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
+        if split_k > 1:
+            _check_split_k_capacity(runtime_m, n, tile_m, tile_n, split_k)
+            tiles, ws_bytes = _split_k_launch_shape(
+                runtime_m, n, tile_m, tile_n, split_k
+            )
+        else:
+            tiles, ws_bytes = 0, 0
+        semaphore, workspace = _get_split_k_buffers(
+            a.device, launch_stream, tiles, ws_bytes
+        )
         return _run_compiled(
             kernel,
             ptr_arg(out),
@@ -849,7 +933,7 @@ def _compile_flydsl_hgemm(
             ptr_arg(launch_bias),
             runtime_m,
             ptr_arg(semaphore),
-            ptr_arg(signal),
+            ptr_arg(workspace),
             fx.Stream(launch_stream),
         )
 
@@ -880,6 +964,10 @@ def flydsl_hgemm(
     b_preshuffle: bool = False,
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
+    xcd_band: int = 1,
+    k_rot: int = 0,
+    m_rows: int = 0,
+    b_cpol: int = 0,
     kernel_family: str | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
@@ -934,6 +1022,10 @@ def flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         split_k=split_k,
         c_to_lds=c_to_lds,
+        xcd_band=xcd_band,
+        k_rot=k_rot,
+        m_rows=m_rows,
+        b_cpol=b_cpol,
         kernel_family=resolved_kernel_family,
         has_bias=bias is not None,
     )
