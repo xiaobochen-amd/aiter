@@ -627,7 +627,16 @@ def get_flydsl_splitk_hgemm_kernels(
         HGEMM_STAGE_OPTIONS,
         KERNEL_CONFIG_VARIANTS,
     ):
-        if n is not None and (n < tile_n or n % tile_n != 0):
+        if n is not None and n < tile_n:
+            continue
+        # The kernel clamps and predicates the last N tile, so tile_n no longer
+        # has to divide N. That path stages B through LDS and needs N aligned
+        # to the 8-element global load vector.
+        if (
+            n is not None
+            and n % tile_n != 0
+            and not (variant["b_to_lds"] and n % 8 == 0)
+        ):
             continue
         split_k_options = _hgemm_split_k_options(k, tile_k)
         if not split_k_options:

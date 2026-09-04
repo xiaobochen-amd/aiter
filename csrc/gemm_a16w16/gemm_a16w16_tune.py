@@ -740,7 +740,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 continue
             if config["tile_m"] > max(M, min_tile_m):
                 continue
-            if N < config["tile_n"] or N % config["tile_n"] != 0:
+            if N < config["tile_n"]:
+                continue
+            # The kernel clamps and predicates the last N tile, so tile_n no
+            # longer has to divide N -- that path needs B staged through LDS
+            # and N aligned to the 8-element global load vector.
+            if N % config["tile_n"] != 0 and not (
+                config.get("b_to_lds", False) and N % 8 == 0
+            ):
                 continue
             if K % config["split_k"] != 0:
                 continue
