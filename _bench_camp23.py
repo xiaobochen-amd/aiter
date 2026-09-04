@@ -118,7 +118,11 @@ BASELINE = {
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 TUNER = os.path.join(REPO, "csrc", "gemm_a16w16", "gemm_tuner.py")
-GPUS = os.environ.get("HIP_VISIBLE_DEVICES", "0,1,4,5")
+# Fixed to the four cards allocated to this campaign, deliberately NOT following
+# HIP_VISIBLE_DEVICES: the orchestrator pins that to a single card, and mp_tuner
+# asserts group count == input count, which fails whenever some point has no
+# FlyDSL candidate at all (the five N=32 rows) and mp is 1.
+GPUS = os.environ.get("CAMP23_GPUS", "0,1,4,5")
 MP = len([g for g in GPUS.split(",") if g])
 
 
@@ -137,9 +141,13 @@ def main():
            "--libtype", "flydsl", "--mp", str(MP)]
     print("running:", " ".join(cmd), flush=True)
     p = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True)
-    if p.returncode != 0:
-        sys.stderr.write(p.stdout[-4000:] + p.stderr[-4000:])
-        print(json.dumps({"ok": False, "gm_ratio": 0.0, "reason": "tuner rc=%d" % p.returncode}))
+    print("tuner rc=%d, stdout %d B, stderr %d B" % (p.returncode, len(p.stdout), len(p.stderr)))
+    if p.returncode != 0 or not os.path.exists(out):
+        sys.stderr.write(p.stdout[-6000:] + p.stderr[-6000:])
+        print("TUNER STDOUT TAIL:\n" + p.stdout[-3000:])
+        print("TUNER STDERR TAIL:\n" + p.stderr[-3000:])
+        print(json.dumps({"ok": False, "gm_ratio": 0.0,
+                          "reason": "tuner rc=%d, out_exists=%s" % (p.returncode, os.path.exists(out))}))
         return
 
     got = {}
