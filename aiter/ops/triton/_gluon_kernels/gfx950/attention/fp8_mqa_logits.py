@@ -792,7 +792,8 @@ def _gluon_fp8_mqa_logits_kernel(
         "NUM_BUFFERS must be 2, all loop variants assume double buffering",
     )
     gl.static_assert(
-        BLOCK_M == 1 or BLOCK_M == 2, "only BLOCK_M in {1, 2} is implemented"
+        BLOCK_M == 1 or BLOCK_M == 2 or BLOCK_M == 4,
+        "only BLOCK_M in {1, 2, 4} is implemented",
     )
 
     # Reversed so the longest segments (highest row ids in a causal layout) are
@@ -878,18 +879,21 @@ def _gluon_fp8_mqa_logits_kernel(
         dot_a_layout,
     )
 
-    if BLOCK_M == 1:
-        mfma_qs = (mfma_q,)
-        w_blocks = (w_block,)
-        row_starts = (start_ind,)
-        row_ends = (end_ind,)
-        union_start = start_ind
-        union_end = end_ind
-    else:
-        mfma_q1, w_block1 = _load_row_operands(
+    # Generic over BLOCK_M: the compute loop below is already a static_range
+    # over these tuples, so only the operand load was pinned to 1-or-2 rows.
+    # Rows in a block are consecutive, so their causal segments differ by at
+    # most BLOCK_M keys and the union they walk is barely wider than one row's.
+    mfma_qs = (mfma_q,)
+    w_blocks = (w_block,)
+    row_starts = (start_ind,)
+    row_ends = (end_ind,)
+    union_start = start_ind
+    union_end = end_ind
+    for r in gl.static_range(1, BLOCK_M):
+        mfma_qr, w_blockr = _load_row_operands(
             Q_ptr,
             weights_ptr,
-            row_id + 1,
+            row_id + r,
             stride_q_s,
             stride_q_h,
             stride_q_d,
@@ -901,10 +905,14 @@ def _gluon_fp8_mqa_logits_kernel(
             mfma_layout,
             dot_a_layout,
         )
-        mfma_qs = (mfma_q, mfma_q1)
-        w_blocks = (w_block, w_block1)
-        row_starts = (start_ind, start_ind1)
-        row_ends = (end_ind, end_ind1)
+        sr = gl.maximum(gl.load(cu_start_ptr + row_id + r), 0)
+        er = gl.minimum(gl.load(cu_end_ptr + row_id + r), seq_len_kv)
+        mfma_qs = mfma_qs + (mfma_qr,)
+        w_blocks = w_blocks + (w_blockr,)
+        row_starts = row_starts + (sr,)
+        row_ends = row_ends + (er,)
+        union_start = gl.minimum(union_start, sr)
+        union_end = gl.maximum(union_end, er)
 
     num_full_tiles = (union_end - union_start) // BLOCK_KV
 

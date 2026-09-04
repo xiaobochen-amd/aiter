@@ -1,4 +1,5 @@
 import inspect
+import os as _os
 
 import torch
 import triton
@@ -215,12 +216,28 @@ def fp8_mqa_logits(
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 2 if num_heads <= 32 else 1
             block_kv = 64 if num_heads <= 32 else 32
-            # BLOCK_M=2 only compiles on the buffer-store path: with plain
-            # stores the AMDGCN backend aborts at JIT time (Sequence.h:275
-            # "Begin must be less or equal to End").
-            block_m = (
-                2 if (num_heads <= 32 and seq_len > 4096 and use_buffer_store) else 1
-            )
+            # Cache traffic is (seq_len / BLOCK_M) * union * head_size, so a
+            # wider block roughly halves it -- until the grid is too narrow to
+            # hide memory latency. The old `seq_len > 4096` left the 1536..4096
+            # band on BLOCK_M=1, and that band is where a server lands:
+            # dsa_indexer caps rows per launch at logits_budget /
+            # (context * 4 B), ~1800 at 542k context.
+            #
+            # Crossovers measured on gfx950 at ctx 131072, 262144 and 542361,
+            # which agree: BLOCK_M=4 only starts winning at 3072 rows. A 2304
+            # threshold costs 6.5-19.8% at 2304 and 2560 rows, worst at the
+            # shallowest context.
+            if num_heads <= 32 and seq_len >= 3072:
+                block_m = 4
+            elif num_heads <= 32 and seq_len >= 1536:
+                block_m = 2
+            else:
+                block_m = 1
+            # Test hook only: op_tests/test_fp8_mqa_logits_block_m.py compares
+            # BLOCK_M variants for bit-exactness on the same inputs.
+            _force = _os.environ.get("AITER_MQA_FORCE_BLOCK_M")
+            if _force:
+                block_m = int(_force)
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
@@ -236,6 +253,34 @@ def fp8_mqa_logits(
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
+
+        # BLOCK_M>=4 keeps four rows live and needs the relaxed occupancy target
+        # whatever the store path is. BLOCK_M==2 only needs it on the global-store
+        # fallback, which is the case the original guard measured.
+        if (
+            arch == "gfx950"
+            and head_size > 64
+            and (block_m >= 4 or (block_m > 1 and not use_buffer_store))
+        ):
+            # Register-pressure escape hatch. Three things stack here: BLOCK_M=2
+            # keeps two rows' worth of values live, the global-store fallback
+            # adds the 64-bit address arithmetic that buffer_store folds into
+            # its descriptor, and waves_per_eu=4 caps each thread at a quarter
+            # of the register budget. Together they are infeasible, and the AMD
+            # backend does not report that -- it trips an LLVM assertion
+            # (`iota_range: Begin <= End`) inside make_amdgcn and aborts, so the
+            # caller sees SIGABRT rather than an exception.
+            #
+            # Relaxing the occupancy target is free on exactly the shapes that
+            # need it -- measured within noise of waves_per_eu=4 at
+            # [16384,32768] (2437 vs 2445 us), [8192,65536] (3164 vs 3160) and
+            # [16384,65536] (5794 vs 5798).
+            #
+            # head_size is part of the guard because it decides the fold layout:
+            # at 64 the same BLOCK_M/store combination compiles fine at
+            # waves_per_eu=4, and dropping to 2 there costs 24%. Widening this
+            # condition trades that away for nothing.
+            waves_per_eu = 2
 
         _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
