@@ -149,8 +149,8 @@ def _large_dispatch_cu(bucket: int) -> int:
         return 224
     if bucket <= 4:
         return 128
-    if bucket <= 8:
-        return 192
+    if bucket <= 16:
+        return 128
     if bucket <= 32:
         return 64
     if bucket <= 64:
@@ -265,8 +265,7 @@ def _select_large_stage1(
         work_shards=work_shards,
         external_grouping=bucket == 4 or bucket >= 256,
         external_counting=bucket >= 256,
-        payload_chunk_rows=384,
-        payload_tile_ready=True,
+        payload_chunk_rows=0 if 32 <= bucket <= 64 else 384,
     )
 
 
@@ -311,7 +310,7 @@ def _select_large_stage2(
         persist_cu = 192
     else:
         persist_cu = 240
-    block_n = 128 if bucket == 256 or model_dim < 4096 else 256
+    block_n = 128 if 1 <= bucket <= 64 or bucket == 256 or model_dim < 4096 else 256
     return Stage2Config(
         block_m=64 if sort_block_m == 128 else 32,
         block_n=block_n,

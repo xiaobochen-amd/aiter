@@ -238,6 +238,7 @@ class FlyDSLDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
+    workspace_num_inp_token_per_rank: int | None = None
     data_type: torch.dtype | None = None
     # User-pinned launch geometry, resolved ONCE per op (not per call):
     # pinned value (block_num+warp must be set together) > tuning table >
@@ -266,6 +267,8 @@ class FlyDSLDispatchCombineConfig:
     gm_compact: bool = False
 
     def __post_init__(self):
+        if self.workspace_num_inp_token_per_rank is None:
+            self.workspace_num_inp_token_per_rank = self.max_num_inp_token_per_rank
         if self.data_type is not None and (
             self.dispatch_dtype not in (None, self.data_type)
             or self.combine_dtype not in (None, self.data_type)
@@ -344,14 +347,14 @@ class FlyDSLDispatchCombineConfig:
 
     @property
     def max_recv(self):
-        return self.world_size * self.max_num_inp_token_per_rank
+        return self.world_size * self.workspace_num_inp_token_per_rank
 
     @property
     def effective_max_recv_per_rank(self):
         if self.max_total_recv_tokens <= 0:
-            return self.max_num_inp_token_per_rank
+            return self.workspace_num_inp_token_per_rank
         per_rank = (self.max_total_recv_tokens + self.world_size - 1) // self.world_size
-        return min(per_rank, self.max_num_inp_token_per_rank)
+        return min(per_rank, self.workspace_num_inp_token_per_rank)
 
     @property
     def effective_max_recv(self):
@@ -633,7 +636,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 rank=config.rank,
                 world_size=config.world_size,
                 hidden_dim=config.hidden_dim,
-                max_tok_per_rank=config.max_num_inp_token_per_rank,
+                max_tok_per_rank=config.workspace_num_inp_token_per_rank,
                 experts_per_rank=config.num_experts_per_rank,
                 topk=config.num_experts_per_token,
                 data_type=config.dispatch_dtype,
@@ -658,7 +661,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cfg = self.cfg
         npes = cfg.world_size
         k = cfg.num_experts_per_token
-        mt = cfg.max_num_inp_token_per_rank
+        mt = cfg.workspace_num_inp_token_per_rank
         mr = cfg.effective_max_recv
         mr_worst = cfg.max_recv
 
@@ -759,6 +762,14 @@ class FlyDSLDispatchCombineIntraNodeOp:
             raise ValueError(
                 f"max_num_inp_token_per_rank must be positive, got {cfg.max_num_inp_token_per_rank}"
             )
+        if (
+            cfg.workspace_num_inp_token_per_rank <= 0
+            or cfg.workspace_num_inp_token_per_rank > cfg.max_num_inp_token_per_rank
+        ):
+            raise ValueError(
+                "workspace_num_inp_token_per_rank must be positive and no greater than "
+                f"max_num_inp_token_per_rank, got {cfg.workspace_num_inp_token_per_rank}"
+            )
         if cfg.num_experts_per_rank <= 0:
             raise ValueError(
                 f"num_experts_per_rank must be positive, got {cfg.num_experts_per_rank}"
@@ -840,7 +851,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             )
         if cfg.max_total_recv_tokens > 0:
             lo = cfg.world_size
-            hi = cfg.world_size * cfg.max_num_inp_token_per_rank
+            hi = cfg.world_size * cfg.workspace_num_inp_token_per_rank
             if cfg.max_total_recv_tokens < lo:
                 raise ValueError(
                     f"max_total_recv_tokens={cfg.max_total_recv_tokens} < "
@@ -853,7 +864,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                     f"max_total_recv_tokens={cfg.max_total_recv_tokens} exceeds the "
                     f"worst case {hi} (= world_size * max_num_inp_token_per_rank); "
                     f"clamping to {hi}.  effective_max_recv_per_rank will be "
-                    f"{cfg.max_num_inp_token_per_rank} (M).",
+                    f"{cfg.workspace_num_inp_token_per_rank} (workspace M).",
                     stacklevel=2,
                 )
 
@@ -924,10 +935,10 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 f"input must be 2-D (cur_tok, hidden_dim), got shape {tuple(input.shape)}"
             )
         cur_tok = input.shape[0]
-        if cur_tok > cfg.max_num_inp_token_per_rank:
+        if cur_tok > cfg.workspace_num_inp_token_per_rank:
             raise ValueError(
-                f"input rows={cur_tok} exceeds cfg.max_num_inp_token_per_rank="
-                f"{cfg.max_num_inp_token_per_rank} (would OOB-write into shmem)"
+                f"input rows={cur_tok} exceeds cfg.workspace_num_inp_token_per_rank="
+                f"{cfg.workspace_num_inp_token_per_rank} (would OOB-write into shmem)"
             )
         # Shared buffers are sized for the configured dispatch dtype.
         if input.dtype != cfg.dispatch_dtype:
@@ -1072,7 +1083,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 experts_per_rank=cfg.num_experts_per_rank,
                 experts_per_token=cfg.num_experts_per_token,
                 hidden_dim=cfg.hidden_dim,
-                max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+                max_tok_per_rank=cfg.workspace_num_inp_token_per_rank,
                 block_num=block_num,
                 warp_num_per_block=warp_num_per_block,
                 data_type=d_dtype,
@@ -1224,10 +1235,10 @@ class FlyDSLDispatchCombineIntraNodeOp:
                     f"{who} requires an explicit cur_tok or a preceding dispatch() on this op "
                     "(cur_tok defaults to the dispatch input.shape[0])."
                 )
-        mt = self.cfg.max_num_inp_token_per_rank
+        mt = self.cfg.workspace_num_inp_token_per_rank
         if cur_tok < 0 or cur_tok > mt:
             raise ValueError(
-                f"cur_tok={cur_tok} out of range [0, max_num_inp_token_per_rank={mt}]"
+                f"cur_tok={cur_tok} out of range [0, workspace_num_inp_token_per_rank={mt}]"
             )
         return cur_tok
 
@@ -1375,7 +1386,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 npes=cfg.world_size,
                 experts_per_token=cfg.num_experts_per_token,
                 hidden_dim=cfg.hidden_dim,
-                max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+                max_tok_per_rank=cfg.workspace_num_inp_token_per_rank,
                 block_num=bn,
                 warp_num_per_block=wpb,
                 data_type=c_dtype,
@@ -1400,7 +1411,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             stream,
         )
 
-        mt = cfg.max_num_inp_token_per_rank
+        mt = cfg.workspace_num_inp_token_per_rank
         k = cfg.num_experts_per_token
         out_token_bytes = _token_bytes_for(c_dtype, cfg.hidden_dim)
         out_view_dim = _token_view_dim_for(c_dtype, cfg.hidden_dim)
