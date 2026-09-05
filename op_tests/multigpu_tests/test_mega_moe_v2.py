@@ -22,11 +22,11 @@ from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
 NETWORKS = {
-    "glm52_routed": {
+    "glm52_ep4": {
         "model_dim": 6144,
         "inter_dim": 2048,
-        "experts": 256,
-        "topk": 8,
+        "experts": 260,
+        "topk": 9,
         "swiglu_limit": 0.0,
     },
     "v4_pro": {
