@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Independent v4_pro MegaMoEV2 accuracy and performance test."""
+"""Independent MegaMoEV2 accuracy and performance test."""
 
 from __future__ import annotations
 
@@ -22,6 +22,13 @@ from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
 NETWORKS = {
+    "glm52_routed": {
+        "model_dim": 6144,
+        "inter_dim": 2048,
+        "experts": 256,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
     "v4_pro": {
         "model_dim": 7168,
         "inter_dim": 3072,
@@ -178,8 +185,11 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
-        gate = (inp @ w1[:inter_dim].T).clamp(max=swiglu_limit)
-        up = (inp @ w1[inter_dim:].T).clamp(-swiglu_limit, swiglu_limit)
+        gate = inp @ w1[:inter_dim].T
+        up = inp @ w1[inter_dim:].T
+        if swiglu_limit > 0:
+            gate.clamp_(max=swiglu_limit)
+            up.clamp_(-swiglu_limit, swiglu_limit)
         hidden = F.silu(gate) * up
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
