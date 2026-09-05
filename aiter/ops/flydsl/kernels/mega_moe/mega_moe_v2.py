@@ -64,17 +64,53 @@ class MegaMoEV2:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
-        self._build_fused_stage1(w1, w1_scale)
+        self.set_weights(w1, w1_scale, w2, w2_scale)
+        self._build_fused_stage1(self._s1_w1, self._s1_w1_scale)
         self._build_fused_stage2()
+
+    def _validate_weight_tensor(self, name, tensor, expected_numel):
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if tensor.device != self.dev:
+            raise ValueError(f"{name}.device={tensor.device} must match {self.dev}")
+        if tensor.element_size() != 1:
+            raise ValueError(f"{name} must use a packed one-byte dtype, got {tensor.dtype}")
+        if tensor.numel() != expected_numel:
+            raise ValueError(
+                f"{name}.numel()={tensor.numel()} does not match expected {expected_numel}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        return tensor.view(torch.uint8)
+
+    def set_weights(self, w1, w1_scale, w2, w2_scale):
+        """Rebind local expert weights without rebuilding communication workspaces.
+
+        SGLang uses one MegaMoEV2 workspace for many sequential MoE layers. The
+        method is intentionally allocation-free and must not be called while a
+        launch from this instance is still in flight.
+        """
+        epr, hidden, inter = self.epr, self.model_dim, self.inter_dim
+        self._s1_w1 = self._validate_weight_tensor(
+            "w1", w1, epr * 2 * inter * hidden // 2
+        )
+        self._s1_w1_scale = self._validate_weight_tensor(
+            "w1_scale", w1_scale, epr * 2 * inter * hidden // 32
+        )
+        self.w2 = self._validate_weight_tensor(
+            "w2", w2, epr * hidden * inter // 2
+        )
+        self.w2_scale = self._validate_weight_tensor(
+            "w2_scale", w2_scale, epr * hidden * inter // 32
+        )
+        return self
 
     def _build_fused_stage1(self, w1, w1_scale):
         from .mega_moe_stage1 import run_mega_moe_stage1
 
         self.sort_block_m = 32
-        self._s1_w1 = w1.contiguous().view(torch.uint8)
-        self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
+        self._s1_w1 = w1
+        self._s1_w1_scale = w1_scale
         op = self.comb_op._gm
         assert op is not None, "combine op was built without enable_group_major"
         self._s1_op = op

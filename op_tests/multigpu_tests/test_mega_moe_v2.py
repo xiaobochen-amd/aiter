@@ -29,6 +29,13 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    "glm52": {
+        "model_dim": 6144,
+        "inter_dim": 2048,
+        "experts": 256,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
 }
 
 
@@ -178,8 +185,11 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
-        gate = (inp @ w1[:inter_dim].T).clamp(max=swiglu_limit)
-        up = (inp @ w1[inter_dim:].T).clamp(-swiglu_limit, swiglu_limit)
+        gate = inp @ w1[:inter_dim].T
+        up = inp @ w1[inter_dim:].T
+        if swiglu_limit > 0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
         hidden = F.silu(gate) * up
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
@@ -338,6 +348,7 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--rebind-clone", action="store_true")
     args = parser.parse_args()
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
@@ -403,6 +414,14 @@ def main():
                 max_tok_per_rank=max_tok_per_rank,
                 **network,
             )
+            if args.rebind_clone:
+                # Different allocations model switching from one SGLang MoE
+                # layer to the next while retaining communication workspaces.
+                w1 = w1.clone()
+                w1_scale = w1_scale.clone()
+                w2 = w2.clone()
+                w2_scale = w2_scale.clone()
+            moe.set_weights(w1, w1_scale, w2, w2_scale)
             _install_config_policy(moe, args.config_tokens, args.unify_fields)
             if rank_tokens:
                 selected = moe._select_config(local_batch_size)
