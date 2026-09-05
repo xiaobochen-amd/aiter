@@ -8,7 +8,7 @@ import argparse
 import os
 from dataclasses import replace
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 import mori.shmem as ms
 import torch
@@ -143,10 +143,19 @@ def _dequant_expert(weight, scale, rows, cols):
     return values * scales.repeat_interleave(32, dim=-1)
 
 
-def _all_gather(tensor):
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, tensor)
-    return torch.cat(gathered)
+def _all_gather(tensor, row_counts=None):
+    if row_counts is None:
+        row_counts = [tensor.shape[0]] * dist.get_world_size()
+    max_rows = max(row_counts)
+    padded = torch.empty(
+        (max_rows, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[: tensor.shape[0]].copy_(tensor)
+    gathered = [torch.empty_like(padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, padded)
+    return torch.cat(
+        [part[:rows] for part, rows in zip(gathered, row_counts)]
+    )
 
 
 @torch.no_grad()
@@ -162,10 +171,14 @@ def _reference(
     experts,
     swiglu_limit,
 ):
+    local_count = torch.tensor([x.shape[0]], dtype=torch.int64, device=x.device)
+    gathered_counts = [torch.empty_like(local_count) for _ in range(world)]
+    dist.all_gather(gathered_counts, local_count)
+    row_counts = [int(count.item()) for count in gathered_counts]
     x_all, weights_all, ids_all = (
-        _all_gather(x),
-        _all_gather(route_weights),
-        _all_gather(ids),
+        _all_gather(x, row_counts),
+        _all_gather(route_weights, row_counts),
+        _all_gather(ids, row_counts),
     )
     partial = torch.zeros(
         (x_all.shape[0], model_dim), dtype=torch.float32, device=x.device
@@ -195,8 +208,9 @@ def _reference(
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
     dist.all_reduce(partial)
-    start = rank * x.shape[0]
-    return partial[start : start + x.shape[0]]
+    start = sum(row_counts[:rank])
+    end = start + x.shape[0]
+    return partial[start:end]
 
 
 def _time_graph(fn, device, iters):
@@ -224,12 +238,76 @@ def _time_graph(fn, device, iters):
     return mean_ms, max_ms
 
 
-def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
+def _run_size(
+    moe, x, weights, ids, ref_weights, args, rank, world, device, collective_tokens
+):
     tokens = x.shape[0]
-    output = moe(x, weights, ids)[:tokens]
+    if moe.workspace_tokens_per_rank == 4096:
+        comb_names = (
+            "shmem_disp_out_tok", "shmem_disp_out_wts", "shmem_disp_out_idx",
+            "shmem_out_scales", "shmem_tok_off", "shmem_recv_tok_num",
+            "shmem_tok_id_to_src", "shmem_comb_inp_tok", "shmem_comb_inp_wts",
+            "shmem_comb_out_tok", "shmem_comb_out_wts", "shmem_xdev_bar_mem",
+        )
+        group_names = (
+            "done2", "running", "ll_count", "rx_em", "scale_em", "idx_em",
+            "wts_em", "srcmap_em", "recv_num", "compact_base", "done2c",
+            "write_cursor", "done2cb", "bigcnt", "cnt_done",
+        )
+        dispatch_names = (
+            "bigcnt", "count_done", "my_base", "plan_ready", "payload_ready",
+            "launch_ready", "tile_ready", "payload_ready_rows",
+        )
+        tensors = [getattr(moe.comb_op, name) for name in comb_names]
+        tensors.extend(
+            getattr(moe._s1_op, name)
+            for name in group_names
+            if getattr(moe._s1_op, name, None) is not None
+        )
+        tensors.extend(moe._s1_dispatch_workspace[name] for name in dispatch_names)
+        unique = {tensor.data_ptr(): tensor for tensor in tensors}
+        symmetric_bytes = sum(
+            tensor.numel() * tensor.element_size() for tensor in unique.values()
+        )
+        if symmetric_bytes > 2 * (1 << 30):
+            raise AssertionError(
+                f"symmetric workspace is {symmetric_bytes} bytes, exceeding 2 GiB"
+            )
+        if rank == 0:
+            print(
+                f"[WORKSPACE] symmetric={symmetric_bytes / (1 << 30):.3f} GiB",
+                flush=True,
+            )
+
+    stage1_launches = 0
+    original_stage1 = moe._run_fused_stage1
+    forward_kwargs = (
+        {}
+        if collective_tokens == tokens
+        and collective_tokens <= moe.workspace_tokens_per_rank
+        else {"collective_tokens_per_rank": collective_tokens}
+    )
+
+    def counted_stage1(*call_args, **call_kwargs):
+        nonlocal stage1_launches
+        stage1_launches += 1
+        return original_stage1(*call_args, **call_kwargs)
+
+    moe._run_fused_stage1 = counted_stage1
+    try:
+        output = moe(x, weights, ids, **forward_kwargs)[:tokens]
+    finally:
+        moe._run_fused_stage1 = original_stage1
+    expected_launches = (
+        collective_tokens + moe.workspace_tokens_per_rank - 1
+    ) // moe.workspace_tokens_per_rank
+    if stage1_launches != expected_launches:
+        raise AssertionError(
+            f"expected {expected_launches} transaction launches, got {stage1_launches}"
+        )
     _barrier()
     rel_l2 = -1.0
-    if tokens <= args.accuracy_max_bs:
+    if collective_tokens <= args.accuracy_max_bs:
         reference = _reference(
             x,
             weights,
@@ -250,22 +328,36 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
 
+    if args.smoke_only:
+        if rank == 0:
+            print(
+                f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
+                f"transactions={expected_launches} smoke=passed",
+                flush=True,
+            )
+        return
+
     x_q, scale = moe.quantize(x)
     state = {}
 
-    def stage1():
-        moe._run_fused_stage1(x_q, weights, scale, ids)
-
-    def stage2():
-        state["output"] = moe._run_stage2(tokens, None, True, moe._active_config)
-
     def end_to_end():
-        state["output"] = moe(x, weights, ids)
+        state["output"] = moe(x, weights, ids, **forward_kwargs)
 
-    stage1_ms = _time_graph(stage1, device, args.iters)
-    stage1()
-    _barrier()
-    stage2_ms = _time_graph(stage2, device, args.iters)
+    if collective_tokens <= moe.workspace_tokens_per_rank:
+        config = moe._select_config(collective_tokens)
+
+        def stage1():
+            moe._run_fused_stage1(x_q, weights, scale, ids, config=config.stage1)
+
+        def stage2():
+            state["output"] = moe._run_stage2(tokens, None, True, config)
+
+        stage1_ms = _time_graph(stage1, device, args.iters)
+        stage1()
+        _barrier()
+        stage2_ms = _time_graph(stage2, device, args.iters)
+    else:
+        stage1_ms = stage2_ms = (float("nan"), float("nan"))
     e2e_ms = _time_graph(end_to_end, device, args.iters)
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
@@ -282,11 +374,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         )
 
 
-def _run_burst(moe, x, weights, ids, depth, rank):
-    moe(x, weights, ids)
+def _run_burst(moe, x, weights, ids, depth, rank, collective_tokens):
+    moe(x, weights, ids, collective_tokens_per_rank=collective_tokens)
     _barrier()
     for _ in range(depth):
-        moe(x, weights, ids)
+        moe(x, weights, ids, collective_tokens_per_rank=collective_tokens)
     torch.cuda.synchronize()
     if rank == 0:
         print(f"[BURST] completed={depth}/{depth}", flush=True)
@@ -344,10 +436,13 @@ def main():
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
     parser.add_argument("--rtol", type=float, default=0.10)
     parser.add_argument("--max-tok-per-rank", type=int)
+    parser.add_argument("--workspace-tokens-per-rank", type=int, default=0)
+    parser.add_argument("--route-expert", type=int, default=-1)
     parser.add_argument("--rank-tokens", default="")
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--smoke-only", action="store_true")
     args = parser.parse_args()
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
@@ -374,6 +469,10 @@ def main():
             raise ValueError(
                 "--config-tokens must be between zero and max-tok-per-rank"
             )
+        if args.workspace_tokens_per_rank < 0:
+            raise ValueError("--workspace-tokens-per-rank must be non-negative")
+        if args.route_expert >= network["experts"]:
+            raise ValueError("--route-expert must name a valid global expert")
         local_experts = network["experts"] // world
         packed = _quantize_weights(
             network["model_dim"],
@@ -402,6 +501,10 @@ def main():
             max_tok_per_rank = args.max_tok_per_rank or max(
                 16, _next_power_of_two(batch_size)
             )
+            workspace_tokens_per_rank = args.workspace_tokens_per_rank or min(
+                max_tok_per_rank, 4096
+            )
+            collective_tokens = max(rank_tokens) if rank_tokens else batch_size
             moe = MegaMoEV2(
                 rank=rank,
                 world_size=world,
@@ -411,11 +514,14 @@ def main():
                 w2=w2,
                 w2_scale=w2_scale,
                 max_tok_per_rank=max_tok_per_rank,
+                workspace_tokens_per_rank=workspace_tokens_per_rank,
                 **network,
             )
             _install_config_policy(moe, args.config_tokens, args.unify_fields)
             if rank_tokens:
-                selected = moe._select_config(local_batch_size)
+                selected = moe._select_config(
+                    min(collective_tokens, moe.workspace_tokens_per_rank)
+                )
                 configs = [None] * world
                 dist.all_gather_object(
                     configs,
@@ -433,9 +539,12 @@ def main():
             local_x = x[:local_batch_size].contiguous()
             local_weights = weights[:local_batch_size].contiguous()
             local_ids = ids[:local_batch_size].contiguous()
+            if args.route_expert >= 0:
+                local_ids.fill_(args.route_expert)
             if args.burst_depth:
                 _run_burst(
-                    moe, local_x, local_weights, local_ids, args.burst_depth, rank
+                    moe, local_x, local_weights, local_ids, args.burst_depth, rank,
+                    collective_tokens
                 )
             else:
                 _run_size(
@@ -448,6 +557,7 @@ def main():
                     rank,
                     world,
                     device,
+                    collective_tokens,
                 )
     finally:
         _cleanup()
