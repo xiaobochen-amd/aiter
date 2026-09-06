@@ -58,10 +58,9 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     parse_8wave_kernel_name,
 )
 from aiter.ops.flydsl.gemm_kernels import (
-    SPLIT_K_SEMAPHORE_GRANULE,
+    compile_hgemm_config_to_cache,
     get_flydsl_splitk_hgemm_kernel_params,
 )
-from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
@@ -279,35 +278,16 @@ def _compile_hgemm_to_cache(
     target_gfx: str,
     kernel_family: str = "hgemm",
     has_bias: bool = False,
+    xcd_band: int = 1,
+    k_rot: int = 0,
+    m_rows: int = 0,
+    b_cpol: int = 0,
     **kwargs,
 ):
-    del kwargs, out_dtype
+    del kwargs, m, out_dtype
 
-    import torch
-
-    dev = torch.device("cpu")
-    torch_dtype = _torch_dtype_for_kernel(dtype)
-
-    out = torch.empty((m, n), device=dev, dtype=torch_dtype)
-    a = torch.empty((m, k), device=dev, dtype=torch_dtype)
-    b = torch.empty((n, k), device=dev, dtype=torch_dtype)
-    bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_GRANULE,),
-        device=dev,
-        dtype=torch.int32,
-    )
-    workspace = torch.empty(
-        (SPLIT_K_SEMAPHORE_GRANULE,),
-        device=dev,
-        dtype=torch.int32,
-    )
-    stream = fx.Stream(0)
-
-    exe = compile_flydsl_hgemm_kernel(
-        dtype,
-        n,
-        k,
+    config = dict(
+        dtype=dtype,
         kernel_family=kernel_family,
         tile_m=tile_m,
         tile_n=tile_n,
@@ -325,22 +305,20 @@ def _compile_hgemm_to_cache(
         b_to_lds=b_to_lds,
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
+        xcd_band=xcd_band,
+        k_rot=k_rot,
+        m_rows=m_rows,
+        b_cpol=b_cpol,
+    )
+    result = compile_hgemm_config_to_cache(
+        n=n,
+        k=k,
+        config=config,
         has_bias=has_bias,
+        target_gfx=target_gfx,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
-    # optional bias and split-K sync tensors.
-    launch_bias = bias if has_bias else b
-    _compile_executable_to_cache(
-        exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(launch_bias),
-        m,
-        _ptr_view_safe(semaphore),
-        _ptr_view_safe(workspace),
-        stream,
-    )
+    if result["compile_time"] is None:
+        raise RuntimeError(result.get("error", "hgemm compile failed"))
 
 
 def _compile_preshuffle_to_cache(

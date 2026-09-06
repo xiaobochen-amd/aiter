@@ -38,15 +38,30 @@ FLYDSL_TUNE_ERROR = None
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
+            HGEMM_AXIS_RERACE_OPTIONS,
+            SPLIT_K_MAX_WORKSPACE_BYTES,
+            _split_k_launch_shape,
             flydsl_hgemm,
+            flydsl_hgemm_axis_variant_name,
+            get_flydsl_splitk_hgemm_kernel_params,
             get_flydsl_splitk_hgemm_kernels,
+            prebuild_hgemm_configs,
         )
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     flydsl_hgemm = None
     get_flydsl_splitk_hgemm_kernels = None
+    get_flydsl_splitk_hgemm_kernel_params = None
+    flydsl_hgemm_axis_variant_name = None
+    prebuild_hgemm_configs = None
+    HGEMM_AXIS_RERACE_OPTIONS = ()
+    SPLIT_K_MAX_WORKSPACE_BYTES = 0
+    _split_k_launch_shape = None
     FLYDSL_TUNE_ERROR = str(exc)
+
+# Price the bm>1 prune against the MALL, not against any one shape.
+_B_STREAM_CACHE_BYTES = 128 * 1024 * 1024
 
 OPUS_TUNE_ERROR = None
 try:
@@ -320,6 +335,8 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
         xcd_band=config.get("xcd_band", 1),
+        k_rot=config.get("k_rot", 0),
+        b_cpol=config.get("b_cpol", 0),
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
@@ -334,6 +351,52 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _flydsl_prebuild_job(n, k, has_bias, kernel_name, config):
+    """Pre-build job for one FlyDSL candidate.
+
+    M is a runtime kernel argument, so the build is keyed on (n, k, config)
+    only -- one build covers every M the bench asks for at the same shape.
+    """
+    return dict(
+        kernel_name=kernel_name,
+        n=int(n),
+        k=int(k),
+        config=config,
+        has_bias=bool(has_bias),
+    )
+
+
+def _prebuild_flydsl_tasks(task, shape_bounds, jobs, label):
+    """Build every FlyDSL candidate off the GPU, then drop the unbuildable ones.
+
+    Two effects, both on wall clock rather than on the search: the timing pass
+    gets a FlyDSL disk-cache hit instead of a JIT build inside the few
+    processes that own the cards, and the candidates the backend rejects
+    outright (a quarter of the catalog, on measured tile/warp asserts) never
+    reach a card. `jobs[i]` is the job for `task[i]`, or None for tasks from
+    other backends.
+    """
+    idx = [i for i, job in enumerate(jobs) if job is not None]
+    tasks_data = [(end - start, ()) for start, end in shape_bounds]
+    if not idx or prebuild_hgemm_configs is None:
+        return task, tasks_data
+
+    cached = prebuild_hgemm_configs([jobs[i] for i in idx], label=label)
+    dropped = {i for i, ok in zip(idx, cached) if not ok}
+    if not dropped:
+        return task, tasks_data
+    kept = [t for i, t in enumerate(task) if i not in dropped]
+    tasks_data = [
+        (sum(1 for i in range(start, end) if i not in dropped), ())
+        for start, end in shape_bounds
+    ]
+    logger.info(
+        f"FlyDSL {label}: {len(task)} -> {len(kept)} candidates after dropping "
+        f"{len(dropped)} the backend cannot build"
+    )
+    return kept, tasks_data
 
 
 @lru_cache(maxsize=1)
@@ -552,9 +615,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return results
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        assert os.path.exists(
-            untuned_gemm_file
-        ), f"Not exist untuned file: {untuned_gemm_file}"
+        assert os.path.exists(untuned_gemm_file), (
+            f"Not exist untuned file: {untuned_gemm_file}"
+        )
         untunedf = pd.read_csv(untuned_gemm_file).fillna("")
         return untunedf.drop_duplicates().reset_index(drop=True)
 
@@ -726,19 +789,24 @@ class GemmA16W16Tuner(GemmCommonTuner):
     ):
         if flydsl_hgemm is None or get_flydsl_splitk_hgemm_kernels is None:
             logger.warning(f"FlyDSL not available, skip. reason: {FLYDSL_TUNE_ERROR}")
-            return []
+            return [], []
         if scaleAB or indtype != dtypes.bf16:
-            return []
+            return [], []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, atol = _default_tol(outdtype)
+        cu_num = get_cu_num()
         flydsl_catalog = get_flydsl_bf16_catalog(M, N, K)
         weight_key = "shuffleweights" if is_shuffle else "weights"
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
+        # Stop at the first tile covering M; past it the rows are outside the
+        # matrix and only add MFMA steps and epilogue traffic.
+        max_tile_m = max(-(-M // 16) * 16, min_tile_m)
         tasks = []
+        jobs = []
         for solidx, kernel_name, config in flydsl_catalog:
             if config.get("b_preshuffle", False) != is_shuffle:
                 continue
-            if config["tile_m"] > max(M, min_tile_m):
+            if config["tile_m"] > max_tile_m:
                 continue
             if N < config["tile_n"]:
                 continue
@@ -754,12 +822,22 @@ class GemmA16W16Tuner(GemmCommonTuner):
             ks = K // config["split_k"]
             if ks < config["tile_k"] or ks % config["tile_k"] != 0:
                 continue
+            bm = (M + config["tile_m"] - 1) // config["tile_m"]
+            wgs = bm * ((N + config["tile_n"] - 1) // config["tile_n"])
             if config["split_k"] > 1:
-                counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
-                    N // config["tile_n"]
+                # Gate on idle CUs, not the tile counter: split_k only buys
+                # parallelism while the grid leaves CUs unused.
+                _, ws_bytes = _split_k_launch_shape(
+                    M, N, config["tile_m"], config["tile_n"], config["split_k"]
                 )
-                if counters > 128:
+                if ws_bytes > SPLIT_K_MAX_WORKSPACE_BYTES:
                     continue
+                if wgs >= cu_num or wgs * config["split_k"] > 2 * cu_num:
+                    continue
+            # bm passes ask HBM for bm x the weight bytes once B outgrows the
+            # last cache level, so spend the wall clock on split_k instead.
+            if N * K * 2 > _B_STREAM_CACHE_BYTES and bm >= 3:
+                continue
             info = (
                 info_keys,
                 solidx,
@@ -788,8 +866,119 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     atol,
                 )
             )
+            jobs.append(_flydsl_prebuild_job(N, K, has_bias, kernel_name, config))
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
-        return tasks
+        return tasks, jobs
+
+    def _get_flydsl_axis_tasks(self, rets, shape_commons, err_ratio):
+        """Second-pass tasks: race B's cache policy and k rotation.
+
+        A read-once weight stream wants cache-bypassing loads and a per-N-block
+        k offset that decorrelates its DRAM bursts. Both knobs are in the
+        kernel, both are worth 15-20% on the wide-N points, and neither can be
+        set by rule -- b_cpol=1 measures -62% on one (shape, tile_k) pair and
+        +83% on another, so the sign depends on the geometry. Cross-producting
+        them into the catalog would multiply every candidate; racing them once
+        the first pass has named the geometries costs a few dozen timings per
+        shape instead.
+        """
+        if flydsl_hgemm is None or flydsl_hgemm_axis_variant_name is None:
+            return [], [], []
+        # The axes act on the B stream, so one seed per geometry is enough.
+        max_seeds_per_shape = 48
+        best_by_geometry = {}
+        for info, us, err_ratio_seen in rets:
+            info_keys, solidx, _, kernel_name, lib, _ = info
+            if lib != "flydsl" or not 0.0 < us < float("inf"):
+                continue
+            if err_ratio_seen > err_ratio:
+                continue
+            config = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
+            if config is None or config.get("k_rot", 0) or config.get("b_cpol", 0):
+                continue
+            geometry = (
+                info_keys,
+                config["tile_n"],
+                config["tile_k"],
+                config["split_k"],
+                config.get("xcd_band", 1),
+            )
+            prev = best_by_geometry.get(geometry)
+            if prev is None or us < prev[0]:
+                best_by_geometry[geometry] = (us, solidx, config)
+
+        seeds_by_shape = {}
+        for geometry, seed in best_by_geometry.items():
+            seeds_by_shape.setdefault(geometry[0], []).append(seed)
+
+        tasks = []
+        jobs = []
+        shape_bounds = []
+        for common in shape_commons:
+            info_keys = common[0]
+            seeds = seeds_by_shape.get(info_keys)
+            if not seeds:
+                continue
+            shape_start = len(tasks)
+            _, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs = common
+            M, N, K = info_keys[2], info_keys[3], info_keys[4]
+            rtol, atol = _default_tol(outdtype)
+            weight_key = "shuffleweights" if is_shuffle else "weights"
+            seeds.sort(key=lambda entry: entry[0])
+            for _, solidx, config in seeds[:max_seeds_per_shape]:
+                for k_rot, b_cpol in HGEMM_AXIS_RERACE_OPTIONS:
+                    variant = dict(config)
+                    variant["k_rot"] = k_rot
+                    variant["b_cpol"] = b_cpol
+                    kernel_name = flydsl_hgemm_axis_variant_name(config, k_rot, b_cpol)
+                    info = (
+                        info_keys,
+                        solidx,
+                        config["split_k"],
+                        kernel_name,
+                        "flydsl",
+                        is_shuffle,
+                    )
+                    tasks.append(
+                        (
+                            info,
+                            generate_data,
+                            (
+                                M,
+                                N,
+                                K,
+                                indtype,
+                                outdtype,
+                                scaleAB,
+                                is_shuffle,
+                                0,
+                                has_bias,
+                            ),
+                            run_flydsl_gemm_bf16,
+                            (["inp", weight_key, "bias"], outdtype, variant),
+                            dict(run_kwargs),
+                            get_gemm_ref,
+                            (
+                                ["inp", "weights", "bias", "x_scale", "w_scale"],
+                                indtype,
+                                outdtype,
+                            ),
+                            {},
+                            None,
+                            rtol,
+                            atol,
+                        )
+                    )
+                    jobs.append(
+                        _flydsl_prebuild_job(N, K, has_bias, kernel_name, variant)
+                    )
+            shape_bounds.append((shape_start, len(tasks)))
+            logger.info(
+                f"FlyDSL axis re-race count for M={M}, N={N}, K={K}: "
+                f"{len(tasks) - shape_start} over "
+                f"{min(len(seeds), max_seeds_per_shape)} arms"
+            )
+        return tasks, shape_bounds, jobs
 
     def _get_skinny_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
@@ -938,8 +1127,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
         run_kwargs = {"num_warmup": 10, "num_iters": 101}
 
         task = []
-        tasks_data = []
         hipblaslt_rets = []
+        shape_commons = []
+        shape_bounds = []
+        prebuild_jobs = []
 
         for i in range(len(untunedf)):
             ds = untunedf.loc[i, :]
@@ -971,12 +1162,16 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 is_shuffle,
                 run_kwargs,
             )
+            shape_commons.append(common)
 
             prev_count = len(task)
             if "all" in libtype or "asm" in libtype:
                 task.extend(self._get_asm_tasks(*common))
             if "all" in libtype or "flydsl" in libtype:
-                task.extend(self._get_flydsl_tasks(*common))
+                flydsl_task, flydsl_jobs = self._get_flydsl_tasks(*common)
+                prebuild_jobs.extend([None] * (len(task) - len(prebuild_jobs)))
+                task.extend(flydsl_task)
+                prebuild_jobs.extend(flydsl_jobs)
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:
@@ -994,11 +1189,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         )
                 task.extend(opus_tasks)
 
-            shape_kernel_nums = len(task) - prev_count
-            tasks_data.append((shape_kernel_nums, ()))
+            shape_bounds.append((prev_count, len(task)))
 
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
+
+        prebuild_jobs.extend([None] * (len(task) - len(prebuild_jobs)))
+        task, tasks_data = _prebuild_flydsl_tasks(
+            task, shape_bounds, prebuild_jobs, "a16w16 race"
+        )
 
         ret = []
         if task:
@@ -1012,6 +1211,25 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 timeout=args.timeout,
                 verbose=args.verbose,
             )
+
+        if ret and ("all" in libtype or "flydsl" in libtype):
+            axis_task, axis_bounds, axis_jobs = self._get_flydsl_axis_tasks(
+                ret, shape_commons, args.errRatio
+            )
+            axis_task, axis_tasks_data = _prebuild_flydsl_tasks(
+                axis_task, axis_bounds, axis_jobs, "a16w16 axis re-race"
+            )
+            if axis_task:
+                ret = ret + mp_tuner(
+                    axis_task,
+                    axis_tasks_data,
+                    args.mp,
+                    False,
+                    args.shape_grouped,
+                    args.errRatio,
+                    timeout=args.timeout,
+                    verbose=args.verbose,
+                )
 
         return ret + hipblaslt_rets
 
