@@ -364,10 +364,11 @@ def moe_sorting(
     accumulate=True,
     flat=False,
     output_aux=False,
+    prefer_flydsl=False,
 ):
     if (
         not _USE_CK_MOE_SORTING
-        and _USE_FLYDSL_MOE_SORTING
+        and (_USE_FLYDSL_MOE_SORTING or prefer_flydsl)
         and is_flydsl_available()
         and not return_local_topk_ids
         and not flat
@@ -930,6 +931,12 @@ def _fused_moe_impl(
         block_size_M = int(block_size_M)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
+    prefer_flydsl_sort = (
+        expert_mask is not None
+        and stage1_func is _flydsl_stage1_wrapper
+        and M * 4 > block_size_M
+        and M <= block_size_M
+    )
     need_local_topk_ids = (
         not metadata.run_1stage
         and need_bias_support
@@ -990,6 +997,7 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
+            prefer_flydsl=prefer_flydsl_sort,
         )
         if need_local_topk_ids:
             (
