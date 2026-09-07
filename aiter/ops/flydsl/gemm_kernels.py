@@ -90,13 +90,12 @@ HGEMM_TILE_N_OPTIONS = (32, 64, 128, 256)
 HGEMM_XCD_BAND_OPTIONS = (1, 2)
 NUM_XCD = 8
 # (k_rot, b_cpol) pairs; neither can be picked by rule, so the tuner races them.
-HGEMM_AXIS_RERACE_OPTIONS = ((1, 0), (2, 0), (4, 0), (0, 1), (1, 1), (2, 1), (4, 1))
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
 HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
 # split_k is bounded by the reduction workspace and idle CUs, not a fixed depth.
-HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 49))
-HGEMM_MAX_SPLIT_K = 48
+HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
+HGEMM_MAX_SPLIT_K = 13
 HGEMM_WARP_SHAPE_OPTIONS = [
     (wm, wn, wk) for wm, wn, wk in product([1, 2, 4], repeat=3) if wm * wn * wk <= 16
 ]
@@ -197,35 +196,6 @@ def flydsl_kernel_name(
         name += f"_cp{b_cpol}"
     name += f"_{get_gfx()}"
     return name
-
-
-def flydsl_hgemm_axis_variant_name(config: dict, k_rot: int, b_cpol: int) -> str:
-    """Re-spell an already-parsed hgemm config with a different axis pair."""
-    name = flydsl_kernel_name(
-        config["stages"],
-        config["dtype"],
-        config["out_dtype"],
-        config["tile_m"],
-        config["tile_n"],
-        config["tile_k"],
-        config["split_k"],
-        config["block_m_warps"],
-        config["block_n_warps"],
-        config["block_k_warps"],
-        config["async_copy"],
-        config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        c_to_lds=config.get("c_to_lds", False),
-        kernel_family=config.get("kernel_family", KERNEL_FAMILY_HGEMM),
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        k_rot=k_rot,
-        b_cpol=b_cpol,
-    )
-    xcd_band = config.get("xcd_band", 1)
-    return name if xcd_band <= 1 else f"{name}_xb{xcd_band}"
 
 
 def _stream_cache_key(stream: torch.cuda.Stream) -> SplitKStreamKey:
@@ -1085,183 +1055,6 @@ def flydsl_hgemm(
 
     launcher(out, a, b, bias=bias, stream=launch_stream)
     return out
-
-
-def _hgemm_config_kernel_kwargs(config: dict, has_bias: bool = False) -> dict:
-    """Map a catalog/parsed hgemm config onto `compile_flydsl_hgemm_kernel`."""
-    return dict(
-        kernel_family=config.get("kernel_family", KERNEL_FAMILY_HGEMM),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        stages=config["stages"],
-        split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        block_k_warps=config["block_k_warps"],
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        async_copy=config.get("async_copy", KERNEL_ASYNC_COPY),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        c_to_lds=config.get("c_to_lds", FIXED_C_TO_LDS),
-        has_bias=has_bias,
-        xcd_band=config.get("xcd_band", 1),
-        k_rot=config.get("k_rot", 0),
-        m_rows=config.get("m_rows", 0),
-        b_cpol=config.get("b_cpol", 0),
-    )
-
-
-def compile_hgemm_config_to_cache(
-    kernel_name: str = "",
-    n: int = 0,
-    k: int = 0,
-    config: dict | None = None,
-    has_bias: bool = False,
-    target_gfx: str = "",
-) -> dict:
-    """Build one hgemm candidate into the FlyDSL disk cache without a GPU.
-
-    `m` is a runtime kernel argument, so one build covers every M sharing an
-    (n, k, config). Runs under `FakeTensorMode` with `COMPILE_ONLY=1`, so no
-    device memory is touched and nothing launches -- which is what lets both
-    the AOT build and the tuner fill the cache from a wide CPU-only process
-    pool while the GPUs stay free. Compile failures are reported through the
-    return value (`compile_time is None`) rather than raised: a candidate the
-    backend rejects is one the caller was going to drop anyway.
-
-    Returns the `run_jobs_parallel` result contract:
-    `{"kernel_name": str, "compile_time": float | None}`.
-    """
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    from aiter.aot.flydsl.common import compile_only_env, override_env
-
-    result: dict = {"kernel_name": kernel_name, "compile_time": None}
-    config = config or {}
-    arch = target_gfx or config.get("target_gfx") or get_gfx()
-    t0 = time.time()
-    try:
-        with override_env("FLYDSL_GPU_ARCH", arch), FakeTensorMode():
-            kernel = compile_flydsl_hgemm_kernel(
-                config["dtype"],
-                n,
-                k,
-                **_hgemm_config_kernel_kwargs(config, has_bias),
-            )
-            # Fake tensors suffice; go through `_run_compiled` to match the key.
-            fake = torch.empty(1, device="cpu")
-            with compile_only_env():
-                _run_compiled(
-                    kernel,
-                    ptr_arg(fake),
-                    ptr_arg(fake),
-                    ptr_arg(fake),
-                    ptr_arg(fake),
-                    1,
-                    ptr_arg(fake),
-                    ptr_arg(fake),
-                    fx.Stream(0),
-                )
-        result["compile_time"] = time.time() - t0
-    except Exception as e:  # noqa: BLE001
-        result["error"] = f"{type(e).__name__}: {e}"
-    return result
-
-
-def _prebuild_hgemm_chunk(configs: list | None = None, kernel_name: str = "") -> dict:
-    """`run_jobs_parallel` worker: build a slice of candidates into the cache.
-
-    A slice rather than a single candidate because the pool forks a fresh
-    process per job, and forking a torch process costs ~20 ms: submitted one
-    candidate at a time the parent's fork loop -- not the compiler -- sets the
-    rate (measured 52-58 jobs/s at both 64 and 160 workers).
-    """
-    t0 = time.time()
-    ok = [
-        idx
-        for idx, job in configs or []
-        if compile_hgemm_config_to_cache(**job)["compile_time"] is not None
-    ]
-    return {"kernel_name": kernel_name, "compile_time": time.time() - t0, "ok": ok}
-
-
-# Enough slices to balance the pool without paying a fork per candidate.
-_PREBUILD_CHUNKS_PER_WORKER = 8
-_PREBUILD_MAX_CHUNK = 64
-
-
-def prebuild_hgemm_configs(jobs: list[dict], *, label: str = "hgemm") -> list[bool]:
-    """Fill the FlyDSL disk cache for `jobs` from a CPU-only process pool.
-
-    Candidate racing is GPU-bound only in its timing phase; the JIT build in
-    front of it is pure host work, and paying it inside the timing workers
-    serialises every build behind the handful of cards the tuner was given.
-    Building first, wide, leaves the timing pass a disk-cache hit (measured
-    275 ms -> 62 ms for a first call on gfx950).
-
-    Returns one flag per job: False means the backend rejected that config, so
-    the caller can drop it instead of re-deriving the same rejection on a GPU
-    worker. A slice the pool loses to a hard crash reports False for its whole
-    slice, which only costs those candidates a cache miss later.
-    """
-    if not jobs:
-        return []
-    from aiter.aot.flydsl.common import get_max_workers, run_jobs_parallel
-
-    # M is a runtime argument, so one build serves every M of a (n, k, config).
-    slot_of_key: dict[tuple, int] = {}
-    unique: list[dict] = []
-    slots = []
-    for job in jobs:
-        key = (
-            job["n"],
-            job["k"],
-            job.get("has_bias", False),
-            *sorted(job["config"].items()),
-        )
-        slot = slot_of_key.get(key)
-        if slot is None:
-            slot = len(unique)
-            slot_of_key[key] = slot
-            unique.append(job)
-        slots.append(slot)
-
-    workers = get_max_workers(len(unique))
-    chunk = min(
-        _PREBUILD_MAX_CHUNK,
-        max(1, -(-len(unique) // max(1, workers * _PREBUILD_CHUNKS_PER_WORKER))),
-    )
-    n_chunks = -(-len(unique) // chunk)
-    indexed = list(enumerate(unique))
-    chunks = [indexed[i::n_chunks] for i in range(n_chunks)]
-    logger.info(
-        f"FlyDSL {label} pre-build: {len(jobs)} candidates, {len(unique)} distinct "
-        f"kernels in {n_chunks} slices"
-    )
-    results = run_jobs_parallel(
-        _prebuild_hgemm_chunk,
-        [{"configs": c, "kernel_name": f"{label}[{i}]"} for i, c in enumerate(chunks)],
-    )
-    built = [False] * len(unique)
-    for res in results:
-        for slot in res.get("ok") or ():
-            built[slot] = True
-    cached = [built[slot] for slot in slots]
-    ok = sum(cached)
-    logger.info(f"FlyDSL {label} pre-build: {ok} cached, {len(jobs) - ok} rejected")
-    return cached
-
-
-# ---------------------------------------------------------------------------
-# FlyDSL preshuffle GEMM kernel management
-# ---------------------------------------------------------------------------
-
-_flydsl_compile_fn = None
-_flydsl_import_done = False
 
 
 def _get_compile_fn():
