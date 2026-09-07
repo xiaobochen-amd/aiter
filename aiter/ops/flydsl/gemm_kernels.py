@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import functools
 import re
-import time
 from itertools import product
 
 import flydsl.expr as fx
@@ -89,11 +88,9 @@ HGEMM_TILE_N_OPTIONS = (32, 64, 128, 256)
 # XCD banding is a pure WG->tile bijection (bit-identical); tune it per shape.
 HGEMM_XCD_BAND_OPTIONS = (1, 2)
 NUM_XCD = 8
-# (k_rot, b_cpol) pairs; neither can be picked by rule, so the tuner races them.
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
 HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
-# split_k is bounded by the reduction workspace and idle CUs, not a fixed depth.
 HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
 HGEMM_MAX_SPLIT_K = 13
 HGEMM_WARP_SHAPE_OPTIONS = [
@@ -152,8 +149,6 @@ def flydsl_kernel_name(
     persistent_n_tiles: int = 1,
     waves_per_eu: int = 0,
     b_to_lds_unroll: int = 0,
-    k_rot: int = 0,
-    b_cpol: int = 0,
 ) -> str:
     async_copy, c_to_lds = _normalize_supported_kernel_metadata(
         async_copy=async_copy,
@@ -190,10 +185,6 @@ def flydsl_kernel_name(
             f"Unsupported kernel_family={kernel_family!r}; expected "
             f"{KERNEL_FAMILY_HGEMM!r} or {KERNEL_FAMILY_SMALL_M!r}"
         )
-    if k_rot > 0:
-        name += f"_kr{k_rot}"
-    if b_cpol > 0:
-        name += f"_cp{b_cpol}"
     name += f"_{get_gfx()}"
     return name
 
@@ -266,8 +257,7 @@ def _estimate_hgemm_lds_bytes(
     pipeline_lds_bytes = stages * tile_m * tile_k * dtype_bytes
     if b_to_lds:
         pipeline_lds_bytes += stages * tile_n * tile_k * dtype_bytes
-    # Keep in step with C_STAGE_DTYPE in splitk_hgemm.py.
-    c_lds_bytes = block_k_warps * tile_m * tile_n * (4 if split_k > 1 else dtype_bytes)
+    c_lds_bytes = block_k_warps * tile_m * tile_n * dtype_bytes
     # The arrival dword sits beside the tile union, so it is counted here too.
     split_k_flag_bytes = 4 if split_k > 1 else 0
     return max(pipeline_lds_bytes, c_lds_bytes) + split_k_flag_bytes
@@ -345,8 +335,7 @@ def selection_filter(m, n, k, kwargs):
         SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
         if B_TO_LDS:
             SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
-        c_stage_bytes = 4 if SPLIT_K > 1 else DTYPE_BYTES
-        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * c_stage_bytes)
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
         return SMEM_USE + (4 if SPLIT_K > 1 else 0)
 
     smem_use_s0 = get_stage_smem_use(STAGES)
@@ -761,7 +750,7 @@ def _split_k_launch_shape(
     tiles = ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n)
     return (
         tiles * SPLIT_K_SEMAPHORE_STRIDE,
-        tiles * split_k * tile_m * tile_n * 4,
+        tiles * split_k * tile_m * tile_n * 2,
     )
 
 
@@ -1055,6 +1044,14 @@ def flydsl_hgemm(
 
     launcher(out, a, b, bias=bias, stream=launch_stream)
     return out
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL preshuffle GEMM kernel management
+# ---------------------------------------------------------------------------
+
+_flydsl_compile_fn = None
+_flydsl_import_done = False
 
 
 def _get_compile_fn():
