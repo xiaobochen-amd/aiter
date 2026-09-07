@@ -785,6 +785,7 @@ def _gluon_fp8_mqa_logits_kernel(
     USE_PADDED_SHARED_LAYOUT: gl.constexpr,
     BLOCK_M: gl.constexpr = 1,  # query rows per workgroup
     MFMA_NONK_DIM: gl.constexpr = 32,
+    NUM_KV_SPLITS: gl.constexpr = 1,  # KV slices per query block, on axis 1
 ):
 
     gl.static_assert(
@@ -913,6 +914,16 @@ def _gluon_fp8_mqa_logits_kernel(
         row_ends = row_ends + (er,)
         union_start = gl.minimum(union_start, sr)
         union_end = gl.maximum(union_end, er)
+
+    # Cut the KV walk across axis 1. Each split owns a BLOCK_KV-aligned slice and
+    # writes only its own logits columns, so the splits never have to be merged.
+    # An out-of-range split lands on start == end and walks nothing.
+    if NUM_KV_SPLITS > 1:
+        span_tiles = (union_end - union_start + BLOCK_KV - 1) // BLOCK_KV
+        per_split = (span_tiles + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS * BLOCK_KV
+        split_start = union_start + gl.program_id(axis=1) * per_split
+        union_end = gl.minimum(union_end, split_start + per_split)
+        union_start = gl.minimum(split_start, union_end)
 
     num_full_tiles = (union_end - union_start) // BLOCK_KV
 
