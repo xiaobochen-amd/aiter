@@ -69,7 +69,9 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?:_kr(?P<k_rot>\d+))?"
     r"(?:_mr(?P<m_rows>\d+))?"
     r"(?:_cp(?P<b_cpol>\d+))?"
-    r"_(?P<target_gfx>gfx[0-9a-z]+)$"
+    r"_(?P<target_gfx>gfx[0-9a-z]+)"
+    # Tuned tables still spell banding after the arch tag; accept both.
+    r"(?:_xb(?P<xcd_band_suffix>\d+))?$"
 )
 
 SplitKStreamKey = tuple[int, int]
@@ -81,7 +83,8 @@ SPLIT_K_GLOBAL_WORKSPACE: dict[SplitKStreamKey, torch.Tensor] = {}
 # reference tuning space. The wider local one-off search space introduced
 # gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
 # and higher split-K values are now capped at 8 for better accuracy.
-HGEMM_TILE_N_OPTIONS = (64, 128, 256)
+# tile_n=32 is the only tile covering N < 64; the kernel asserts n >= BLOCK_N.
+HGEMM_TILE_N_OPTIONS = (32, 64, 128, 256)
 # XCD banding is a pure WG->tile bijection (bit-identical); tune it per shape.
 HGEMM_XCD_BAND_OPTIONS = (1, 2)
 NUM_XCD = 8
@@ -578,7 +581,7 @@ def _parse_hgemm_kernel_params(name: str) -> dict | None:
         "b_to_lds": m.group("b_to_lds") == "True",
         "b_preshuffle": m.group("b_preshuffle") == "True",
         "c_to_lds": m.group("c_to_lds") == "True",
-        "xcd_band": int(m.group("xcd_band") or 1),
+        "xcd_band": int(m.group("xcd_band") or m.group("xcd_band_suffix") or 1),
         "k_rot": int(m.group("k_rot") or 0),
         "m_rows": int(m.group("m_rows") or 0),
         "b_cpol": int(m.group("b_cpol") or 0),
@@ -627,7 +630,16 @@ def get_flydsl_splitk_hgemm_kernels(
         HGEMM_STAGE_OPTIONS,
         KERNEL_CONFIG_VARIANTS,
     ):
-        if n is not None and (n < tile_n or n % tile_n != 0):
+        if n is not None and n < tile_n:
+            continue
+        # The kernel clamps and predicates the last N tile, so tile_n no longer
+        # has to divide N. That path stages B through LDS and needs N aligned
+        # to the 8-element global load vector.
+        if (
+            n is not None
+            and n % tile_n != 0
+            and not (variant["b_to_lds"] and n % 8 == 0)
+        ):
             continue
         split_k_options = _hgemm_split_k_options(k, tile_k)
         if not split_k_options:

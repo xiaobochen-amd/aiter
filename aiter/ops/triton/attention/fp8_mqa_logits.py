@@ -79,6 +79,42 @@ def _gfx942_tile_fits_lds(
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
+# A slice pays its own prologue -- two peeled tiles, the Q/weight load and the
+# double-buffer fill -- so below this many tiles it stops paying for itself.
+_MIN_TILES_PER_KV_SPLIT = 16
+# A workgroup is only NUM_WARPS (1-2) waves, so filling the machine takes several
+# per CU; past this the curve flattens.
+_KV_SPLIT_BLOCKS_PER_CU = 4
+_DEVICE_CU_COUNT = None
+
+
+def _pick_kv_splits(num_blocks: int, seq_len_kv: int, block_kv: int) -> int:
+    """How many KV slices to spread each query block over on grid axis 1.
+
+    The grid is otherwise just the query rows, so a decode launch leaves nearly
+    the whole device idle while every program walks the entire KV range alone.
+    A slice only re-reads Q, which is negligible against the KV it saves.
+    """
+    forced = _os.environ.get("AITER_MQA_FORCE_KV_SPLITS")
+    if forced:
+        return max(1, int(forced))
+
+    global _DEVICE_CU_COUNT
+    if _DEVICE_CU_COUNT is None:
+        _DEVICE_CU_COUNT = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    target_blocks = _DEVICE_CU_COUNT * _KV_SPLIT_BLOCKS_PER_CU
+    if num_blocks >= target_blocks:
+        return 1
+
+    total_tiles = (seq_len_kv + block_kv - 1) // block_kv
+    cap = total_tiles // _MIN_TILES_PER_KV_SPLIT
+    if cap <= 1:
+        return 1
+    return max(1, min(-(-target_blocks // num_blocks), cap))
+
+
 def fp8_mqa_logits(
     Q,
     KV,
@@ -244,6 +280,12 @@ def fp8_mqa_logits(
                 "BLOCK_M": block_m,
                 "MFMA_NONK_DIM": mfma_nonk_dim,
             }
+            num_kv_splits = _pick_kv_splits(
+                num_blocks=(seq_len + block_m - 1) // block_m,
+                seq_len_kv=seq_len_kv,
+                block_kv=block_kv,
+            )
+            other["NUM_KV_SPLITS"] = num_kv_splits
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -282,7 +324,9 @@ def fp8_mqa_logits(
             # condition trades that away for nothing.
             waves_per_eu = 2
 
-        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
+        _gluon_fp8_mqa_logits_kernel[
+            ((seq_len + block_m - 1) // block_m, num_kv_splits)
+        ](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,

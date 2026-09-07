@@ -38,7 +38,10 @@ FLYDSL_TUNE_ERROR = None
 try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
+            SPLIT_K_MAX_WORKSPACE_BYTES,
+            _split_k_launch_shape,
             flydsl_hgemm,
+            get_flydsl_splitk_hgemm_kernel_params,
             get_flydsl_splitk_hgemm_kernels,
         )
     else:
@@ -46,7 +49,13 @@ try:
 except ImportError as exc:
     flydsl_hgemm = None
     get_flydsl_splitk_hgemm_kernels = None
+    get_flydsl_splitk_hgemm_kernel_params = None
+    SPLIT_K_MAX_WORKSPACE_BYTES = 0
+    _split_k_launch_shape = None
     FLYDSL_TUNE_ERROR = str(exc)
+
+# Price the bm>1 prune against the MALL, not against any one shape.
+_B_STREAM_CACHE_BYTES = 128 * 1024 * 1024
 
 OPUS_TUNE_ERROR = None
 try:
@@ -320,6 +329,8 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
         xcd_band=config.get("xcd_band", 1),
+        k_rot=config.get("k_rot", 0),
+        b_cpol=config.get("b_cpol", 0),
         b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
@@ -552,9 +563,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return results
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        assert os.path.exists(
-            untuned_gemm_file
-        ), f"Not exist untuned file: {untuned_gemm_file}"
+        assert os.path.exists(untuned_gemm_file), (
+            f"Not exist untuned file: {untuned_gemm_file}"
+        )
         untunedf = pd.read_csv(untuned_gemm_file).fillna("")
         return untunedf.drop_duplicates().reset_index(drop=True)
 
@@ -726,33 +737,55 @@ class GemmA16W16Tuner(GemmCommonTuner):
     ):
         if flydsl_hgemm is None or get_flydsl_splitk_hgemm_kernels is None:
             logger.warning(f"FlyDSL not available, skip. reason: {FLYDSL_TUNE_ERROR}")
-            return []
+            return [], []
         if scaleAB or indtype != dtypes.bf16:
-            return []
+            return [], []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, atol = _default_tol(outdtype)
+        cu_num = get_cu_num()
         flydsl_catalog = get_flydsl_bf16_catalog(M, N, K)
         weight_key = "shuffleweights" if is_shuffle else "weights"
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
+        # Stop at the first tile covering M; past it the rows are outside the
+        # matrix and only add MFMA steps and epilogue traffic.
+        max_tile_m = max(-(-M // 16) * 16, min_tile_m)
         tasks = []
+        jobs = []
         for solidx, kernel_name, config in flydsl_catalog:
             if config.get("b_preshuffle", False) != is_shuffle:
                 continue
-            if config["tile_m"] > max(M, min_tile_m):
+            if config["tile_m"] > max_tile_m:
                 continue
-            if N < config["tile_n"] or N % config["tile_n"] != 0:
+            if N < config["tile_n"]:
+                continue
+            # The kernel clamps and predicates the last N tile, so tile_n no
+            # longer has to divide N -- that path needs B staged through LDS
+            # and N aligned to the 8-element global load vector.
+            if N % config["tile_n"] != 0 and not (
+                config.get("b_to_lds", False) and N % 8 == 0
+            ):
                 continue
             if K % config["split_k"] != 0:
                 continue
             ks = K // config["split_k"]
             if ks < config["tile_k"] or ks % config["tile_k"] != 0:
                 continue
+            bm = (M + config["tile_m"] - 1) // config["tile_m"]
+            wgs = bm * ((N + config["tile_n"] - 1) // config["tile_n"])
             if config["split_k"] > 1:
-                counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
-                    N // config["tile_n"]
+                # Gate on idle CUs, not the tile counter: split_k only buys
+                # parallelism while the grid leaves CUs unused.
+                _, ws_bytes = _split_k_launch_shape(
+                    M, N, config["tile_m"], config["tile_n"], config["split_k"]
                 )
-                if counters > 128:
+                if ws_bytes > SPLIT_K_MAX_WORKSPACE_BYTES:
                     continue
+                if wgs >= cu_num or wgs * config["split_k"] > 2 * cu_num:
+                    continue
+            # bm passes ask HBM for bm x the weight bytes once B outgrows the
+            # last cache level, so spend the wall clock on split_k instead.
+            if N * K * 2 > _B_STREAM_CACHE_BYTES and bm >= 3:
+                continue
             info = (
                 info_keys,
                 solidx,
@@ -781,8 +814,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     atol,
                 )
             )
+            jobs.append(_flydsl_prebuild_job(N, K, has_bias, kernel_name, config))
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
-        return tasks
+        return tasks, jobs
 
     def _get_skinny_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
@@ -931,8 +965,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
         run_kwargs = {"num_warmup": 10, "num_iters": 101}
 
         task = []
-        tasks_data = []
         hipblaslt_rets = []
+        shape_commons = []
+        shape_bounds = []
+        prebuild_jobs = []
 
         for i in range(len(untunedf)):
             ds = untunedf.loc[i, :]
@@ -964,12 +1000,16 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 is_shuffle,
                 run_kwargs,
             )
+            shape_commons.append(common)
 
             prev_count = len(task)
             if "all" in libtype or "asm" in libtype:
                 task.extend(self._get_asm_tasks(*common))
             if "all" in libtype or "flydsl" in libtype:
-                task.extend(self._get_flydsl_tasks(*common))
+                flydsl_task, flydsl_jobs = self._get_flydsl_tasks(*common)
+                prebuild_jobs.extend([None] * (len(task) - len(prebuild_jobs)))
+                task.extend(flydsl_task)
+                prebuild_jobs.extend(flydsl_jobs)
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:
@@ -987,11 +1027,12 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         )
                 task.extend(opus_tasks)
 
-            shape_kernel_nums = len(task) - prev_count
-            tasks_data.append((shape_kernel_nums, ()))
+            shape_bounds.append((prev_count, len(task)))
 
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
+
+        tasks_data = shape_bounds
 
         ret = []
         if task:
