@@ -245,10 +245,6 @@ def compile_hgemm_kernel(
     LDG_REG_C_COUNT = -(-LDG_C_VECS // BLOCK_THREADS)
     C_TAIL_PREDICATE = (LDG_C_VECS % BLOCK_THREADS) != 0
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
-    # f32 partials make a full LDG_VEC_SIZE run wider than one buffer access.
-    WS_VEC_SIZE = min(LDG_VEC_SIZE, 4)
-    WS_VEC_STEPS = LDG_VEC_SIZE // WS_VEC_SIZE
-    assert WS_VEC_STEPS * WS_VEC_SIZE == LDG_VEC_SIZE
 
     # LDS parameters: the A/B pipeline and C scratch are live at disjoint times,
     # so model their storage overlap explicitly with a union. SharedAllocator
@@ -258,8 +254,6 @@ def compile_hgemm_kernel(
     BS_ELEMS = STAGES * BLOCK_N * BLOCK_K
     CMN_ELEMS = BLOCK_K_WARPS * BLOCK_M * BLOCK_N
     fx_dtype = fx.Float16 if dtype == "f16" else fx.BFloat16
-    # Stage in f32 so the reduction rounds once, at the store, not per plane.
-    C_STAGE_DTYPE = fx.Float32 if IS_SPLIT_K else fx_dtype
     if B_TO_LDS:
         assert ASYNC_COPY
 
@@ -277,7 +271,7 @@ def compile_hgemm_kernel(
     @fx.union
     class TileStorage:
         pipeline: PipelineStorage
-        c_lds: fx.Array[C_STAGE_DTYPE, CMN_ELEMS, 16]
+        c_lds: fx.Array[fx_dtype, CMN_ELEMS, 16]
 
     @fx.struct
     class SharedStorage:
@@ -446,14 +440,14 @@ def compile_hgemm_kernel(
             )
             return fx.ptr_load(
                 c_lds_ptr + elem_off,
-                result_type=fx.Vector.make_type(vec_size, C_STAGE_DTYPE),
+                result_type=fx.Vector.make_type(vec_size, fx_dtype),
             )
 
         if const_expr(IS_SPLIT_K):
             # Tile-major, so the reducing block reads consecutive lines.
             WS_ = GTensor(
                 workspace,
-                dtype=get_dtype_in_kernel("f32"),
+                dtype=dtype_,
                 shape=(-1,),
                 cache_modifier=SPLIT_K_CPOL,
             )
@@ -1103,8 +1097,7 @@ def compile_hgemm_kernel(
                         static_position=[kk],
                         dynamic_position=[],
                     )
-                    if const_expr(not IS_SPLIT_K):
-                        val = val.truncf(dtype_)
+                    val = val.truncf(dtype_)
                     if const_expr(IS_SLICE_K):
                         cs_store_scalar(wid_k, lds_m_idx, lds_n_idx, val)
                     else:
@@ -1132,8 +1125,8 @@ def compile_hgemm_kernel(
         if const_expr(IS_SPLIT_K):
             gpu.barrier()
             # Reduce in f32 rather than rounding at every tree level.
-            acc_vec_type = fx.Vector.make_type(WS_VEC_SIZE, fx.Float32)
-            out_vec_type = fx.Vector.make_type(WS_VEC_SIZE, fx_dtype)
+            acc_vec_type = fx.Vector.make_type(LDG_VEC_SIZE, fx.Float32)
+            out_vec_type = fx.Vector.make_type(LDG_VEC_SIZE, fx_dtype)
             # Whole tile including rows past M; the reduction drops them.
             ws_tile_base = (
                 tile_idx * (SPLIT_K * BLOCK_MN_SIZE)
@@ -1143,23 +1136,17 @@ def compile_hgemm_kernel(
                 global_tid = BLOCK_THREADS * i + tid
                 with _if_then(c_lane_active(global_tid)):
                     m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                    n_run_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-                    for v in range_constexpr(WS_VEC_STEPS):
-                        n_local_idx = fx.Index(n_run_idx + v * WS_VEC_SIZE)
-                        pk_val = cs_load_vec(0, m_local_idx, n_local_idx, WS_VEC_SIZE)
-                        for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                            pk_val += cs_load_vec(
-                                ksi, m_local_idx, n_local_idx, WS_VEC_SIZE
-                            )
-                        WS_.vec_store(
-                            (
-                                ws_tile_base
-                                + global_tid * LDG_VEC_SIZE
-                                + v * WS_VEC_SIZE,
-                            ),
-                            pk_val,
-                            WS_VEC_SIZE,
+                    n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                    pk_val = cs_load_vec(0, m_local_idx, n_local_idx, LDG_VEC_SIZE)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        pk_val += cs_load_vec(
+                            ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE
                         )
+                    WS_.vec_store(
+                        (ws_tile_base + global_tid * LDG_VEC_SIZE,),
+                        pk_val,
+                        LDG_VEC_SIZE,
+                    )
 
             is_last = arith.cmpi(
                 arith.CmpIPredicate.eq, split_k_arrive(), fx.Index(SPLIT_K - 1)
@@ -1169,46 +1156,41 @@ def compile_hgemm_kernel(
                 for i in range_constexpr(LDG_REG_C_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                    n_run_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
+                    n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                     m_global_idx = m_offset + m_local_idx
-                    for v in range_constexpr(WS_VEC_STEPS):
-                        n_local_idx = fx.Index(n_run_idx + v * WS_VEC_SIZE)
-                        cond_boundary = arith.cmpi(
-                            arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                    cond_boundary = arith.cmpi(
+                        arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                    )
+                    cond_boundary = c_lane_active(global_tid, cond_boundary)
+                    cond_boundary = c_col_active(n_local_idx, cond_boundary)
+                    cond_boundary_if = scf.IfOp(
+                        cond_boundary, results_=[], has_else=False
+                    )
+                    with ir.InsertionPoint(cond_boundary_if.then_block):
+                        ws_off = (
+                            tile_idx * (SPLIT_K * BLOCK_MN_SIZE)
+                            + global_tid * LDG_VEC_SIZE
                         )
-                        cond_boundary = c_lane_active(global_tid, cond_boundary)
-                        cond_boundary = c_col_active(n_local_idx, cond_boundary)
-                        cond_boundary_if = scf.IfOp(
-                            cond_boundary, results_=[], has_else=False
+                        planes = [
+                            WS_.vec_load(
+                                (ws_off + s * BLOCK_MN_SIZE,), LDG_VEC_SIZE
+                            ).extf(acc_vec_type)
+                            for s in range_constexpr(SPLIT_K)
+                        ]
+                        vec = _pairwise_sum(planes)
+                        if const_expr(HAS_BIAS):
+                            vec = vec + BIAS_.vec_load(
+                                (n_offset + n_local_idx,), LDG_VEC_SIZE
+                            ).extf(acc_vec_type)
+                        vec = vec.truncf(out_vec_type)
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                         )
-                        with ir.InsertionPoint(cond_boundary_if.then_block):
-                            ws_off = (
-                                tile_idx * (SPLIT_K * BLOCK_MN_SIZE)
-                                + global_tid * LDG_VEC_SIZE
-                                + v * WS_VEC_SIZE
-                            )
-                            planes = [
-                                WS_.vec_load((ws_off + s * BLOCK_MN_SIZE,), WS_VEC_SIZE)
-                                for s in range_constexpr(SPLIT_K)
-                            ]
-                            vec = _pairwise_sum(planes)
-                            if const_expr(HAS_BIAS):
-                                vec = vec + BIAS_.vec_load(
-                                    (n_offset + n_local_idx,), WS_VEC_SIZE
-                                ).extf(acc_vec_type)
-                            vec = vec.truncf(out_vec_type)
-                            C_.vec_store(
-                                (m_global_idx, n_offset + n_local_idx),
-                                vec,
-                                WS_VEC_SIZE,
-                            )
-                            scf.YieldOp([])
+                        scf.YieldOp([])
                 split_k_release()
                 scf.YieldOp([])
         else:
             gpu.barrier()
-            slice_acc_type = fx.Vector.make_type(LDG_VEC_SIZE, fx.Float32)
-            slice_out_type = fx.Vector.make_type(LDG_VEC_SIZE, fx_dtype)
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -1222,21 +1204,13 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_load_vec(0, m_local_idx, n_local_idx, LDG_VEC_SIZE)
-                    if const_expr(IS_SLICE_K):
-                        vec = vec.extf(slice_acc_type)
-                        for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                            vec += cs_load_vec(
-                                ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE
-                            ).extf(slice_acc_type)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        vec += cs_load_vec(ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
                         bias_vec = BIAS_.vec_load(
                             (n_offset + n_local_idx,), LDG_VEC_SIZE
                         )
-                        if const_expr(IS_SLICE_K):
-                            bias_vec = bias_vec.extf(slice_acc_type)
                         vec = vec + bias_vec
-                    if const_expr(IS_SLICE_K):
-                        vec = vec.truncf(slice_out_type)
                     C_.vec_store(
                         (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
