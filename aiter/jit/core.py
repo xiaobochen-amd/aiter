@@ -399,7 +399,11 @@ class AITER_CONFIG:
 
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        # Merged tables land outside the repo so a read-only checkout still works, but
+        # the destination has to be overridable: two isolated environments on the same
+        # box (different aiter checkouts, different tuned CSVs) otherwise write the
+        # same /tmp path and silently read each other's tables.
+        config_path = Path(os.getenv("AITER_CONFIG_MERGE_DIR", "/tmp/aiter_configs/"))
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
         new_file_path = f"{config_path}/{merge_name}.csv"

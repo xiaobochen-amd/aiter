@@ -18,20 +18,49 @@ from torch_guard import torch_compile_guard
 logger = logging.getLogger("aiter")
 
 
+# rocminfo talks to the KFD. If the KFD is left inconsistent -- e.g. a multi-GPU
+# process was SIGKILLed mid-flight -- it blocks in an uninterruptible (D state)
+# kernel call that SIGKILL cannot clear. Without a bound, this function then hangs
+# forever *during import aiter*, with no error, no log and no timeout.
+_ROCMINFO_TIMEOUT_S = float(os.getenv("AITER_ROCMINFO_TIMEOUT", "60"))
+
+
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
     try:
         rocminfo = executable_path("rocminfo")
-        result = subprocess.run(
+        # Popen rather than subprocess.run(timeout=): on TimeoutExpired run() kills
+        # the child and then communicates with it, which assumes the child can be
+        # signalled and reaped -- a D-state child can be neither. That reasoning is
+        # from the semantics of D state, not from a measurement. The form below does
+        # not rely on it either way: on timeout it never waits on the child at all.
+        proc = subprocess.Popen(
             [rocminfo],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=True,
         )
-        for line in result.stdout.splitlines():
+        try:
+            stdout, stderr = proc.communicate(timeout=_ROCMINFO_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise RuntimeError(
+                f"rocminfo did not return within {_ROCMINFO_TIMEOUT_S:.0f}s. The KFD is "
+                f"most likely wedged (check for rocminfo processes in D state: "
+                f"ps -eo pid,stat,cmd | grep rocminfo). A container restart usually "
+                f"clears it. Set AITER_ROCMINFO_TIMEOUT to change this bound, or "
+                f"GPU_ARCHS=gfx950 to skip detection entirely."
+            ) from None
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"rocminfo exited {proc.returncode}: {stderr.strip()[:200]}"
+            )
+        for line in stdout.splitlines():
             match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
     raise RuntimeError("No gfx arch found in rocminfo output.")
