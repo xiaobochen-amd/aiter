@@ -257,6 +257,10 @@ def emit_direct_fixed_slot_payload(
     )
     producer_group = producer_slot & group_mask
     group_slot = (producer_slot - producer_group) >> group_mask
+    # Parity mirrors the slot region, so this launch never overwrites rows the
+    # destination is still consuming for the previous launch.
+    slot_half = parity * fx.Int32(fz_epr * fz_cap)
+    running_half = parity * fx.Int32(fz_epr)
     route = group_slot * fx.Int32(num_waves) + warp
     route_stride = producers_per_group * fx.Int32(num_waves)
     r_idx = crfa(addr_in_idx)
@@ -283,12 +287,12 @@ def emit_direct_fixed_slot_payload(
                 )
                 offset_lane = fx.Int32(
                     comm_ops.atomic_add_system(
-                        remote_running + fx.Int64(local_expert) * fx.Int64(4), fx.Int32(1)
+                        remote_running + fx.Int64(running_half + local_expert) * fx.Int64(4), fx.Int32(1)
                     )
                 )
         expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
         publish = assigned & (expert_offset < fx.Int32(fz_cap))
-        payload_row = local_expert * fx.Int32(fz_cap) + expert_offset
+        payload_row = slot_half + local_expert * fx.Int32(fz_cap) + expert_offset
 
         if publish:
             remote_token = buffer_ops.buffer_load(crfa(p_rx), destination, vec_width=1, dtype=fx.Int64)
@@ -371,7 +375,10 @@ def emit_direct_fixed_slot_finalize(
 
         valid_expert = lane < fx.Int32(fz_epr)
         safe_expert = valid_expert.select(lane, fx.Int32(0))
-        count = buffer_ops.buffer_load(crfa(a_running), safe_expert, vec_width=1, dtype=fx.Int32)
+        # Mirror of the producer-side parity halves (see emit_direct_fixed_slot_payload).
+        slot_half = parity * fx.Int32(fz_epr * fz_cap)
+        running_slot = parity * fx.Int32(fz_epr) + safe_expert
+        count = buffer_ops.buffer_load(crfa(a_running), running_slot, vec_width=1, dtype=fx.Int32)
         count = valid_expert.select(count, fx.Int32(0))
         overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
         overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
@@ -387,7 +394,7 @@ def emit_direct_fixed_slot_finalize(
         if valid_expert:
             if no_overflow:
                 global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
-                payload_base = safe_expert * fx.Int32(fz_cap)
+                payload_base = slot_half + safe_expert * fx.Int32(fz_cap)
                 for tile in range(fx.Int32(0), num_expert_tiles, 1):
                     metadata_index = metadata_base + tile
                     buffer_ops.buffer_store(global_expert, crfa(a_se), metadata_index)
@@ -398,7 +405,7 @@ def emit_direct_fixed_slot_finalize(
                 buffer_ops.buffer_store(metadata_base + num_expert_tiles, crfa(a_expert_tile_end), safe_expert)
             else:
                 buffer_ops.buffer_store(fx.Int32(0), crfa(a_expert_tile_end), safe_expert)
-            buffer_ops.buffer_store(fx.Int32(0), crfa(a_running), safe_expert)
+            buffer_ops.buffer_store(fx.Int32(0), crfa(a_running), running_slot)
 
         if lane == fx.Int32(0):
             num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))

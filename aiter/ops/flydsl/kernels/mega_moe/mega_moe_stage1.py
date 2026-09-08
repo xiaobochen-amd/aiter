@@ -47,8 +47,9 @@ def _dispatch_row_capacity(
     batch_size, npes, experts_per_rank, topk, tile_m, cap, direct_fixed_slot
 ):
     if direct_fixed_slot:
-        # Fixed slots reserve one cap-sized region per local expert.
-        return experts_per_rank * cap + 256
+        # Fixed slots reserve one cap-sized region per local expert, mirrored per
+        # epoch parity (see FlyDSLDispatchGroupMajorOp.payload_epochs).
+        return 2 * (experts_per_rank * cap + 256)
     return npes * batch_size * topk + experts_per_rank * tile_m
 
 
@@ -148,6 +149,10 @@ def compile_mega_moe_stage1(
     direct_fixed_slot = _use_direct_fixed_slot(
         fixed_slot_dispatch, fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m
     )
+    # Direct fixed slots mirror the payload region per epoch parity and the
+    # count_done handshake already bounds the launch skew to one epoch, so only the
+    # single-buffered compact layout still needs the cross-rank launch barrier.
+    launch_barrier = not direct_fixed_slot
     fz_total_experts = fz_npes * fz_epr
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
@@ -241,26 +246,28 @@ def compile_mega_moe_stage1(
                 previous_expected = _buffer_load(expected_rsrc, next_parity_lane, fx.Int32)
                 next_expected = previous_expected + fx.Int32(fz_npes)
                 _buffer_store(expected_rsrc, next_parity_lane, next_expected, fx.Int32)
-                launch_epoch_lane = (
-                    (next_expected // fx.Int32(fz_npes)) * fx.Int32(2) - next_parity_lane
-                )
+                if const_expr(launch_barrier):
+                    launch_epoch_lane = (
+                        (next_expected // fx.Int32(fz_npes)) * fx.Int32(2) - next_parity_lane
+                    )
             next_parity = fx.Int32(fx.rocdl.readfirstlane(T.i32, next_parity_lane))
-            launch_epoch = fx.Int32(fx.rocdl.readfirstlane(T.i32, launch_epoch_lane))
             if const_expr(payload_tile_ready):
                 if tid == fx.Int32(0):
                     comm_ops.store_i32_system(a_payload_ready_rows, fx.Int32(0), fx.Int32(fz_tile_m))
                     comm_ops.fence_system_release()
                 fx.barrier()
-            if tid < fx.Int32(fz_npes):
-                peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
-                comm_ops.fence_system_release()
-                launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
-                remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
-                comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
-                mori_shmem.int32_wait_until_greater_than(
-                    a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch - fx.Int32(1)
-                )
-                comm_ops.fence_system_acquire()
+            if const_expr(launch_barrier):
+                launch_epoch = fx.Int32(fx.rocdl.readfirstlane(T.i32, launch_epoch_lane))
+                if tid < fx.Int32(fz_npes):
+                    peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
+                    comm_ops.fence_system_release()
+                    launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
+                    remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
+                    comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
+                    mori_shmem.int32_wait_until_greater_than(
+                        a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch - fx.Int32(1)
+                    )
+                    comm_ops.fence_system_acquire()
             if tid == fx.Int32(0):
                 work_head_rsrc = _make_buffer_from_addr(a_work_head, fx.Int32)
                 for shard in range_constexpr(8):
@@ -407,12 +414,14 @@ def compile_mega_moe_stage1(
             ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             mori_shmem.int32_wait_until_equals(
                 local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), payload_expected)
-            comm_ops.fence_agent_acquire()
+            if const_expr(direct_fixed_slot):
+                # Peers publish the payload with system-scope releases. Fixed slots
+                # are complete once the plan lands, so acquire once per block instead
+                # of per work item; the invalidate covers the whole block's caches.
+                comm_ops.fence_system_acquire()
+            else:
+                comm_ops.fence_agent_acquire()
         fx.barrier()
-        if const_expr(direct_fixed_slot):
-            # Peers publish the payload with system-scope releases. Fixed slots are
-            # complete once the plan lands, so acquire once instead of per work item.
-            comm_ops.fence_system_acquire()
 
         num_valid = _buffer_load(nv_rsrc, fx.Int32(0), fx.Int32)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))

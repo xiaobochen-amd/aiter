@@ -418,9 +418,14 @@ class FlyDSLDispatchGroupMajorOp:
             num_valid_max = (
                 world_size * max_tok_per_rank * topk + experts_per_rank * unit_size
             )
+            self.payload_epochs = 1
         else:
             num_valid_max = experts_per_rank * self.ll_cap + 256
+            # Fixed slots are mirrored per epoch parity so a peer can publish the
+            # next launch while the local consumers still read the current one.
+            self.payload_epochs = 2
         self.num_valid_max = int(num_valid_max)
+        self.payload_rows = self.num_valid_max * self.payload_epochs
         self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
 
         self._alloc()
@@ -434,9 +439,9 @@ class FlyDSLDispatchGroupMajorOp:
 
     def _alloc(self):
         npes, epr = self.npes, self.epr
-        nvm = self.num_valid_max
+        nvm = self.payload_rows
         self.done2 = self._sym((npes,), torch.int32)
-        self.running = self._sym((epr,), torch.int32)
+        self.running = self._sym((epr * self.payload_epochs,), torch.int32)
         self.ll_count = self._sym((epr,), torch.int32)
         self.rx_em = self._sym((nvm * self.row_bytes,), torch.int8)
         self.scale_em = self._sym((max(1, nvm * self.scale_n_i32),), torch.int32)
@@ -526,11 +531,11 @@ class FlyDSLDispatchGroupMajorOp:
 
     def _ll_views(self):
         rx_dtype = torch.float4_e2m1fn_x2 if _is_fp4_dtype(self.dtype) else self.dtype
-        rx_em_view = self.rx_em.view(rx_dtype).view(self.num_valid_max, self.row_view)
+        rx_em_view = self.rx_em.view(rx_dtype).view(self.payload_rows, self.row_view)
         scale_em_view = self.scale_em.view(torch.uint8).view(
-            self.num_valid_max, max(1, self.scale_n_i32 * 4)
+            self.payload_rows, max(1, self.scale_n_i32 * 4)
         )[:, : self.scale_bytes]
-        scale_em_i32 = self.scale_em.view(self.num_valid_max, max(1, self.scale_n_i32))
+        scale_em_i32 = self.scale_em.view(self.payload_rows, max(1, self.scale_n_i32))
         return {
             "rx_em": rx_em_view,
             "scale_em": scale_em_view,
