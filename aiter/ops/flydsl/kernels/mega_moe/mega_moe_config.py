@@ -25,6 +25,10 @@ TOKEN_BUCKETS = (
 )
 P2P_FP8_MIN_MTPR = 1024
 FIXED_SLOT_MAX_MTPR = 255
+# Fixed-slot dispatch reserves world_size * mtpr payload rows per local expert and
+# buys two fewer system-scope handshakes per launch with them. Above this reservation
+# the payload buffer costs more than the handshakes are worth.
+FIXED_SLOT_MAX_RESERVED_BYTES = 512 << 20
 MAX_MTPR_CLASS = 32768
 REFERENCE_EXPERTS_PER_RANK = 48
 EXPERT_CONFIG_GRANULARITY = 64
@@ -101,6 +105,23 @@ def nearest_token_bucket(tokens: int) -> int:
 
 def mtpr_config_class(mtpr: int) -> int:
     return mtpr if mtpr <= P2P_FP8_MIN_MTPR else MAX_MTPR_CLASS
+
+
+def use_fixed_slot_dispatch(
+    mtpr: int, world_size: int, experts_per_rank: int, row_bytes: int
+) -> bool:
+    """Reserve a fixed slot per (local expert, sender) when the payload buffer fits.
+
+    Fixed slots let a sender atomically claim a destination row and write it without
+    waiting for the destination's count exchange and plan broadcast, at the cost of a
+    payload buffer sized for the all-to-one routing case.
+    """
+    if mtpr <= FIXED_SLOT_MAX_MTPR:
+        return True
+    if world_size != 8 or not 0 < experts_per_rank <= 64:
+        return False
+    reserved_rows = experts_per_rank * world_size * mtpr
+    return reserved_rows * row_bytes <= FIXED_SLOT_MAX_RESERVED_BYTES
 
 
 def expert_config_class(experts_per_rank: int) -> int:
@@ -347,10 +368,18 @@ def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
     dispatch_cu = {
         16: 128,
         32: 128,
-        128: 96,
+        64: 128,
+        128: 128,
     }.get(bucket)
     if dispatch_cu is not None:
         stage1 = replace(stage1, num_dispatch_cu=dispatch_cu)
+    # The two verify-forward buckets pad each expert to 64 rows instead of 32, which
+    # holds the stage1 tile count at exactly one per local expert whatever the routing
+    # skew is. Stage2 then needs the matching block_m and a cached (non-NT) B stream,
+    # because the wider tile makes it re-read rows the NT hint would have dropped.
+    wide_tile = bucket in (64, 128)
+    if wide_tile:
+        stage1 = replace(stage1, sort_block_m=64)
     stage2 = _select_bounded_stage2(
         bucket,
         fixed_slot=False,
@@ -359,6 +388,8 @@ def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
         model_dim=6144,
     )
     stage2 = replace(stage2, block_n=128, persist=True, persist_cu=192)
+    if wide_tile:
+        stage2 = replace(stage2, block_m=64, persist_cu=160, use_nt=False)
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
 

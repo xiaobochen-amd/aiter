@@ -39,20 +39,25 @@ def _use_direct_fixed_slot(
     if not enabled or tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    return npes == 8 and experts_per_rank == 48 and cap == required_cap
+    # The finalize pass scans one lane per local expert, so any 1..64 shard works.
+    return npes == 8 and 0 < experts_per_rank <= 64 and cap == required_cap
+
+
+def _dispatch_row_capacity(
+    batch_size, npes, experts_per_rank, topk, tile_m, cap, direct_fixed_slot
+):
+    if direct_fixed_slot:
+        # Fixed slots reserve one cap-sized region per local expert.
+        return experts_per_rank * cap + 256
+    return npes * batch_size * topk + experts_per_rank * tile_m
 
 
 def _validate_dispatch_capacity(
-    batch_size,
-    npes,
-    experts_per_rank,
-    topk,
-    tile_m,
+    max_rows,
     row_bytes,
     output_row_bytes,
     use_tile_resource,
 ):
-    max_rows = npes * batch_size * topk + experts_per_rank * tile_m
     if not use_tile_resource and max_rows * row_bytes >= _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError(
             "MegaMoE v2 stage1 payload exceeds the 32-bit buffer-resource ABI"
@@ -154,7 +159,10 @@ def compile_mega_moe_stage1(
     fz_enable_scales = fz_scale_bytes > 0
     fz_safe_end_i32 = (fz_n_i32 // 512) * 512
     _validate_dispatch_capacity(
-        fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_nbytes, inter_dim, use_tile_resource
+        _dispatch_row_capacity(
+            fz_mtpr, fz_npes, fz_epr, fz_k, fz_tile_m, fz_cap, direct_fixed_slot
+        ),
+        fz_nbytes, inter_dim, use_tile_resource
     )
 
     @fx.struct
@@ -298,7 +306,7 @@ def compile_mega_moe_stage1(
                 emit_direct_fixed_slot_payload(
                     num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_cap=fz_cap,
                     fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes,
-                    fz_n_i32=fz_n_i32,
+                    fz_n_i32=fz_n_i32, fz_safe_end_i32=fz_safe_end_i32,
                     fz_scale_n_i32=fz_scale_n_i32, fz_enable_scales=fz_enable_scales, addr_disp=addr_disp,
                     addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                     i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
@@ -401,6 +409,10 @@ def compile_mega_moe_stage1(
                 local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), payload_expected)
             comm_ops.fence_agent_acquire()
         fx.barrier()
+        if const_expr(direct_fixed_slot):
+            # Peers publish the payload with system-scope releases. Fixed slots are
+            # complete once the plan lands, so acquire once instead of per work item.
+            comm_ops.fence_system_acquire()
 
         num_valid = _buffer_load(nv_rsrc, fx.Int32(0), fx.Int32)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))

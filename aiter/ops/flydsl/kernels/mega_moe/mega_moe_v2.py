@@ -12,10 +12,10 @@ from ..flydsl_dispatch_combine_intranode_op import (
 )
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
-    FIXED_SLOT_MAX_MTPR,
     MegaMoEConfig,
     Stage1Config,
     select_mega_moe_config,
+    use_fixed_slot_dispatch,
 )
 from .quant import per_1x32_mx_quant
 
@@ -49,7 +49,9 @@ class MegaMoEV2:
             raise ValueError("swiglu_limit must be non-negative")
         self.dev = torch.device("cuda", rank)
         self.max_recv = self.world_size * self.mtpr
-        compact = self.mtpr > FIXED_SLOT_MAX_MTPR
+        compact = not use_fixed_slot_dispatch(
+            self.mtpr, self.world_size, self.epr, self.model_dim
+        )
         capacity_tile_m = 128 if compact else 32
         self._s1_fixed_slot = not compact
         self._s1_scale_dim = self.model_dim // 32
@@ -160,7 +162,7 @@ class MegaMoEV2:
             "active_payload_blocks": torch.zeros(1, dtype=torch.int32, device=self.dev),
             "payload_blocks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
             "payload_chunks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
-            "group_done": torch.zeros(1, dtype=torch.int32, device=self.dev),
+            "group_done": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
         }
         workspace["bigcnt"] = op._sym((self.world_size * self.epr,), torch.int32)
         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)

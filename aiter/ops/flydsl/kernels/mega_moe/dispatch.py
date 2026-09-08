@@ -223,8 +223,8 @@ def _publish_tile_range(
 @flyc.jit
 def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
-    fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
-    i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
+    fz_safe_end_i32, fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts,
+    addr_in_sc, i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots."""
@@ -245,14 +245,20 @@ def emit_direct_fixed_slot_payload(
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
-    destination_groups = 2
-    assert dispatch_blocks % destination_groups == 0, "direct fixed-slot dispatch needs even producer groups"
-    producers_per_group = dispatch_blocks // destination_groups
-    producer_group = producer_slot % fx.Int32(destination_groups)
-    group_slot = producer_slot // fx.Int32(destination_groups)
-    route = group_slot * fx.Int32(num_waves) + warp
-    route_stride = fx.Int32(producers_per_group * num_waves)
+    assert dispatch_blocks % 2 == 0, "direct fixed-slot dispatch needs an even producer count"
     route_limit = i32_cur_tok * fx.Int32(fz_k)
+    # Splitting the producers by destination parity lets each half signal its
+    # destinations as soon as it drains, but it also halves the waves a route can
+    # land on. Keep the split only while every wave still owns at most one route.
+    split_destinations = route_limit <= fx.Int32((dispatch_blocks // 2) * num_waves)
+    group_mask = split_destinations.select(fx.Int32(1), fx.Int32(0))
+    producers_per_group = split_destinations.select(
+        fx.Int32(dispatch_blocks // 2), fx.Int32(dispatch_blocks)
+    )
+    producer_group = producer_slot & group_mask
+    group_slot = (producer_slot - producer_group) >> group_mask
+    route = group_slot * fx.Int32(num_waves) + warp
+    route_stride = producers_per_group * fx.Int32(num_waves)
     r_idx = crfa(addr_in_idx)
     r_wts = crfa(addr_in_wts)
     r_scales = crfa(addr_in_sc)
@@ -269,7 +275,7 @@ def emit_direct_fixed_slot_payload(
         destination = safe_expert // fx.Int32(fz_epr)
         local_expert = safe_expert - destination * fx.Int32(fz_epr)
         offset_lane = fx.Int32(0)
-        assigned = valid_expert & (destination % fx.Int32(destination_groups) == producer_group)
+        assigned = valid_expert & ((destination & group_mask) == producer_group)
         if lane == fx.Int32(0):
             if assigned:
                 remote_running = buffer_ops.buffer_load(
@@ -288,9 +294,10 @@ def emit_direct_fixed_slot_payload(
             remote_token = buffer_ops.buffer_load(crfa(p_rx), destination, vec_width=1, dtype=fx.Int64)
             destination_rsrc = crfa(remote_token + fx.Int64(payload_row) * fx.Int64(fz_nbytes))
             source_rsrc = crfa(addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes))
-            for column in range(lane * fx.Int32(4), fz_n_i32, 256):
-                value = buffer_ops.buffer_load(source_rsrc, column, vec_width=4, dtype=fx.Int32)
-                buffer_ops.buffer_store(value, destination_rsrc, column)
+            _copy_token_row(
+                source_rsrc, destination_rsrc, lane,
+                fz_safe_end_i32=fz_safe_end_i32, fz_n_i32=fz_n_i32,
+            )
 
             if const_expr(fz_enable_scales):
                 if lane < fx.Int32(fz_scale_n_i32):
@@ -319,11 +326,11 @@ def emit_direct_fixed_slot_payload(
                 a_producer_done + fx.Int64(producer_group) * fx.Int64(4), fx.Int32(1)
             )
         )
-        if done == fx.Int32(producers_per_group - 1):
+        if done == producers_per_group - fx.Int32(1):
             comm_ops.fence_agent_acquire()
             done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             for destination in range_constexpr(fz_npes):
-                if producer_group == fx.Int32(destination % destination_groups):
+                if producer_group == (fx.Int32(destination) & group_mask):
                     remote_done = buffer_ops.buffer_load(
                         crfa(p_source_done), fx.Int32(destination), vec_width=1, dtype=fx.Int64
                     )
