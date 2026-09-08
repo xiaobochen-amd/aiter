@@ -3,7 +3,7 @@
 """Static MegaMoEV2 configuration rules for MI355X."""
 
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 
 TOKEN_BUCKETS = (
@@ -323,6 +323,45 @@ def _select_large_stage2(
     )
 
 
+def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
+    """MI355X GLM-5.2 EP8 decode settings tuned with MTPR=256.
+
+    The fused stage1 dispatch/GEMM balance is sensitive to both token bucket and
+    the 32 local experts. Stage2 consistently benefits from a narrower N tile
+    and fewer persistent CUs than the generic bounded-MTPR policy.
+    """
+    stage1 = _select_bounded_stage1(
+        bucket,
+        mtpr=256,
+        experts_per_rank=expert_config_class(32),
+        inter_dim=2048,
+    )
+    if bucket == 4:
+        stage1 = replace(
+            stage1,
+            tile_n=512,
+            num_waves=8,
+            mfma_amajor=True,
+            async_a_copy=True,
+        )
+    dispatch_cu = {
+        16: 128,
+        32: 128,
+        128: 96,
+    }.get(bucket)
+    if dispatch_cu is not None:
+        stage1 = replace(stage1, num_dispatch_cu=dispatch_cu)
+    stage2 = _select_bounded_stage2(
+        bucket,
+        fixed_slot=False,
+        mtpr=256,
+        sort_block_m=stage1.sort_block_m,
+        model_dim=6144,
+    )
+    stage2 = replace(stage2, block_n=128, persist=True, persist_cu=192)
+    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+
+
 @cache
 def _select_bucket_config(
     bucket: int, mtpr_class: int, experts_per_rank: int, model_dim: int, inter_dim: int
@@ -367,6 +406,14 @@ def select_mega_moe_config(
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
     if mtpr_class <= FIXED_SLOT_MAX_MTPR and experts_per_rank > 64:
         raise ValueError("fixed-slot supports at most 64 experts per rank")
+    if (
+        mtpr_class == 256
+        and experts_per_rank == 32
+        and model_dim == 6144
+        and inter_dim == 2048
+        and bucket <= 128
+    ):
+        return _select_glm52_ep8_decode(bucket)
     return _select_bucket_config(
         bucket, mtpr_class, expert_config_class(experts_per_rank), model_dim, inter_dim
     )
