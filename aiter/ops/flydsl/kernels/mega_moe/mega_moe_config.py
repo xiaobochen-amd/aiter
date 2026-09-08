@@ -375,8 +375,10 @@ def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
         stage1 = replace(stage1, num_dispatch_cu=dispatch_cu)
     # The two verify-forward buckets pad each expert to 64 rows instead of 32, which
     # holds the stage1 tile count at exactly one per local expert whatever the routing
-    # skew is. Stage2 then needs the matching block_m and a cached (non-NT) B stream,
-    # because the wider tile makes it re-read rows the NT hint would have dropped.
+    # skew is. Stage2 keeps the narrower 32-row block and walks two of them per stage1
+    # tile: only ~21 of the 64 padded rows carry a token, so a 64-row block spends half
+    # its MFMAs on padding the epilog then discards. It still wants the cached (non-NT)
+    # B stream, because the paired blocks re-read the rows the NT hint would have dropped.
     wide_tile = bucket in (64, 128)
     if wide_tile:
         stage1 = replace(stage1, sort_block_m=64)
@@ -389,7 +391,7 @@ def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
     )
     stage2 = replace(stage2, block_n=128, persist=True, persist_cu=192)
     if wide_tile:
-        stage2 = replace(stage2, block_m=64, persist_cu=160, use_nt=False)
+        stage2 = replace(stage2, use_nt=False)
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
 
