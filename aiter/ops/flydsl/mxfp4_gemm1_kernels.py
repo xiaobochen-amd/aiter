@@ -51,6 +51,15 @@ def _get_compiled_mxfp4_gemm1_port(
 def _assert_supported(
     *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant, BN=256, BK=256
 ):
+    if BN not in (128, 256):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires BN in (128, 256), got BN={BN}"
+        )
+    variant = (BM, use_nt, inline_quant)
+    if BN == 128 and variant not in {(16, True, False), (16, True, True)}:
+        raise NotImplementedError(
+            "flydsl mxfp4 gemm1 BN=128 requires BM=16 and use_nt=True"
+        )
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
@@ -60,7 +69,9 @@ def _assert_supported(
             f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % {BN} == 0, "
             f"got D_INTER={D_INTER}"
         )
-    if (BM, use_nt, inline_quant) not in _SUPPORTED:
+    if variant not in _SUPPORTED and not (
+        BN == 128 and variant == (16, True, False)
+    ):
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
             f"(BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
