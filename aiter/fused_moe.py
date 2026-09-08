@@ -127,6 +127,7 @@ def _adaptive_moe_sort(
     atomic=False,
     emit_aux=False,
     moebuf_dtype=dtypes.bf16,
+    quant_input=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -148,38 +149,69 @@ def _adaptive_moe_sort(
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
+    a_quant = None
+    a_scale = None
+    if quant_input is not None:
+        a_quant = torch.empty(
+            (M, model_dim // 2), dtype=torch.uint8, device=device
+        )
+        a_scale = torch.empty(
+            (M, model_dim // 32), dtype=torch.uint8, device=device
+        )
+
     # threestage-sort scratch (prologue==1, i.e. BM != 16). Previously allocated
     # via torch::empty inside the kernel; now passed in so the C++ TU is torch-free.
     # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=16 mirrors
     # csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h.
-    sort3stage_ws = (
-        torch.empty(0, dtype=dtypes.i32, device=device)
-        if BM == 16
-        else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
-    )
-
-    aiter.mxfp4_moe_sort(
-        topk_ids=topk_ids,
-        topk_weight=topk_weights,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=num_valid_ids,
-        reverse_sorted=reverse_sorted,
-        sorted_weights=sorted_weights,
-        m_indices=m_indices,
-        bf16_zero_out=bf16_zero,
-        bf16_zero_workspace=empty_bf16,
-        sort3stage_ws=sort3stage_ws,
-        M_logical=M,
-        NE=num_experts,
-        TOPK=topk,
-        D_HIDDEN=model_dim,
-        D_INTER=1,  # (void)D_INTER in the sort path; unused
-        MB=BM,
-        prologue=0 if BM == 16 else 1,
-    )
+    if quant_input is not None:
+        aiter.mxfp4_moe_sort_quant(
+            quant_input,
+            topk_ids,
+            topk_weights,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            reverse_sorted,
+            sorted_weights,
+            a_quant,
+            a_scale,
+            m_indices,
+            bf16_zero,
+            num_experts,
+            topk,
+            model_dim,
+            BM,
+        )
+    else:
+        sort3stage_ws = (
+            torch.empty(0, dtype=dtypes.i32, device=device)
+            if BM == 16
+            else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
+        )
+        aiter.mxfp4_moe_sort(
+            topk_ids=topk_ids,
+            topk_weight=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            m_indices=m_indices,
+            bf16_zero_out=bf16_zero,
+            bf16_zero_workspace=empty_bf16,
+            sort3stage_ws=sort3stage_ws,
+            M_logical=M,
+            NE=num_experts,
+            TOPK=topk,
+            D_HIDDEN=model_dim,
+            D_INTER=1,  # (void)D_INTER in the sort path; unused
+            MB=BM,
+            prologue=0 if BM == 16 else 1,
+        )
     std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if emit_aux:
+        if quant_input is not None:
+            return (*std, m_indices, reverse_sorted, a_quant, a_scale)
         return (*std, m_indices, reverse_sorted)
     return std
 
@@ -962,27 +994,62 @@ def _fused_moe_impl(
                 "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
                 "(expert_mask is dropped by the output_aux sort path)."
             )
+        _kn1 = metadata.stage1.keywords.get("kernelName1", "")
+        _g1 = _parse_mxfp4_g1_kname(_kn1)
+        cached_gemm1_a = _g1["BN"] == 128 and _g1["inline_quant"]
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = moe_sorting(
-            topk_ids,
-            topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            accumulate=_atomic,
-            output_aux=True,
-        )
+        if cached_gemm1_a:
+            sorting_ret = _adaptive_moe_sort(
+                topk_ids,
+                topk_weight,
+                global_E,
+                topk,
+                block_size_M,
+                model_dim,
+                atomic=_atomic,
+                emit_aux=True,
+                moebuf_dtype=dtype,
+                quant_input=hidden_states,
+            )
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+                sort_a_quant,
+                sort_a_scale,
+            ) = sorting_ret
+        else:
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                accumulate=_atomic,
+                output_aux=True,
+            )
         local_topk_ids = None
+        if cached_gemm1_a:
+            _stage1_extra_args = {
+                **(_stage1_extra_args or {}),
+                "a_quant": sort_a_quant,
+                "a_scale": sort_a_scale,
+                "quant_ready": True,
+            }
     else:
         sorting_ret = moe_sorting(
             topk_ids,
@@ -1599,22 +1666,26 @@ def _mxfp4_a4w4_stage1(
     Kpad_inter,
     BM,
     max_sorted,
-    kernelName1,
     device,
+    BN,
+    BK,
+    quant_ready=False,
+    xcd_swizzle,
     use_nt=False,
     interleave=False,
 ):
     if not inline_quant:
-        aiter.mxfp4_moe_quant(
-            a_input=hidden_states,
-            a_quant=a_quant,
-            a_scale=a_scale,
-            bf16_zero_out=bf16_zero,
-            NE=NE,
-            TOPK=topk,
-            D_HIDDEN=D_HIDDEN,
-            MB=BM,
-        )
+        if not quant_ready:
+            aiter.mxfp4_moe_quant(
+                a_input=hidden_states,
+                a_quant=a_quant,
+                a_scale=a_scale,
+                bf16_zero_out=bf16_zero,
+                NE=NE,
+                TOPK=topk,
+                D_HIDDEN=D_HIDDEN,
+                MB=BM,
+            )
         padded_rows = ((max_sorted + 31) // 32) * 32
         cols = D_HIDDEN // 32
         a_scale_sorted_shuffled = torch.empty(
@@ -1651,7 +1722,6 @@ def _mxfp4_a4w4_stage1(
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
@@ -1671,8 +1741,10 @@ def _mxfp4_a4w4_stage1(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
         topk=topk,
+        BN=BN,
+        BK=BK,
         interleave=interleave,
-        xcd_swizzle=_xcd1,
+        xcd_swizzle=xcd_swizzle,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1835,12 +1907,15 @@ def _mxfp4_a4w4_stage1_fw(
     m_indices=None,
     moe_buf=None,
     interleave=False,
+    a_quant=None,
+    a_scale=None,
+    quant_ready=False,
     **_kwargs,
 ):
     device = hidden_states.device
-    p1 = _parse_mxfp4_g1_kname(kernelName1)
-    BM = p1["BM"]
-    inline_quant = p1["inline_quant"]
+    _g1 = _parse_mxfp4_g1_kname(kernelName1)
+    BM = _g1["BM"]
+    inline_quant = _g1["inline_quant"]
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
         w1 = w1.view(torch.uint8)
     NE = w1.shape[0]
@@ -1848,8 +1923,10 @@ def _mxfp4_a4w4_stage1_fw(
     D_INTER = w1.shape[1] // 2
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
-    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
-    a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+    if a_quant is None:
+        a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+    if a_scale is None:
+        a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
     bf16_zero = (
         moe_buf
@@ -1867,7 +1944,7 @@ def _mxfp4_a4w4_stage1_fw(
         sorted_expert_ids,
         num_valid_ids,
         m_indices,
-        inline_quant=inline_quant,
+        inline_quant=inline_quant and _g1["BN"] != 128,
         NE=NE,
         topk=topk,
         D_HIDDEN=D_HIDDEN,
@@ -1875,9 +1952,12 @@ def _mxfp4_a4w4_stage1_fw(
         Kpad_inter=Kpad_inter,
         BM=BM,
         max_sorted=sorted_token_ids.shape[0],
-        kernelName1=kernelName1,
         device=device,
-        use_nt=p1["use_nt"],
+        BN=_g1["BN"],
+        BK=_g1["BK"],
+        quant_ready=quant_ready,
+        xcd_swizzle=_g1["xcd_swizzle"],
+        use_nt=_g1["use_nt"],
         interleave=interleave,
     )
 

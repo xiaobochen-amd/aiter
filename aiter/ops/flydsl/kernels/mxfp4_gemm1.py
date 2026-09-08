@@ -174,6 +174,7 @@ def _gemm1_body(
     kAStages, kSubBlocks, kMChunks, _ = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL)
 
     BN_INT = BN // 2
+    N_MFMA_J = BN // 64
     b_aux = 2 if use_nt else 0
     M_REPS = BM // 16
 
@@ -242,25 +243,35 @@ def _gemm1_body(
     # +kAStages*BM*KH_TILE.
 
     cached_actual_row = []
+    a_load_wave = wave
     cached_row_inline = None
     if const_expr(inline_quant):
         rcls = wave * fx.Int32(4) + lane_div_16
         cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
     else:
+        if const_expr(BM == 16):
+            a_load_wave = wave & fx.Int32(1)
         for sub in range_constexpr(kSubBlocks):
-            idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
+            idx = (
+                m_row + a_load_wave * fx.Int32(max(BM // 4, 8))
+                + fx.Int32(sub * 8) + lane_div_8
+            )
             cached_actual_row.append(_global_i32_at(arg_mind, idx))
 
     # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
     N0_HALF = N_OUT // 32
     b_load_s_base = []
-    for j in range_constexpr(4):
+    for j in range_constexpr(N_MFMA_J):
         if const_expr(interleave):
             col = (
                 n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
             )
         else:
-            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+            tile_il = (
+                n_block_idx * fx.Int32(BN // 16)
+                + wave * fx.Int32(BN // 64)
+                + fx.Int32(j)
+            )
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
@@ -272,7 +283,10 @@ def _gemm1_body(
         mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
         np_list = [mni_base, mni_base + fx.Int32(1)]
     else:
-        np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+        np_gate = (
+            n_block_idx * fx.Int32(BN // 64)
+            + wave // fx.Int32(256 // BN)
+        )
         np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
@@ -283,24 +297,35 @@ def _gemm1_body(
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
-    accm = [[None] * 4 for _ in range(kMChunks)]
-    b = [[[None, None] for _ in range(4)] for _ in range(kStages)]
+    accm = [[None] * N_MFMA_J for _ in range(kMChunks)]
+    b = [[[None, None] for _ in range(N_MFMA_J)] for _ in range(kStages)]
     b_scale_v = [[None, None] for _ in range(kStages)]
 
     def issue_a_load_lds(slot, kt):
         for sub in range_constexpr(kSubBlocks):
-            lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
+            lds_row = (
+                a_load_wave * fx.Int32(max(BM // 4, 8)) + fx.Int32(sub * 8)
+            )
             mask = _lds_swizzle_mask(lds_row + lane_div_8)
             voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
                 sub
             ] * fx.Int32(K_HALF)
             off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            fx.copy(
-                aq_dma_atom,
-                fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
-                fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
-                soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
-            )
+            if const_expr(BM == 16):
+                if wave < fx.Int32(2):
+                    fx.copy(
+                        aq_dma_atom,
+                        fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
+                        fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
+                        soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
+                    )
+            else:
+                fx.copy(
+                    aq_dma_atom,
+                    fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
+                    fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
+                    soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
+                )
 
     # s_aq as flat i32, divided into 4-element (128-bit) and 1-element tiles.
     s_aq_i32_flat = fx.make_view(
@@ -386,7 +411,12 @@ def _gemm1_body(
                 + lane_div_16 * fx.Int32(16)
                 + lane_mod_16
             )
-            out.append(_raw(_global_i32_load(asc_i32_tiles, lds_dw)))
+            scale = fx.Int32(_raw(_global_i32_load(asc_i32_tiles, lds_dw)))
+            if const_expr((BM == 16) and not inline_quant):
+                scale = scale.shrui(
+                    (m_block_idx & fx.Int32(1)) * fx.Int32(8)
+                )
+            out.append(_raw(scale))
         return out
 
     lib = lane & fx.Int32(3)
@@ -505,7 +535,14 @@ def _gemm1_body(
                 r,
                 soffset=s_off // fx.Int32(4),
             )
-            bs_slot[mw] = r.load()[0]
+            scale = r.load()[0]
+            if const_expr((BN == 128) and not interleave):
+                # opselB is immediate, so place each odd wave's packed scales in
+                # the selector-0/2 byte positions consumed by the MFMA calls.
+                scale = fx.Int32(scale).shrui(
+                    (wave & fx.Int32(1)) * fx.Int32(8)
+                )
+            bs_slot[mw] = scale
 
     mfma_ty = T.f32x4
     zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -572,20 +609,21 @@ def _gemm1_body(
             scale_accum = inline_quant_kt(
                 1, 0, K_C, K_C, cached_row_inline, scale_accum
             )
-            issue_b_load_j(b[K_C], K_C, 2)
-            issue_b_load_j(b[K_C], K_C, 3)
+            if const_expr(N_MFMA_J == 4):
+                issue_b_load_j(b[K_C], K_C, 2)
+                issue_b_load_j(b[K_C], K_C, 3)
             inline_quant_pack_write(K_C, scale_accum)
         else:
             issue_a_load_lds(K_C, K_C)
             if const_expr(not _relax_prologue):
-                for j in range_constexpr(4):
+                for j in range_constexpr(N_MFMA_J):
                     issue_b_load_j(b[K_C], K_C, j)
         if const_expr(not _relax_prologue):
             issue_b_scale_load(b_scale_v[K_C], K_C)
     if const_expr(_relax_prologue):
         rocdl.sched_barrier(0)
         for K_C in range_constexpr(kStages):
-            for j in range_constexpr(4):
+            for j in range_constexpr(N_MFMA_J):
                 issue_b_load_j(b[K_C], K_C, j)
             issue_b_scale_load(b_scale_v[K_C], K_C)
 
@@ -607,7 +645,7 @@ def _gemm1_body(
             h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
             h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
             rocdl.sched_barrier(0)
-        for J in range_constexpr(4):
+        for J in range_constexpr(N_MFMA_J):
             if const_expr(BM != 128):
                 rocdl.sched_barrier(0)
                 rocdl.s_setprio(1)
@@ -635,7 +673,7 @@ def _gemm1_body(
         else:
             a_cur = issue_a_ds_read(kt % kAStages)
             asc_cur = issue_a_scale_ds_read(kt)
-        for J in range_constexpr(4):
+        for J in range_constexpr(N_MFMA_J):
             mfma_cluster(
                 b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
             )
@@ -667,11 +705,14 @@ def _gemm1_body(
 
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
-        for J in range_constexpr(4):
+        for J in range_constexpr(N_MFMA_J):
             is_up = (J % 2) == 1
             J_local = J // 2
-            col_local = wave * fx.Int32(32) + fx.Int32(J_local * 16) + lane_mod_16
-            lds_col = (fx.Int32(128) + col_local) if is_up else col_local
+            col_local = (
+                wave * fx.Int32(BN_INT // 4)
+                + fx.Int32(J_local * 16) + lane_mod_16
+            )
+            lds_col = (fx.Int32(BN_INT) + col_local) if is_up else col_local
             vec = fx.Vector(accm[i][J])
             for v in range_constexpr(4):
                 idx = acc_idx(row_base + fx.Int32(v), lds_col)
@@ -682,8 +723,11 @@ def _gemm1_body(
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // fx.Int32(16)
     n_lane = tx_i32 % fx.Int32(16)
-    wave_grp = n_lane // fx.Int32(4)
-    kk = n_lane % fx.Int32(4)
+    active_n_lanes = BN_INT // 8
+    epilogue_active = n_lane < fx.Int32(active_n_lanes)
+    epilogue_n_lane = n_lane % fx.Int32(active_n_lanes)
+    wave_grp = epilogue_n_lane // fx.Int32(4)
+    kk = epilogue_n_lane % fx.Int32(4)
 
     aqout_layout = fx.make_layout((BM, K_G2_HALF), (K_G2_HALF, 1))
     # UniversalCopy has no nontemporal/cache-hint knob; dropped (perf-neutral).
@@ -698,7 +742,7 @@ def _gemm1_body(
         for ee in range_constexpr(8):
             col_in_grp = fx.Int32(8) * kk + fx.Int32(ee)
             gate_col = wave_grp * fx.Int32(32) + col_in_grp
-            up_col = fx.Int32(128) + gate_col
+            up_col = fx.Int32(BN_INT) + gate_col
             gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
             up_vs[ee] = acc_load(acc_idx(row_local, up_col))
         result = _silu_mul_batch(gate_vs, up_vs)
@@ -732,7 +776,8 @@ def _gemm1_body(
         )
         out_row = m_row + row_local
         store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-        _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
+        if epilogue_active:
+            _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
 
     # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
     ascaleout_layout = fx.make_layout(
@@ -741,17 +786,26 @@ def _gemm1_body(
     ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
     ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
     if kk == fx.Int32(0):
-        ku = n_block_idx >> fx.Int32(1)
-        ikxdl = n_block_idx & fx.Int32(1)
+        N_BLOCKS_PER_SCALE_TILE = 256 // BN
+        scale_n_block = n_block_idx // fx.Int32(N_BLOCKS_PER_SCALE_TILE)
+        scale_sub_block = n_block_idx % fx.Int32(N_BLOCKS_PER_SCALE_TILE)
+        scale_wave_grp = wave_grp + scale_sub_block * fx.Int32(N_MFMA_J)
+        ku = scale_n_block >> fx.Int32(1)
+        ikxdl = scale_n_block & fx.Int32(1)
         if const_expr(BM == 16):
             chunk = m_block_idx
-            dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
+            dword_off = _layout_idx(
+                ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
+            )
             addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-            _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
+            if epilogue_active:
+                _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
         else:
             for sub in range_constexpr(kSubBlocks):
                 chunk = m_block_idx * fx.Int32(kSubBlocks) + fx.Int32(sub)
-                dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
+                dword_off = _layout_idx(
+                    ascaleout_layout, chunk, ku, scale_wave_grp, m_lane
+                )
                 pair_i32 = scales_per_mr[sub * 2 + 0] | (
                     scales_per_mr[sub * 2 + 1] << fx.Int32(8)
                 )
@@ -786,18 +840,25 @@ def compile_gemm1_a4w4_port(
     interleave=False,
     xcd_swizzle=0,
 ):
-    if (BM, use_nt, inline_quant) not in {
+    variant = (BM, use_nt, inline_quant)
+    if BN not in (128, 256):
+        raise AssertionError(f"only BN==128 or BN==256 supported, got BN={BN}")
+    if BN == 128 and variant not in {(16, True, False), (16, True, True)}:
+        raise AssertionError(
+            f"BN==128 supports only BM=16 and use_nt=True, got {variant}"
+        )
+    if variant not in {
         (32, True, False),
         (32, False, False),
         (64, False, False),
         (128, False, False),
         (16, True, True),
-    }:
+    } and not (BN == 128 and variant == (16, True, False)):
         raise AssertionError(
             f"unsupported gemm1 variant (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
 
-    assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
+    assert BK == 256, f"only BK==256 supported, got BK={BK}"
     KH_TILE = BK // 2
     _K = D_HIDDEN
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
@@ -816,7 +877,7 @@ def compile_gemm1_a4w4_port(
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_bn{BN}_{variant_tag}_{gu_tag}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
 

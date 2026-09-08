@@ -36,6 +36,7 @@ SHAPES = [
     (385, 7168, 768, 7),  # dsv4 NE=385 TOPK=7 (tp4)
     (385, 7168, 512, 7),  # dsv4 NE=385 TOPK=7 (tp6/tp8)
     (257, 6144, 512, 9),  # GLM-5.2 TP=4 (256 routed + 1 shared -> topk 8+1, H=6144)
+    (257, 6144, 256, 9),  # GLM-5.2 TP=8
 ]
 
 
@@ -171,9 +172,10 @@ AUX_SCATTER_Q_PARAMS = """    int            M,
 
 
 def _aux_sort_quant_body(ne, topk, mb, h):
+    nctas = "kInlineQuantZeroInitCtas" if mb == 16 else "kNCtasSort"
     return (
         f"    aiter::mxfp4_moe::moe_sort_quant::launch<\n"
-        f"        {ne}, {topk}, {mb}, {h}, kNCtasSort, kThreadsSort>(\n"
+        f"        {ne}, {topk}, {mb}, {h}, {nctas}, kThreadsSort>(\n"
         f"            stream, M,\n"
         f"            reinterpret_cast<const __hip_bfloat16*>(a_input),\n"
         f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
@@ -271,9 +273,9 @@ class mxfp4_moe_aux_codegen:
         self.working_path = Path(working_path)
 
     def enumerate_instances(self):
-        # sort_quant: MB=32 only
+        # mxfp4_moe_sort_quant: MB=16 also supplies cached A to split-N GEMM1.
         for ne, h, e, topk in SHAPES:
-            for mb in (32,):
+            for mb in (16, 32):
                 yield Instance(
                     f"aux_sort_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
                     "SortQuantFn",
