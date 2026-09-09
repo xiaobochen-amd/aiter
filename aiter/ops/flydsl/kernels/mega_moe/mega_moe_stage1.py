@@ -23,11 +23,24 @@ from .dispatch import (
     emit_dispatch_plan,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
-from .gemm_util import _buffer_load, _buffer_store, _make_buffer, _make_buffer_from_addr
+from .gemm_util import (
+    _buffer_load,
+    _buffer_store,
+    _make_buffer,
+    _make_buffer_from_addr,
+    wait_lds_barrier,
+)
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
 
+# Entry tickets are handed out by one agent-scope atomic per block. A single shared
+# counter serializes all of them beyond the per-XCD L2, so the counter is sharded by
+# block index onto its own cache line; the (shard, round) pair still enumerates every
+# ticket exactly once.
+CTRL_LINE_BYTES = 256
+CTRL_MAX_SHARDS = 256
+CTRL_EPOCH_SLOTS = 10
 
 def ceildiv(a, b):
     return (a + b - 1) // b
@@ -83,7 +96,7 @@ def compile_mega_moe_stage1(
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int | None = None, external_grouping: bool | None = None,
     external_counting: bool | None = None, payload_chunk_rows: int = 0, payload_tile_ready: bool = False,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float = 0.0, b_warm_steps: int = 0,
 ):
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
@@ -97,6 +110,7 @@ def compile_mega_moe_stage1(
     N_TILES = (2 * inter_dim) // tile_n
     GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
     assert grid_mult in GRID_MULT_VALUES, "grid_mult out of range"
+    assert len(GRID_MULT_VALUES) <= CTRL_EPOCH_SLOTS
     grid_epoch_slot = GRID_MULT_VALUES.index(grid_mult)
     dispatch_blocks = int(num_dispatch_cu)
     payload_chunk_rows = int(payload_chunk_rows)
@@ -111,6 +125,13 @@ def compile_mega_moe_stage1(
     assert grid_x > 0, "consumer grid must remain positive"
     launch_grid_x = planner_blocks + dispatch_blocks + grid_x
     assert launch_grid_x <= num_cu * 33 + 1
+    # Blocks are assigned to entry shards by index, so every shard is hit exactly
+    # CTRL_ENTRY_PERIOD times per launch.
+    CTRL_ENTRY_SHARDS = next(
+        (s for s in (CTRL_MAX_SHARDS, 128, 64, 32, 16, 8, 4, 2) if launch_grid_x % s == 0), 1
+    )
+    CTRL_ENTRY_PERIOD = launch_grid_x // CTRL_ENTRY_SHARDS
+    B_WARM_STEPS = int(b_warm_steps)
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
     assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
@@ -185,6 +206,7 @@ def compile_mega_moe_stage1(
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
         f"_pc{payload_chunk_rows}"
         f"_ptr{int(payload_tile_ready)}"
+        f"_bw{B_WARM_STEPS}"
         f"{swiglu_suffix}"
     )
 
@@ -220,18 +242,25 @@ def compile_mega_moe_stage1(
         p_launch_ready = _disp_ptr(DispatchSlot.P2P_LAUNCH_READY)
         a_payload_ready_rows = _disp_ptr(DispatchSlot.PAYLOAD_READY_ROWS)
 
+        block_id = fx.block_idx.x
+        entry_shard = block_id % fx.Int32(CTRL_ENTRY_SHARDS)
+        entry_addr = (
+            a_entry_count
+            + fx.Int64(grid_epoch_slot * CTRL_ENTRY_SHARDS * CTRL_LINE_BYTES)
+            + fx.Int64(entry_shard) * fx.Int64(CTRL_LINE_BYTES)
+        )
+        gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
+
         ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
         if tid == fx.Int32(0):
-            ticket64 = fx.Int64(
-                comm_ops.atomic_add_agent(a_entry_count + fx.Int64(grid_epoch_slot * 8), fx.Int64(1))
-            )
+            ticket64 = fx.Int64(comm_ops.atomic_add_agent(entry_addr, fx.Int64(1)))
             fx.ptr_store(Vec.from_elements([ticket64], fx.Int64), ticket_scratch)
         fx.barrier()
         ticket64 = Vec(ticket_view.load())[0]
-        generation = ticket64 // fx.Int64(launch_grid_x)
-        ticket = fx.Int32(ticket64 - generation * fx.Int64(launch_grid_x))
-        gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
+        generation = ticket64 // fx.Int64(CTRL_ENTRY_PERIOD)
+        entry_round = fx.Int32(ticket64 - generation * fx.Int64(CTRL_ENTRY_PERIOD))
+        ticket = entry_shard + entry_round * fx.Int32(CTRL_ENTRY_SHARDS)
         gate_epoch = fx.Int32(generation + fx.Int64(1))
         compact_owner = ticket == fx.Int32(0)
         compact_producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
@@ -394,7 +423,7 @@ def compile_mega_moe_stage1(
             out_rsrc = _make_buffer(out, fx.Int16, max_size=False, num_records_bytes=out_nbytes)
         os_rsrc = _make_buffer(out_scale, fx.Int8, max_size=False, num_records_bytes=os_nbytes)
 
-        expert_of_flat, _do_scheduled_tile = build_fused_gemm1(
+        expert_of_flat, _do_scheduled_tile, _warm_tile_b = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
             trb_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
@@ -406,8 +435,34 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit=swiglu_limit, w_tensor=w if B_WARM_STEPS > 0 else None,
+            w_bytes=fz_epr * inter_dim * model_dim,
         )
+
+        def _shard_work_item(shard, index):
+            # Hand each shard a disjoint set of m-tiles rather than one n-tile column.
+            # Tickets follow the block index, so a shard is one XCD, and the N_TILES
+            # items that gather the same A rows then land on a single L2.
+            group = index // fx.Int32(N_TILES)
+            return (
+                (shard + group * fx.Int32(WORK_SHARDS)) * fx.Int32(N_TILES)
+                + index - group * fx.Int32(N_TILES)
+            )
+
+        if const_expr(B_WARM_STEPS > 0):
+            # Consumers sit idle for the whole dispatch handshake while HBM carries
+            # only the payload, so they stream the head of the work item they are
+            # about to claim. The item is a guess (metadata lands with the plan) but
+            # every local expert is routed, so the bytes are consumed either way.
+            # Producers are excluded: delaying the payload delays the plan for all.
+            # Wave 0 is excluded so its lane 0 reaches the plan_ready poll straight
+            # away; the copies of the other waves then overlap the whole handshake.
+            if (ticket > fx.Int32(dispatch_blocks)) & (wave_id != fx.Int32(0)):
+                warm_flat = _shard_work_item(
+                    ticket & fx.Int32(WORK_SHARDS - 1),
+                    (ticket - fx.Int32(dispatch_blocks + 1)) // fx.Int32(WORK_SHARDS),
+                )
+                _warm_tile_b(warm_flat, B_WARM_STEPS, a_buf, wave_id * fx.Int32(1024))
 
         if tid == fx.Int32(0):
             local_plan_ready = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.PLAN_READY)), fx.Int64)
@@ -421,7 +476,12 @@ def compile_mega_moe_stage1(
                 comm_ops.fence_system_acquire()
             else:
                 comm_ops.fence_agent_acquire()
-        fx.barrier()
+        if const_expr(B_WARM_STEPS > 0):
+            # Retire the warm copies here, after the poll, so they never stall the
+            # handshake yet cannot land on the A tile that reuses this LDS.
+            wait_lds_barrier(0)
+        else:
+            fx.barrier()
 
         num_valid = _buffer_load(nv_rsrc, fx.Int32(0), fx.Int32)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
@@ -445,6 +505,7 @@ def compile_mega_moe_stage1(
 
         # Control CTAs join the work pool after dispatch.
         consumer_active = fx.Int32(1) == fx.Int32(1)
+
         work_scratch = fx.recast_iter(fx.Int32, a_buf.ptr)
         work_scratch_view = fx.make_view(work_scratch, fx.make_layout(1, 1))
         work_shard = ticket & fx.Int32(WORK_SHARDS - 1)
@@ -455,7 +516,7 @@ def compile_mega_moe_stage1(
                         a_work_head + fx.Int64(work_shard) * fx.Int64(64), fx.Int32(1)
                     )
                 )
-                work = work_shard + local_work * fx.Int32(WORK_SHARDS)
+                work = _shard_work_item(work_shard, local_work)
                 fx.ptr_store(Vec.from_elements([work], fx.Int32), work_scratch)
             fx.barrier()
             work = Vec(work_scratch_view.load())[0]
@@ -501,7 +562,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
     b_nt=-1, work_shards=None, external_grouping=None, external_counting=None,
-    payload_chunk_rows=0, payload_tile_ready=False, swiglu_limit=0.0):
+    payload_chunk_rows=0, payload_tile_ready=False, swiglu_limit=0.0, b_warm_steps=0):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -513,7 +574,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, work_shards=work_shards, external_grouping=external_grouping,
         external_counting=external_counting, payload_chunk_rows=payload_chunk_rows,
         payload_tile_ready=payload_tile_ready,
-        swiglu_limit=swiglu_limit,
+        swiglu_limit=swiglu_limit, b_warm_steps=b_warm_steps,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,

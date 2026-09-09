@@ -254,7 +254,9 @@ class AS2RLoader:
 class BWeightLoader:
     """Per-K-step fp4 gate&up weights VMEM->reg (i32x8, 128b widened). shuffle_weight_w4 N-major layout."""
 
-    def __init__(self, *, w_rsrc, num_acc_n, model_dim, cache_modifier=0):
+    def __init__(
+        self, *, w_rsrc, num_acc_n, model_dim, cache_modifier=0, w_tensor=None, w_bytes=0
+    ):
         self._w_rsrc = w_rsrc
         self._num_acc_n = num_acc_n
         self._cache_modifier = int(cache_modifier)
@@ -263,6 +265,18 @@ class BWeightLoader:
         self._stride_klane = 256
         self._stride_k0 = 1024
         self._stride_n0 = model_dim * 8
+        self._w_dma = None
+        if w_tensor is not None and int(w_bytes) > 0:
+            w_view = fx.Tensor(
+                fx.make_view(fx.get_iter(w_tensor), fx.make_layout(int(w_bytes), 1))
+            )
+            self._w_dma = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(
+                    w_view, max_size=False, num_records_bytes=int(w_bytes)
+                ),
+                fx.make_layout(1, 1),
+            )
+            self._dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
 
     def _load_pack(self, row_base_i32, ni, kstep_i32, ksub):
         lane_row = fx.Int32(self._lane % 16)
@@ -296,6 +310,27 @@ class BWeightLoader:
             self._load_pack(row_base_i32, ni, kstep_i32, ks)
             for ks in range_constexpr(_PACK)
         ]
+
+    def warm_steps_lds(self, row_base_i32, num_steps, lds_dst, lds_slot_bytes):
+        """Pull this tile's leading K-steps into the memory-side cache via LDS.
+
+        A K-step pack is 1 KiB of consecutive bytes, so one direct global-to-LDS
+        copy per (n-group, ksub) covers it with no register destination: depth costs
+        neither VGPRs nor a wait, and the copies stay alive because they write LDS.
+        The landing slot is scratch -- only the cache side effect is wanted.
+        """
+        assert self._w_dma is not None, "warm_steps_lds needs the weight tensor"
+        n_blk0 = row_base_i32 // fx.Int32(16)
+        lds_i8 = fx.recast_iter(fx.Int8, lds_dst.ptr)
+        dst = fx.make_view(
+            fx.add_offset(lds_i8, lds_slot_bytes), fx.make_layout(1, 1)
+        )
+        lane_byte = fx.Int32(self._lane) * fx.Int32(16)
+        for ni in range_constexpr(self._num_acc_n):
+            n_byte = (n_blk0 + fx.Int32(ni)) * fx.Int32(self._stride_n0) + lane_byte
+            for k0 in range_constexpr(num_steps * _PACK):
+                src_byte = n_byte + fx.Int32(k0 * self._stride_k0)
+                fx.copy(self._dma_atom, fx.slice(self._w_dma, (None, src_byte)), dst)
 
 
 class BScaleLoader:

@@ -143,15 +143,24 @@ class MegaMoEV2:
         self._build_v2_disp_table()
 
     def _allocate_dispatch_workspace(self, op, metadata_blocks):
+        from .mega_moe_stage1 import (
+            CTRL_EPOCH_SLOTS,
+            CTRL_LINE_BYTES,
+            CTRL_MAX_SHARDS,
+        )
+
         total_experts = self.world_size * self.epr
+        # Stage1 gives each entry-ticket shard its own cache line; see the ticket note
+        # in stage1.
+        entry_count_len = CTRL_EPOCH_SLOTS * CTRL_MAX_SHARDS * (CTRL_LINE_BYTES // 8)
         workspace = {
             "local_hist": torch.zeros(total_experts, dtype=torch.int32, device=self.dev),
             "local_cursor": torch.zeros(total_experts, dtype=torch.int32, device=self.dev),
             "pair_order": torch.empty(self.mtpr * self.topk, dtype=torch.int32, device=self.dev),
             "pair_base": torch.empty(total_experts, dtype=torch.int32, device=self.dev),
             "pair_ready": torch.zeros(2, dtype=torch.int32, device=self.dev),
-            "entry_count": torch.zeros(10, dtype=torch.int64, device=self.dev),
-            "epoch_gate": torch.zeros(10, dtype=torch.int32, device=self.dev),
+            "entry_count": torch.zeros(entry_count_len, dtype=torch.int64, device=self.dev),
+            "epoch_gate": torch.zeros(CTRL_EPOCH_SLOTS, dtype=torch.int32, device=self.dev),
             "pair_order_ready": torch.zeros(2, dtype=torch.int32, device=self.dev),
             "work_head": torch.zeros(8 * 16, dtype=torch.int32, device=self.dev),
             "work_tail": torch.zeros(1, dtype=torch.int32, device=self.dev),
@@ -290,7 +299,7 @@ class MegaMoEV2:
             work_shards=config.work_shards, external_grouping=config.external_grouping,
             external_counting=config.external_counting, payload_chunk_rows=config.payload_chunk_rows,
             payload_tile_ready=config.payload_tile_ready,
-            swiglu_limit=self.swiglu_limit)
+            swiglu_limit=self.swiglu_limit, b_warm_steps=config.b_warm_steps)
         # fmt: on
         self._s1_active_tile_m = config.sort_block_m
         return self._s1_active_tile_m

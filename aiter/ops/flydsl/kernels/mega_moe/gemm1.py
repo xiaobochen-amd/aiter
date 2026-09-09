@@ -271,7 +271,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
-    use_tile_resource, swiglu_limit=0.0):
+    use_tile_resource, swiglu_limit=0.0, w_tensor=None, w_bytes=0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -292,6 +292,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         num_acc_n=num_acc_n,
         model_dim=model_dim,
         cache_modifier=b_cache_modifier,
+        w_tensor=w_tensor,
+        w_bytes=w_bytes,
     )
     b_scale = BScaleLoader(scale_rsrc=sw_rsrc, num_acc_n=num_acc_n, model_dim=model_dim)
     a_scale = AScaleLoader(
@@ -318,6 +320,17 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         m_tile, _n = _decode(flat)
         return sched.expert_of(m_tile)
 
+    def warm_tile_b(flat, num_steps, lds_dst, lds_slot_bytes):
+        """Warm a work item's leading B steps while its metadata is still in flight.
+
+        Sorted expert IDs only exist once the dispatch plan lands, so the local expert
+        is taken to be the m-tile index. Decode routes every local expert, so a
+        mispredicted tile still warms weights that some other work item consumes.
+        """
+        m_tile, n_tile = _decode(flat)
+        b_row = sched.gate_base_row(m_tile) + n_wave_base + n_tile * fx.Int32(tile_n)
+        b_loader.warm_steps_lds(b_row, num_steps, lds_dst, lds_slot_bytes)
+
     def do_scheduled_tile(flat):
         m_tile, n_tile = _decode(flat)
         n_tile_base = n_wave_base + n_tile * fx.Int32(tile_n)
@@ -330,7 +343,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             trb_rsrc)
         # fmt: on
 
-    return expert_of_flat, do_scheduled_tile
+    return expert_of_flat, do_scheduled_tile, warm_tile_b
 
 
 # fmt: off
@@ -402,7 +415,7 @@ def compile_gemm1(
         )
         wave_id = fx.thread_idx.x // 64
 
-        _, run_tile = build_fused_gemm1(
+        _, run_tile, _warm = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc, sw_rsrc=sw_rsrc,
             sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc, trb_rsrc=trb_rsrc,
             expert_rsrc=expert_rsrc, out_tensor=out, a_buf=a_buf,

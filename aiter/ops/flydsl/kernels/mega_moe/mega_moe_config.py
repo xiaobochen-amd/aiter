@@ -54,6 +54,7 @@ class Stage1Config:
     external_counting: bool = False
     payload_chunk_rows: int = 0
     payload_tile_ready: bool = False
+    b_warm_steps: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +393,11 @@ def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
     stage2 = replace(stage2, block_n=128, persist=True, persist_cu=192)
     if wide_tile:
         stage2 = replace(stage2, use_nt=False)
+    # Consumers idle through the whole dispatch handshake while HBM only carries the
+    # payload, so they pull the head of their first work item's B stream in. Six
+    # K-steps is the measured knee: deeper warms stop fitting in the idle window and
+    # start competing with the GEMM they were meant to feed.
+    stage1 = replace(stage1, b_warm_steps=6)
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
 
