@@ -224,7 +224,7 @@ def _publish_tile_range(
 def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32,
     fz_safe_end_i32, fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts,
-    addr_in_sc, i32_cur_tok, dispatch_blocks, producer_slot, parity, expected,
+    addr_in_sc, i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, reset_group_done=False,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots."""
@@ -267,7 +267,8 @@ def emit_direct_fixed_slot_payload(
     r_wts = crfa(addr_in_wts)
     r_scales = crfa(addr_in_sc)
 
-    for wk in range(route, route_limit, route_stride):
+    def _claim_route(wk):
+        """Reserve this route's row in the destination's fixed slot region."""
         source_token = wk // fx.Int32(fz_k)
         topk_slot = wk - source_token * fx.Int32(fz_k)
         global_expert_lane = fx.Int32(0)
@@ -293,7 +294,10 @@ def emit_direct_fixed_slot_payload(
         expert_offset = fx.Int32(fx.rocdl.readlane(T.i32, offset_lane, 0))
         publish = assigned & (expert_offset < fx.Int32(fz_cap))
         payload_row = slot_half + local_expert * fx.Int32(fz_cap) + expert_offset
+        return publish, destination, payload_row, source_token, topk_slot, wk
 
+    def _write_route(claim):
+        publish, destination, payload_row, source_token, topk_slot, wk = claim
         if publish:
             remote_token = buffer_ops.buffer_load(crfa(p_rx), destination, vec_width=1, dtype=fx.Int64)
             destination_rsrc = crfa(remote_token + fx.Int64(payload_row) * fx.Int64(fz_nbytes))
@@ -321,6 +325,9 @@ def emit_direct_fixed_slot_payload(
                 buffer_ops.buffer_store(weight_bits, crfa(remote_weights), payload_row)
                 buffer_ops.buffer_store(source_encoding, crfa(remote_srcmap), payload_row)
 
+    for wk in range(route, route_limit, route_stride):
+        _write_route(_claim_route(wk))
+
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
     if tid == fx.Int32(0):
@@ -332,6 +339,11 @@ def emit_direct_fixed_slot_payload(
         )
         if done == producers_per_group - fx.Int32(1):
             comm_ops.fence_agent_acquire()
+            if const_expr(reset_group_done):
+                # Without an owner-published gate there is no safe point for the owner
+                # to clear this counter, so the group's last producer - which has just
+                # observed every peer in the group - clears it for the next launch.
+                buffer_ops.buffer_store(fx.Int32(0), crfa(a_producer_done), producer_group)
             done_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             for destination in range_constexpr(fz_npes):
                 if producer_group == (fx.Int32(destination) & group_mask):
@@ -343,10 +355,17 @@ def emit_direct_fixed_slot_payload(
 
 @flyc.jit
 def emit_direct_fixed_slot_finalize(
-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected
+    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected,
+    ready_slot=None, ready_epoch=None, num_waves=1, dense_plan=False,
 ):
     """Finalize local fixed slots as soon as every source publishes this destination."""
     assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
+    # Only the consumers' metadata has to be in place before the plan is published.
+    # Everything else the pass writes - the row sentinels a tile's padding needs and
+    # the counters the launch after next reuses - is handed to the waves that would
+    # otherwise idle here, so neither the stores nor their drain sit in front of the
+    # plan_ready release.
+    helper_waves = int(num_waves) - 1
     crfa = buffer_ops.create_buffer_resource_from_addr
     rdisp = crfa(addr_disp)
 
@@ -368,11 +387,38 @@ def emit_direct_fixed_slot_finalize(
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
     if warp == fx.Int32(0):
+        if const_expr(dense_plan):
+            # While every local expert holds between one row and one tile - the decode
+            # regime this path serves - the plan is a pure function of the slot geometry
+            # and does not depend on the counts at all. Writing it here puts its stores
+            # and their drain inside the rendezvous window below instead of behind it;
+            # what is left behind the rendezvous is the check, plus a rewrite on the
+            # runs where the assumption does not hold.
+            if lane < fx.Int32(fz_epr):
+                buffer_ops.buffer_store(fx.Int32(fz_rank * fz_epr) + lane, crfa(a_se), lane)
+                buffer_ops.buffer_store(
+                    parity * fx.Int32(fz_epr * fz_cap) + lane * fx.Int32(fz_cap), crfa(a_trb), lane
+                )
+                buffer_ops.buffer_store(lane + fx.Int32(1), crfa(a_expert_tile_end), lane)
+            if lane == fx.Int32(0):
+                buffer_ops.buffer_store(fx.Int32(fz_epr * fz_tile_m), crfa(a_nv), fx.Int32(0))
+                buffer_ops.buffer_store(fx.Int32(0), crfa(a_nv), fx.Int32(1))
+                buffer_ops.buffer_store(fx.Int32(fz_epr * n_tiles), crfa(a_work_tail), fx.Int32(0))
+                buffer_ops.buffer_store(fx.Int32(1), crfa(a_max_expert_tiles), fx.Int32(0))
         for source in range(lane, fz_npes, 64):
             done_index = parity * fx.Int32(fz_npes) + source
             mori_shmem.int32_wait_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
+    if const_expr(helper_waves > 0):
+        # Releases the helper waves once the counts are final; the acquire above
+        # invalidates for the whole block, so they see the same values wave 0 does.
+        fx.barrier()
 
+    if const_expr(helper_waves > 0):
+        active_wave = fx.Int32(1) == fx.Int32(1)
+    else:
+        active_wave = warp == fx.Int32(0)
+    if active_wave:
         valid_expert = lane < fx.Int32(fz_epr)
         safe_expert = valid_expert.select(lane, fx.Int32(0))
         # Mirror of the producer-side parity halves (see emit_direct_fixed_slot_payload).
@@ -390,38 +436,83 @@ def emit_direct_fixed_slot_finalize(
         inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
         metadata_base = inclusive_tiles - num_expert_tiles
         total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
+        payload_base = slot_half + safe_expert * fx.Int32(fz_cap)
 
-        if valid_expert:
-            if no_overflow:
-                global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
-                payload_base = slot_half + safe_expert * fx.Int32(fz_cap)
-                for tile in range(fx.Int32(0), num_expert_tiles, 1):
-                    metadata_index = metadata_base + tile
-                    buffer_ops.buffer_store(global_expert, crfa(a_se), metadata_index)
-                    buffer_ops.buffer_store(payload_base + tile * fx.Int32(fz_tile_m), crfa(a_trb), metadata_index)
-                padded_rows = num_expert_tiles * fx.Int32(fz_tile_m)
-                for pad in range(fx.Int32(0), padded_rows - safe_count, 1):
-                    buffer_ops.buffer_store(fx.Int32(fz_npes * fz_mtpr), crfa(a_sm), payload_base + safe_count + pad)
-                buffer_ops.buffer_store(metadata_base + num_expert_tiles, crfa(a_expert_tile_end), safe_expert)
-            else:
-                buffer_ops.buffer_store(fx.Int32(0), crfa(a_expert_tile_end), safe_expert)
-            buffer_ops.buffer_store(fx.Int32(0), crfa(a_running), running_slot)
+        def _emit_row_sentinels(first, stride):
+            if valid_expert:  # noqa: SIM102 - keep the device and compile-time branches separate.
+                if no_overflow:
+                    padded_rows = num_expert_tiles * fx.Int32(fz_tile_m)
+                    for pad in range(first, padded_rows - safe_count, stride):
+                        buffer_ops.buffer_store(
+                            fx.Int32(fz_npes * fz_mtpr), crfa(a_sm), payload_base + safe_count + pad
+                        )
 
-        if lane == fx.Int32(0):
-            num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-            ready_work = no_overflow.select(total_tiles * fx.Int32(n_tiles), fx.Int32(0))
-            buffer_ops.buffer_store(num_valid, crfa(a_nv), fx.Int32(0))
-            # num_valid[1] is a device-visible overflow status.
-            buffer_ops.buffer_store(overflow_count, crfa(a_nv), fx.Int32(1))
-            buffer_ops.buffer_store(ready_work, crfa(a_work_tail), fx.Int32(0))
-            buffer_ops.buffer_store(max_expert_tiles, crfa(a_max_expert_tiles), fx.Int32(0))
+        if const_expr(dense_plan):
+            # One tile per expert, as assumed above, exactly when no expert is empty and
+            # none needs a second tile.
+            mismatch = valid_expert & (num_expert_tiles != fx.Int32(1))
+            plan_stale = _wave_reduce_max_i32(
+                mismatch.select(fx.Int32(1), fx.Int32(0)), lane
+            ) == fx.Int32(1)
+        else:
+            plan_stale = fx.Int32(0) == fx.Int32(0)
 
-        fx.rocdl.s_waitcnt(0)
-        comm_ops.fence_system_release()
-        for source in range(lane, fz_npes, 64):
-            remote_ready = buffer_ops.buffer_load(crfa(p_plan_ready), source, vec_width=1, dtype=fx.Int64)
-            ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
-            comm_ops.store_i32_system(remote_ready, ready_index, expected)
+        if warp == fx.Int32(0):
+            if plan_stale:  # noqa: SIM102 - keep the device and compile-time branches separate.
+                if valid_expert:
+                    if no_overflow:
+                        global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
+                        for tile in range(fx.Int32(0), num_expert_tiles, 1):
+                            metadata_index = metadata_base + tile
+                            buffer_ops.buffer_store(global_expert, crfa(a_se), metadata_index)
+                            buffer_ops.buffer_store(payload_base + tile * fx.Int32(fz_tile_m), crfa(a_trb), metadata_index)
+                        buffer_ops.buffer_store(metadata_base + num_expert_tiles, crfa(a_expert_tile_end), safe_expert)
+                    else:
+                        buffer_ops.buffer_store(fx.Int32(0), crfa(a_expert_tile_end), safe_expert)
+
+                if lane == fx.Int32(0):
+                    num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
+                    ready_work = no_overflow.select(total_tiles * fx.Int32(n_tiles), fx.Int32(0))
+                    buffer_ops.buffer_store(num_valid, crfa(a_nv), fx.Int32(0))
+                    # num_valid[1] is a device-visible overflow status.
+                    buffer_ops.buffer_store(overflow_count, crfa(a_nv), fx.Int32(1))
+                    buffer_ops.buffer_store(ready_work, crfa(a_work_tail), fx.Int32(0))
+                    buffer_ops.buffer_store(max_expert_tiles, crfa(a_max_expert_tiles), fx.Int32(0))
+
+            fx.rocdl.s_waitcnt(0)
+            comm_ops.fence_system_release()
+            if const_expr(ready_slot is None):
+                for source in range(lane, fz_npes, 64):
+                    remote_ready = buffer_ops.buffer_load(crfa(p_plan_ready), source, vec_width=1, dtype=fx.Int64)
+                    ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+                    comm_ops.store_i32_system(remote_ready, ready_index, expected)
+            elif lane == fx.Int32(0):
+                # The plan is only ever consumed by this rank, and its epoch comes from the
+                # entry ticket so that a block joining late still knows what to wait for.
+                local_ready = buffer_ops.buffer_load(
+                    crfa(p_plan_ready), fx.Int32(fz_rank), vec_width=1, dtype=fx.Int64
+                )
+                comm_ops.store_i32_system(local_ready, fx.Int32(ready_slot), ready_epoch)
+
+        if const_expr(helper_waves > 0):
+            pad_active = warp != fx.Int32(0)
+            pad_first = warp - fx.Int32(1)
+            pad_stride = fx.Int32(helper_waves)
+        else:
+            pad_active = warp == fx.Int32(0)
+            pad_first = fx.Int32(0)
+            pad_stride = fx.Int32(1)
+        if pad_active:
+            _emit_row_sentinels(pad_first, pad_stride)
+    if const_expr(helper_waves > 0):
+        # Every wave has read the counts by now, so they can be cleared for the launch
+        # that reuses this parity.
+        fx.barrier()
+    if warp == fx.Int32(0):  # noqa: SIM102 - keep the device and compile-time branches separate.
+        if lane < fx.Int32(fz_epr):
+            buffer_ops.buffer_store(
+                fx.Int32(0), crfa(a_running), parity * fx.Int32(fz_epr) + lane
+            )
     fx.barrier()
 
 

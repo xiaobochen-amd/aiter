@@ -174,6 +174,16 @@ def compile_mega_moe_stage1(
     # count_done handshake already bounds the launch skew to one epoch, so only the
     # single-buffered compact layout still needs the cross-rank launch barrier.
     launch_barrier = not direct_fixed_slot
+    # Fixed slots also make the intra-rank epoch gate redundant: the launch epoch is a
+    # pure function of one monotonic counter, so every block derives it locally
+    # instead of waiting for the owner to publish it. The plan_ready slot then has to
+    # be indexed by grid geometry (a late block must not read the counter).
+    gate_free = direct_fixed_slot
+    assert not gate_free or CTRL_EPOCH_SLOTS <= 2 * fz_npes, "plan_ready cannot hold one slot per geometry"
+    # Fixed slots also make the plan itself independent of the counts whenever every
+    # local expert holds between one row and one tile, so it can be written before the
+    # count_done rendezvous rather than after it (see emit_direct_fixed_slot_finalize).
+    dense_plan = direct_fixed_slot
     fz_total_experts = fz_npes * fz_epr
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
@@ -206,7 +216,7 @@ def compile_mega_moe_stage1(
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
         f"_pc{payload_chunk_rows}"
         f"_ptr{int(payload_tile_ready)}"
-        f"_bw{B_WARM_STEPS}"
+        f"_bw{B_WARM_STEPS}_dp{int(dense_plan)}"
         f"{swiglu_suffix}"
     )
 
@@ -249,7 +259,8 @@ def compile_mega_moe_stage1(
             + fx.Int64(grid_epoch_slot * CTRL_ENTRY_SHARDS * CTRL_LINE_BYTES)
             + fx.Int64(entry_shard) * fx.Int64(CTRL_LINE_BYTES)
         )
-        gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
+        if const_expr(not gate_free):
+            gate_addr = a_epoch_gate + fx.Int64(grid_epoch_slot * 4)
 
         ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
@@ -266,7 +277,30 @@ def compile_mega_moe_stage1(
         compact_producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
         producer_slot = ticket - fx.Int32(1)
 
-        if compact_owner:
+        def _reset_work_pool():
+            work_head_rsrc = _make_buffer_from_addr(a_work_head, fx.Int32)
+            for shard in range_constexpr(8):
+                _buffer_store(work_head_rsrc, fx.Int32(shard * 16), fx.Int32(0), fx.Int32)
+            _buffer_store(_make_buffer_from_addr(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
+
+        if const_expr(gate_free):
+            # The epoch is one monotonic counter every block reads, so no block waits
+            # on a gate published by another: the head of the kernel costs a single
+            # load instead of the owner's dependent load/store chain plus the release
+            # every other block has to observe. The counter is advanced after the
+            # owner retires (see the epilogue) because only the low tickets - the
+            # owner and the producers - are guaranteed to arrive before any block
+            # exits. Ordering that the gate used to provide is already covered:
+            # plan_ready releases the work-pool reset to the consumers, and each
+            # producer group clears its own done counter.
+            epoch_base = _buffer_load(expected_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
+            payload_expected = epoch_base + fx.Int32(fz_npes)
+            payload_parity = (payload_expected // fx.Int32(fz_npes)) & fx.Int32(1)
+            if compact_owner:
+                if tid == fx.Int32(0):
+                    _reset_work_pool()
+                fx.barrier()
+        elif compact_owner:
             next_parity_lane = fx.Int32(0)
             launch_epoch_lane = fx.Int32(0)
             if tid == fx.Int32(0):
@@ -298,10 +332,7 @@ def compile_mega_moe_stage1(
                     )
                     comm_ops.fence_system_acquire()
             if tid == fx.Int32(0):
-                work_head_rsrc = _make_buffer_from_addr(a_work_head, fx.Int32)
-                for shard in range_constexpr(8):
-                    _buffer_store(work_head_rsrc, fx.Int32(shard * 16), fx.Int32(0), fx.Int32)
-                _buffer_store(_make_buffer_from_addr(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
+                _reset_work_pool()
                 if const_expr(external_grouping or direct_fixed_slot):
                     group_done_rsrc = _make_buffer_from_addr(a_group_done, fx.Int32)
                     for destination in range_constexpr(fz_npes if direct_fixed_slot else 1):
@@ -322,8 +353,9 @@ def compile_mega_moe_stage1(
                 comm_ops.fence_agent_acquire()
             fx.barrier()
 
-        payload_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
-        payload_expected = _buffer_load(expected_rsrc, payload_parity, fx.Int32, cache_modifier=_SC0_CACHE)
+        if const_expr(not gate_free):
+            payload_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
+            payload_expected = _buffer_load(expected_rsrc, payload_parity, fx.Int32, cache_modifier=_SC0_CACHE)
 
         if compact_owner:  # noqa: SIM102 - keep the device and compile-time branches separate.
             if const_expr(not direct_fixed_slot):
@@ -346,7 +378,7 @@ def compile_mega_moe_stage1(
                     fz_scale_n_i32=fz_scale_n_i32, fz_enable_scales=fz_enable_scales, addr_disp=addr_disp,
                     addr_in_tok=addr_in_tok, addr_in_idx=addr_in_idx, addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc,
                     i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
-                    parity=payload_parity, expected=payload_expected,
+                    parity=payload_parity, expected=payload_expected, reset_group_done=gate_free,
                 )
             else:
                 if const_expr(external_grouping):
@@ -397,7 +429,9 @@ def compile_mega_moe_stage1(
                 emit_direct_fixed_slot_finalize(
                     fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
                     fz_tile_m=fz_tile_m, n_tiles=N_TILES, addr_disp=addr_disp, parity=payload_parity,
-                    expected=payload_expected,
+                    expected=payload_expected, num_waves=NUM_WAVES,
+                    ready_slot=grid_epoch_slot if gate_free else None, ready_epoch=gate_epoch,
+                    dense_plan=dense_plan,
                 )
         else:
             payload_table = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.P2P_PAYLOAD_READY)), fx.Int64)
@@ -466,9 +500,14 @@ def compile_mega_moe_stage1(
 
         if tid == fx.Int32(0):
             local_plan_ready = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.PLAN_READY)), fx.Int64)
-            ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+            if const_expr(gate_free):
+                ready_index = fx.Int32(grid_epoch_slot)
+                ready_epoch = gate_epoch
+            else:
+                ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
+                ready_epoch = payload_expected
             mori_shmem.int32_wait_until_equals(
-                local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), payload_expected)
+                local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), ready_epoch)
             if const_expr(direct_fixed_slot):
                 # Peers publish the payload with system-scope releases. Fixed slots
                 # are complete once the plan lands, so acquire once per block instead
@@ -533,6 +572,13 @@ def compile_mega_moe_stage1(
                     comm_ops.fence_system_acquire()
                 _do_scheduled_tile(work)
             consumer_active = has_work != fx.Int32(0)
+
+        if const_expr(gate_free):  # noqa: SIM102 - keep the device and compile-time branches separate.
+            # Publish the next launch's epoch only once the owner has retired: by then
+            # every producer has long read it, and no consumer ever does.
+            if compact_owner:
+                if tid == fx.Int32(0):
+                    _buffer_store(expected_rsrc, fx.Int32(0), payload_expected, fx.Int32)
 
     @flyc.jit
     def launch(
