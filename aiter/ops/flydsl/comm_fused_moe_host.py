@@ -513,6 +513,7 @@ class _AtomicRunner:
                 ptr_arg(self.partial),
                 fx.Int64(self.partial_flat_base),
                 ptr_arg(self.output),
+                self.rank,
                 stream,
             )
             return self.output

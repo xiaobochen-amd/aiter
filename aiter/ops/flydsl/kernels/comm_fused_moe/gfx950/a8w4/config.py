@@ -7,13 +7,16 @@ BLOCK = 256
 SLOTS = 2
 PRODUCER_COUNTER_STRIDE = 64
 
-# Threads per block in the full-reduce kernel, which runs one work item per
-# thread. Every block rendezvouses with its counterpart on each TP peer, so a
-# wide block buys a cheaper collective rather than a busier one: it covers the
-# work with fewer blocks, and each block that drops out is three fewer remote
-# flags being polled. Measured at m=64, 128 threads costs 1.3us over 512, and
-# 1024 recovers nothing further.
-REDUCE_BLOCK = 512
+# Full-reduce geometry: the widest block up to REDUCE_BLOCK that still splits
+# the work into whole blocks, at least REDUCE_BLOCKS of them, one item per
+# thread. Wider blocks mean fewer rendezvous participants and, because a row
+# of the payload is 384 items, blocks that cover whole rows -- which is what
+# makes a peer's window arrive as one contiguous burst. Measured at m=64
+# (fused us, one item per thread throughout): 384 threads/64 blocks 93.0,
+# 768/32 93.3, 1024/24 93.5, 256/96 93.4, 128/192 93.9, 512/48 94.3; halving
+# the thread count to 2 items per thread costs 2 us on top.
+REDUCE_BLOCK = 384
+REDUCE_BLOCKS = 24
 
 # One in-kernel rendezvous flag per block per collective phase, spread over
 # separate cache lines so peers spinning on them do not share a line with a

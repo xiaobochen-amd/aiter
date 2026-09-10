@@ -14,6 +14,8 @@ from .collectives import (
     decode_scaled_fp8_f32,
     e8m0_scale,
     emit_block_rendezvous,
+    emit_rendezvous_acquire,
+    emit_rendezvous_publish,
     load_bf16,
     load_buffer,
     load_e8m0_scale,
@@ -24,7 +26,13 @@ from .collectives import (
     store_buffer,
     store_fp8_words,
 )
-from .config import BLOCK, REDUCE_BLOCK, RENDEZVOUS_FLAG_SLOTS, AtomicConfig
+from .config import (
+    BLOCK,
+    REDUCE_BLOCK,
+    REDUCE_BLOCKS,
+    RENDEZVOUS_FLAG_SLOTS,
+    AtomicConfig,
+)
 
 VECTOR_WIDTH = 16
 QUANT_BLOCK = 256
@@ -106,46 +114,47 @@ def _emit_quantize_chunk(config, local, shared, partial, token, column, zero_loc
         )
 
 
-@flyc.jit
-def _emit_reduce_chunk(config, partial_base, output, token, group, column):
-    """Sum one VECTOR_WIDTH chunk across every TP peer into the BF16 output."""
-    shape = config.shape
-    h = shape.model_dim
-    groups_per_row = h // 32
-    acc = fx.Vector.filled(VECTOR_WIDTH, 0.0, fx.Float32)
-    for source_round in range_constexpr(shape.tp_size):
-        # Stagger the peer order by token so the ranks do not all hit the same
-        # peer's window in the same cycle.
-        source = (token + fx.Int32(source_round)) % fx.Int32(shape.tp_size)
-        source_base = peer_base(partial_base, source)
-        source_row = buffer_tensor_from_addr(
-            source_base + fx.Int64(token) * fx.Int64(h),
-            fx.Int32,
-            h,
-        )
-        words = load_fp8_words(
-            source_row,
-            column // fx.Int32(4),
-            word_count=VECTOR_WIDTH // 4,
-            load_width=4,
-            cache_modifier=0,
-        )
-        scale_row = buffer_tensor_from_addr(
-            source_base
-            + fx.Int64(config.m * h)
-            + fx.Int64(token) * fx.Int64(groups_per_row),
-            fx.Int8,
-            groups_per_row,
-        )
-        values = decode_scaled_fp8_f32(words, load_e8m0_scale(scale_row, group, 0))
-        acc = acc + fx.Vector.from_elements(values, fx.Float32)
+def _emit_peer_rotation(shape, rank, row, source_round):
+    """Name one peer, rotated by row and by rank.
 
-    output_row = buffer_tensor_from_addr(
-        fx.Int64(ptrtoint(output)) + fx.Int64(token) * fx.Int64(h * 2),
-        fx.BFloat16,
-        h * 2,
+    Rotating by row keeps the waves that share a row reading one contiguous
+    stretch of a single peer's window, and rotating by rank on top keeps the
+    ranks from all starting on the same peer.
+    """
+    peers = shape.tp_size - 1
+    slot = row % fx.Int32(peers) + fx.Int32(source_round)
+    slot = (slot >= fx.Int32(peers)).select(slot - fx.Int32(peers), slot)
+    source = rank + fx.Int32(1) + slot
+    return (source >= fx.Int32(shape.tp_size)).select(
+        source - fx.Int32(shape.tp_size), source
     )
-    store_bf16(output_row, column, acc, VECTOR_WIDTH)
+
+
+def _emit_source_chunk(config, source_base, row, group, column, cache_modifier):
+    """Decode one VECTOR_WIDTH chunk of one row out of one rank's window."""
+    h = config.shape.model_dim
+    groups_per_row = h // 32
+    source_row = buffer_tensor_from_addr(
+        source_base + fx.Int64(row) * fx.Int64(h),
+        fx.Int32,
+        h,
+    )
+    words = load_fp8_words(
+        source_row,
+        column // fx.Int32(4),
+        word_count=VECTOR_WIDTH // 4,
+        load_width=4,
+        cache_modifier=cache_modifier,
+    )
+    scale_row = buffer_tensor_from_addr(
+        source_base + fx.Int64(config.m * h) + fx.Int64(row) * fx.Int64(groups_per_row),
+        fx.Int8,
+        groups_per_row,
+    )
+    values = decode_scaled_fp8_f32(
+        words, load_e8m0_scale(scale_row, group, cache_modifier)
+    )
+    return fx.Vector.from_elements(values, fx.Float32)
 
 
 @functools.cache
@@ -166,7 +175,8 @@ def compile_quantize(config: AtomicConfig, zero_local: bool):
     @flyc.kernel(
         name=(
             f"gemm2_tp_atomic_pipeline_{shape.tag}_m{m}_quant_add_shared"
-            f"{'_zero_local' if zero_local else ''}_v16_b256"
+            f"{'_zero_local' if zero_local else ''}"
+            f"_v{VECTOR_WIDTH}_b{QUANT_BLOCK}"
         ),
         known_block_size=[QUANT_BLOCK, 1, 1],
     )
@@ -201,26 +211,33 @@ def compile_full_reduce(config: AtomicConfig):
     ``tp-1`` times more peer bytes than the sharded pair, which only pays off
     while the launches dominate the byte traffic -- see ``use_full_reduce``.
 
-    The kernel opens with the per-block rendezvous that replaces the epoch
-    barrier launch. The quantize launch that produced the partials has already
-    released them, so this rendezvous only has to exchange flags.
+    The per-block rendezvous that replaces the epoch barrier launch is split
+    around this rank's own quarter of the reduction: the quantize launch that
+    produced the partials has already released them, so the flag only guards
+    the peers, and the wait is worth whatever the peers are still doing.
     """
     shape = config.shape
-    groups_per_row = shape.model_dim // 32
+    h = shape.model_dim
+    groups_per_row = h // 32
     packs_per_group = 32 // VECTOR_WIDTH
-    grid = _rendezvous_grid(config, REDUCE_BLOCK)
+    block, grid = _rendezvous_geometry(config.m * groups_per_row * packs_per_group)
     flag_offset = config.block_flag_offset(0)
 
     @flyc.kernel(
         name=(
             f"gemm2_tp_atomic_pipeline_{shape.tag}_m{config.m}"
-            f"_full_reduce_rendezvous_g{grid}_b{REDUCE_BLOCK}"
+            f"_full_reduce_rendezvous_g{grid}_b{block}"
         ),
-        known_block_size=[REDUCE_BLOCK, 1, 1],
+        known_block_size=[block, 1, 1],
     )
-    def kernel(partial: fx.Pointer, partial_base: fx.Int64, output: fx.Pointer):
-        emit_block_rendezvous(partial, partial_base, flag_offset, shape.tp_size)
-        item = fx.Int32(gpu.block_id("x")) * fx.Int32(REDUCE_BLOCK) + fx.Int32(
+    def kernel(
+        partial: fx.Pointer,
+        partial_base: fx.Int64,
+        output: fx.Pointer,
+        rank: fx.Int32,
+    ):
+        epoch = emit_rendezvous_publish(partial, flag_offset, shape.tp_size)
+        item = fx.Int32(gpu.block_id("x")) * fx.Int32(block) + fx.Int32(
             gpu.thread_id("x")
         )
         group_item = item // fx.Int32(packs_per_group)
@@ -228,40 +245,65 @@ def compile_full_reduce(config: AtomicConfig):
         token = group_item // fx.Int32(groups_per_row)
         group = group_item - token * fx.Int32(groups_per_row)
         column = group * fx.Int32(32) + pack_in_group * fx.Int32(VECTOR_WIDTH)
-        _emit_reduce_chunk(config, partial_base, output, token, group, column)
+
+        # This rank's own window is released by the launch that wrote it, so
+        # folding it in here spends the peers' remaining quantize time on a
+        # quarter of the reduction instead of on the spin.
+        acc = _emit_source_chunk(
+            config, fx.Int64(ptrtoint(partial)), token, group, column, 0
+        )
+        emit_rendezvous_acquire(partial_base, flag_offset, epoch, shape.tp_size)
+
+        for source_round in range_constexpr(shape.tp_size - 1):
+            source = _emit_peer_rotation(shape, rank, token, source_round)
+            acc = acc + _emit_source_chunk(
+                config, peer_base(partial_base, source), token, group, column, 0
+            )
+
+        output_row = buffer_tensor_from_addr(
+            fx.Int64(ptrtoint(output)) + fx.Int64(token) * fx.Int64(h * 2),
+            fx.BFloat16,
+            h * 2,
+        )
+        store_bf16(output_row, column, acc, VECTOR_WIDTH)
 
     @flyc.jit
-    def launch(partial, partial_base, output, stream):
-        kernel(partial, partial_base, output).launch(
+    def launch(partial, partial_base, output, rank, stream):
+        kernel(partial, partial_base, output, rank).launch(
             grid=(grid, 1, 1),
-            block=(REDUCE_BLOCK, 1, 1),
+            block=(block, 1, 1),
             stream=stream,
         )
 
     return launch
 
 
-def _rendezvous_grid(config: AtomicConfig, block: int) -> int:
-    """Blocks for a rendezvous kernel: one work item per thread, no tail.
+def _rendezvous_geometry(work_items: int) -> tuple[int, int]:
+    """Pick the (block, grid) shape of a rendezvous collective.
 
     A pairwise rendezvous pairs block ``b`` with block ``b`` of the peers, so
     the grid has to cover the work exactly and stay inside the reserved flags.
+    Covering it exactly is also what lets a caller split the wait around its
+    rank-local share, which needs the accumulator to live in registers across
+    the wait. Peer flag traffic scales with the grid while the payload reads
+    do not, so the widest block that still leaves ``REDUCE_BLOCKS`` blocks
+    wins, one item per thread.
     """
-    groups_per_row = config.shape.model_dim // 32
-    packs_per_group = 32 // VECTOR_WIDTH
-    work_items = config.m * groups_per_row * packs_per_group
-    if work_items % block:
+    for block in range(REDUCE_BLOCK, 0, -64):
+        if work_items % block == 0 and work_items // block >= REDUCE_BLOCKS:
+            break
+    else:
         raise ValueError(
-            f"{work_items} work items for m={config.m} do not fill whole "
-            f"blocks of {block}"
+            f"no block of at most {REDUCE_BLOCK} threads splits {work_items} "
+            f"work items into {REDUCE_BLOCKS} whole blocks"
         )
     grid = work_items // block
     if grid > RENDEZVOUS_FLAG_SLOTS:
         raise ValueError(
-            f"m={config.m} needs {grid} rendezvous flags, only "
+            f"{work_items} work items need {grid} rendezvous flags, only "
             f"{RENDEZVOUS_FLAG_SLOTS} are reserved"
         )
-    return grid
+    return block, grid
 
 
 @functools.cache
@@ -315,30 +357,14 @@ def compile_reduce_scatter(config: AtomicConfig):
                 source = (rank + local_token + fx.Int32(source_round)) % fx.Int32(
                     shape.tp_size
                 )
-                source_base = peer_base(partial_base, source)
-                source_row = buffer_tensor_from_addr(
-                    source_base + fx.Int64(global_token) * fx.Int64(h),
-                    fx.Int32,
-                    h,
+                acc = acc + _emit_source_chunk(
+                    config,
+                    peer_base(partial_base, source),
+                    global_token,
+                    group,
+                    column,
+                    2,
                 )
-                words = load_fp8_words(
-                    source_row,
-                    column // fx.Int32(4),
-                    word_count=VECTOR_WIDTH // 4,
-                    load_width=4,
-                    cache_modifier=2,
-                )
-                scale_row = buffer_tensor_from_addr(
-                    source_base
-                    + fx.Int64(config.m * h)
-                    + fx.Int64(global_token) * fx.Int64(groups_per_row),
-                    fx.Int8,
-                    groups_per_row,
-                )
-                values = decode_scaled_fp8_f32(
-                    words, load_e8m0_scale(scale_row, group, 2)
-                )
-                acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
             local_max = fx.Float32(1e-10).maximumf(
                 fmath.absf(acc).reduce(ReductionOp.MAX)

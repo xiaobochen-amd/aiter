@@ -147,6 +147,41 @@ def compile_epoch_barrier(tp_size: int):
     return flyc.jit(launch)
 
 
+def _rendezvous_slot(flag_offset):
+    return fx.Int64(flag_offset) + fx.Int64(gpu.block_id("x")) * fx.Int64(
+        RENDEZVOUS_FLAG_STRIDE
+    )
+
+
+@flyc.jit
+def emit_rendezvous_publish(partial, flag_offset, tp_size):
+    """Publish this block's epoch and return the one its peers will reach.
+
+    Split from the acquire so a caller can spend the peers' remaining time on
+    its own window, which no flag guards: see ``emit_block_rendezvous`` for
+    the protocol this is half of.
+    """
+    tid = fx.Int32(gpu.thread_id("x"))
+    epoch = fx.Int32(0)
+    if tid < fx.Int32(tp_size):
+        local_flag = fx.Int64(ptrtoint(partial)) + _rendezvous_slot(flag_offset)
+        epoch = fx.Int32(comm_ops.load_i32_global_system(local_flag)) + fx.Int32(1)
+        if tid == fx.Int32(0):
+            comm_ops.store_i32_global_system_monotonic(local_flag, epoch)
+    return epoch
+
+
+@flyc.jit
+def emit_rendezvous_acquire(partial_base, flag_offset, epoch, tp_size):
+    """Wait for every TP peer to publish ``epoch`` on this block's flag."""
+    tid = fx.Int32(gpu.thread_id("x"))
+    if tid < fx.Int32(tp_size):
+        comm_ops.spin_until_ge_i32_system(
+            peer_base(partial_base, tid) + _rendezvous_slot(flag_offset), epoch
+        )
+    gpu.barrier()
+
+
 @flyc.jit
 def emit_block_rendezvous(partial, partial_base, flag_offset, tp_size):
     """Rendezvous block ``b`` with block ``b`` of every TP peer, in kernel.
@@ -167,17 +202,12 @@ def emit_block_rendezvous(partial, partial_base, flag_offset, tp_size):
     the protocol inside wave 0 where wave program order already puts the read
     of the previous epoch ahead of the write.
     """
-    tid = fx.Int32(gpu.thread_id("x"))
-    slot = fx.Int64(flag_offset) + fx.Int64(gpu.block_id("x")) * fx.Int64(
-        RENDEZVOUS_FLAG_STRIDE
+    emit_rendezvous_acquire(
+        partial_base,
+        flag_offset,
+        emit_rendezvous_publish(partial, flag_offset, tp_size),
+        tp_size,
     )
-    if tid < fx.Int32(tp_size):
-        local_flag = fx.Int64(ptrtoint(partial)) + slot
-        epoch = fx.Int32(comm_ops.load_i32_global_system(local_flag)) + fx.Int32(1)
-        if tid == fx.Int32(0):
-            comm_ops.store_i32_global_system_monotonic(local_flag, epoch)
-        comm_ops.spin_until_ge_i32_system(peer_base(partial_base, tid) + slot, epoch)
-    gpu.barrier()
 
 
 def e8m0_scale(local_max):
