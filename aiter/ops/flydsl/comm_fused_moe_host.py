@@ -442,18 +442,29 @@ class _AtomicRunner:
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
         shape = config.shape
-        self.partial_ready = config.m * (shape.model_dim + shape.model_dim // 32)
+        self.partial_ready = config.ready_offset
         self.reduced_ready = config.shard_rows * shape.model_dim
         sizes = (
-            (self.partial_ready + 8 + 255) // 256 * 256,
+            config.partial_bytes,
             (self.reduced_ready + 8 + 255) // 256 * 256,
             config.shard_rows * (shape.model_dim // 32),
         )
         self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
         self.partial, self.reduced_payload, self.reduced_scale = tensors
-        self.partial[self.partial_ready : self.partial_ready + 8].zero_()
+        # Epoch flag plus the collectives' per-block rendezvous flags; they are
+        # monotonic counters, so they only get cleared here.
+        self.partial[self.partial_ready :].zero_()
         self.reduced_payload[self.reduced_ready : self.reduced_ready + 8].zero_()
         self.output = torch.empty(
+            (config.m, shape.model_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        # Stage2 accumulation target, kept apart from `output` because the
+        # collectives overwrite every row of `output`. Zeroed once here; the
+        # quantize kernel clears it again as it reads, so an atomic-scatter
+        # stage2 never needs its accumulator re-seeded from the host.
+        self.accum = torch.zeros(
             (config.m, shape.model_dim),
             dtype=torch.bfloat16,
             device=self.device,
@@ -479,32 +490,35 @@ class _AtomicRunner:
         ordinary_stage2,
     ):
         config = self.config
-        add_shared = stage2_uses_route_reduce(ordinary_stage2)
-        if not add_shared:
-            self.output.copy_(shared_partial)
+        # An atomic-scatter stage2 adds into its output buffer, a route-reduce
+        # one overwrites it; only the former needs quantize to clear `accum`.
+        zero_local = not stage2_uses_route_reduce(ordinary_stage2)
         ordinary_stage2(
             *stage2_args[:6],
-            self.output,
+            self.accum,
             *stage2_args[7:],
             **stage2_kwargs,
         )
         stream = torch.cuda.current_stream(self.device)
         _run_compiled(
-            atomic.compile_quantize(config, add_shared),
-            ptr_arg(self.output),
+            atomic.compile_quantize(config, zero_local),
+            ptr_arg(self.accum),
             ptr_arg(shared_partial),
             ptr_arg(self.partial),
             stream,
         )
-        _barrier(
-            self.partial,
-            self.partial_flat_base,
-            self.partial_ready,
-            config.shape.tp_size,
-            stream,
-        )
+        if config.use_full_reduce:
+            _run_compiled(
+                atomic.compile_full_reduce(config),
+                ptr_arg(self.partial),
+                fx.Int64(self.partial_flat_base),
+                ptr_arg(self.output),
+                stream,
+            )
+            return self.output
         _run_compiled(
             atomic.compile_reduce_scatter(config),
+            ptr_arg(self.partial),
             fx.Int64(self.partial_flat_base),
             ptr_arg(self.reduced_shard),
             ptr_arg(self.reduced_payload),
@@ -512,15 +526,10 @@ class _AtomicRunner:
             self.rank,
             stream,
         )
-        _barrier(
-            self.reduced_payload,
-            self.reduced_payload_base,
-            self.reduced_ready,
-            config.shape.tp_size,
-            stream,
-        )
         _run_compiled(
             atomic.compile_all_gather(config),
+            ptr_arg(self.partial),
+            fx.Int64(self.partial_flat_base),
             fx.Int64(self.reduced_payload_base),
             fx.Int64(self.reduced_scale_base),
             ptr_arg(self.output),

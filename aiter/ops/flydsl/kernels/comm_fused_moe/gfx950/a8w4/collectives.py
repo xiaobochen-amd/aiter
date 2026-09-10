@@ -12,6 +12,7 @@ from flydsl.expr.typing import ReductionOp, T, as_ir_value
 from .... import communication_ops_utils as comm_ops
 from ....mxfp4_gemm_common import global_typed_ptr
 from ....tensor_shim import ptr_buf_tensor
+from .config import RENDEZVOUS_FLAG_STRIDE
 
 FLAT_VA_RANK_STRIDE = 1 << 32
 
@@ -144,6 +145,39 @@ def compile_epoch_barrier(tp_size: int):
 
     launch.__name__ = f"launch_comm_fused_moe_epoch_tp{tp_size}"
     return flyc.jit(launch)
+
+
+@flyc.jit
+def emit_block_rendezvous(partial, partial_base, flag_offset, tp_size):
+    """Rendezvous block ``b`` with block ``b`` of every TP peer, in kernel.
+
+    This replaces a separate epoch-barrier launch at the head of a collective
+    kernel. Reaching the kernel already means the launch that produced this
+    rank's payload retired, and an end-of-kernel release is system scoped, so
+    the peers only need the flag itself -- no cache maintenance belongs here.
+    For the same reason no acquire is needed on the other side: the launch's
+    own acquire is the last thing that could have pulled a peer line into this
+    L2, and no block touches a peer window before its rendezvous.
+
+    Each block owns a flag word per rank and waits only on the same block
+    index of the peers, never on another block of its own grid, so the wait
+    carries no grid-residency requirement -- and because the flag is published
+    before the wait, a grid that does not fit simply drains in waves. The flag
+    doubles as the block's epoch counter; only lane 0 writes it, which keeps
+    the protocol inside wave 0 where wave program order already puts the read
+    of the previous epoch ahead of the write.
+    """
+    tid = fx.Int32(gpu.thread_id("x"))
+    slot = fx.Int64(flag_offset) + fx.Int64(gpu.block_id("x")) * fx.Int64(
+        RENDEZVOUS_FLAG_STRIDE
+    )
+    if tid < fx.Int32(tp_size):
+        local_flag = fx.Int64(ptrtoint(partial)) + slot
+        epoch = fx.Int32(comm_ops.load_i32_global_system(local_flag)) + fx.Int32(1)
+        if tid == fx.Int32(0):
+            comm_ops.store_i32_global_system_monotonic(local_flag, epoch)
+        comm_ops.spin_until_ge_i32_system(peer_base(partial_base, tid) + slot, epoch)
+    gpu.barrier()
 
 
 def e8m0_scale(local_max):

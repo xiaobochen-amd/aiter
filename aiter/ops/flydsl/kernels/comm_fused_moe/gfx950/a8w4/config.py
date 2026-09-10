@@ -7,6 +7,22 @@ BLOCK = 256
 SLOTS = 2
 PRODUCER_COUNTER_STRIDE = 64
 
+# Threads per block in the full-reduce kernel, which runs one work item per
+# thread. Every block rendezvouses with its counterpart on each TP peer, so a
+# wide block buys a cheaper collective rather than a busier one: it covers the
+# work with fewer blocks, and each block that drops out is three fewer remote
+# flags being polled. Measured at m=64, 128 threads costs 1.3us over 512, and
+# 1024 recovers nothing further.
+REDUCE_BLOCK = 512
+
+# One in-kernel rendezvous flag per block per collective phase, spread over
+# separate cache lines so peers spinning on them do not share a line with a
+# neighbour. Two phases cover the longest pipeline (reduce-scatter, then
+# all-gather); the flags are epoch counters, so each phase needs its own.
+RENDEZVOUS_FLAG_SLOTS = 256
+RENDEZVOUS_FLAG_STRIDE = PRODUCER_COUNTER_STRIDE
+RENDEZVOUS_PHASES = 2
+
 SUPPORTED_TP_SIZES = (2, 4, 8)
 
 
@@ -420,21 +436,58 @@ class AtomicConfig:
             raise ValueError(
                 f"m={self.m} must be a positive multiple of " f"TP={self.shape.tp_size}"
             )
-        if self.reduce_scatter_grid <= 0:
+        if not 0 < self.reduce_scatter_grid <= RENDEZVOUS_FLAG_SLOTS:
             raise ValueError(
-                "reduce_scatter_grid must be positive, got "
-                f"{self.reduce_scatter_grid}"
+                "reduce_scatter_grid must be positive and at most "
+                f"{RENDEZVOUS_FLAG_SLOTS}, got {self.reduce_scatter_grid}"
             )
         source_count = self.shape.tp_size - 1
-        if self.all_gather_grid < source_count or self.all_gather_grid % source_count:
+        if (
+            self.all_gather_grid < source_count
+            or self.all_gather_grid % source_count
+            or self.all_gather_grid > RENDEZVOUS_FLAG_SLOTS
+        ):
             raise ValueError(
-                "all_gather_grid must be a positive multiple of TP-1, got "
+                "all_gather_grid must be a multiple of TP-1 in "
+                f"(0, {RENDEZVOUS_FLAG_SLOTS}], got "
                 f"all_gather_grid={self.all_gather_grid}, TP={self.shape.tp_size}"
             )
 
     @property
     def shard_rows(self) -> int:
         return self.m // self.shape.tp_size
+
+    @property
+    def use_full_reduce(self) -> bool:
+        """Collapse reduce-scatter + all-gather into one full-reduce launch.
+
+        The pair halves the peer bytes but costs a second launch and a second
+        rendezvous. Measured on GLM-5.2 TP4/EP4 the two are within half a
+        microsecond at m=64, where the single kernel is still ahead, and the
+        pair pulls clear from m=96 up as the bytes start to dominate.
+        """
+        return self.m <= 64
+
+    @property
+    def ready_offset(self) -> int:
+        """Byte offset of the epoch flag that follows the MXFP8 partial."""
+        model_dim = self.shape.model_dim
+        return self.m * (model_dim + model_dim // 32)
+
+    def block_flag_offset(self, phase: int) -> int:
+        """Byte offset of one collective phase's per-block rendezvous flags."""
+        if not 0 <= phase < RENDEZVOUS_PHASES:
+            raise ValueError(f"rendezvous phase must be in [0, 2), got {phase}")
+        base = _align_up(self.ready_offset + 8, RENDEZVOUS_FLAG_STRIDE)
+        return base + phase * RENDEZVOUS_FLAG_SLOTS * RENDEZVOUS_FLAG_STRIDE
+
+    @property
+    def partial_bytes(self) -> int:
+        return _align_up(
+            self.block_flag_offset(RENDEZVOUS_PHASES - 1)
+            + RENDEZVOUS_FLAG_SLOTS * RENDEZVOUS_FLAG_STRIDE,
+            256,
+        )
 
 
 @dataclass(frozen=True)
