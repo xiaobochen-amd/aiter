@@ -398,3 +398,77 @@ class STensor(TensorBase):
             vec_t = T.vec(1, self.dtype)
             vec = vector.from_elements(vec_t, [value])
             vector.store(vec, self.memptr, [offset], alignment=16)
+
+
+# --- buffer-resource views, ported verbatim from the upstream tensor_shim ---
+# comm_fused_moe addresses its symmetric windows through these. Appended rather
+# than taken with the whole upstream file because that rewrite drops STensor,
+# which this tree's mega_moe still uses.
+BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
+
+
+def buf_base_i64(base):
+    """i64 base address of *base*: an fx pointer, a tensor/memref, or an address.
+
+    Lets a caller narrow a descriptor to one row (``ptr + row * row_bytes``)
+    without first materialising a pointer for it.
+    """
+    raw = extract_to_ir_values(base)[0]
+    if str(raw.type).startswith(("!fly.ptr", "!llvm.ptr")):
+        return fx.Int64(ptrtoint(base))
+    if isinstance(raw.type, (ir.IntegerType, ir.IndexType)):
+        return fx.Int64(base)
+    # tensor / memref kernel arg: take its aligned base pointer.
+    aligned = fly.extract_aligned_pointer_as_index(ir.Type.parse("!llvm.ptr<1>"), raw)
+    return fx.Int64(llvm.PtrToIntOp(T.i64, aligned).result)
+
+
+def ptr_buf_tensor(
+    ptr,
+    elem=fx.Int32,
+    n=BUF_VIEW_MAX_ELEMS,
+    unit_elems=1,
+    num_records_bytes=None,
+    unit_stride=None,
+):
+    """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
+
+    *ptr* is an fx.Pointer kernel arg or a raw i64 address (see
+    :func:`buf_base_i64`).
+
+    Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
+    per access. Indexing a plain typed pointer instead builds a full 64-bit
+    address in VGPRs on every access.
+
+    ``unit_elems`` sets the access width and hence the rank:
+      1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
+      >1 -> ``(n, unit_elems)``; ``fx.slice(t, (u, None))`` is one wide access
+            and ``fx.copy`` over it emits a single ``buffer_load_dwordx{2,4}``.
+            A vector *element type* would be the obvious spelling for this but
+            MLIR rejects it (``AlignAttr`` takes integer/float only), so the
+            width lives in the layout.
+
+    ``unit_stride`` is the element distance between consecutive units and
+    defaults to ``unit_elems`` (units tile the buffer, so ``u`` counts whole
+    units). Pass 1 for a wide access at an arbitrary *element* offset: units
+    then overlap -- meaningless to iterate but exact for the one slice a caller
+    takes, and the only way to express e.g. a dwordx4 store at a row base that
+    is only dword-aligned. It also sets the pointer alignment, which is all such
+    an access can rely on.
+
+    ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
+    zero-fills rather than reading stale bytes.
+    """
+    unit_stride = unit_elems if unit_stride is None else unit_stride
+    layout = (
+        fx.make_layout((n,), (1,))
+        if unit_elems == 1
+        else fx.make_layout((n, unit_elems), (unit_stride, 1))
+    )
+    pt = fx.PointerType.get(
+        elem.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=unit_stride * (elem.width // 8),
+    )
+    view = fx.make_view(fx.inttoptr(pt, buf_base_i64(ptr)), layout)
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
