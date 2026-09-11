@@ -15,13 +15,34 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
 
+# gfx950 (MI355X); _validate_sparse_decode_inputs already gates the arch, and
+# sparse_mla_decode_workspace_shape is a pure sizing helper with no device to
+# query, so the CU count has to be a constant here.
+_NUM_CU = 256
+
+
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
 
-    Merge adjacent 64-key tiles only while the reduced producer grid still has
-    enough CTAs to cover the GPU. This keeps small decode batches on the
-    lower-latency one-tile path and lets wide/large decode cases reduce scratch
-    traffic and combine work without a shape whitelist.
+    Each producer CTA is one wavefront handling `inner_iter` 64-key tiles, so
+    the grid is `seq * (ng_total // inner_iter)` CTAs and its cost is dominated
+    by how the *last* scheduling wave quantises onto the CU array -- a tail
+    effect, not the monotonic "more CTAs is better" the previous threshold
+    assumed. Measured at topk=2048 on MI355X, inner_iter 2 vs 4 swings either
+    way purely on where that tail lands:
+
+        seq  ctas(ii4)  util ii4 -> ii2   measured ii2 vs ii4
+         48        384   0.75 -> 1.00           -2.94%
+         60        480   0.94 -> 0.94           +9.33%
+         72        576   0.75 -> 0.90           -7.15%
+         84        672   0.88 -> 0.88           +7.31%
+         96        768   1.00 -> 1.00           +3.23%
+
+    Picking the best tail utilisation and breaking ties toward the *larger*
+    grouping -- fewer partials also means a cheaper combine, measured at
+    +0.32 us per doubling of the split count -- reproduces all five. The old
+    `min_producer_ctas` threshold picked inner_iter 4 for every seq >= 48 and so
+    got seq 48 and 72 wrong.
     """
     inner_iter = 1
     while inner_iter < 4:
@@ -32,6 +53,19 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
         if seq * (ng_total // candidate) < min_producer_ctas:
             break
         inner_iter = candidate
+
+    # Only refine the fully-merged case. Below it the grid is still short enough
+    # that raw CTA count dominates and the threshold above is right; here the
+    # grid is several waves deep, so the tail decides. Splitting further is not
+    # free (one more partial per token for the combine), so only take it when
+    # the tail strictly improves -- ties keep the coarser, cheaper grouping.
+    if inner_iter == 4:
+        def _tail_util(groups: int) -> float:
+            ctas = seq * groups
+            return ctas / (-(-ctas // _NUM_CU) * _NUM_CU)
+
+        if _tail_util(ng_total // 2) > _tail_util(ng_total // 4):
+            inner_iter = 2
     return inner_iter
 
 
