@@ -15,8 +15,12 @@ from .collectives import (
     e8m0_scale,
     emit_block_rendezvous,
     emit_rendezvous_acquire,
+    emit_rendezvous_collect,
     emit_rendezvous_epoch,
     emit_rendezvous_mark,
+    emit_rendezvous_peer_signal,
+    emit_rendezvous_signal,
+    emit_rendezvous_wide_epoch,
     load_bf16,
     load_buffer,
     load_e8m0_scale,
@@ -45,6 +49,12 @@ QUANT_BLOCK = 256
 # whole number of cache lines. Splitting below a wave measured 2 us worse at
 # m=64 even though it doubles the grid.
 SHARD_CHUNKS_CHOICES = (64, 128)
+
+# Blocks a shard rendezvous spreads over. Widening it past this shortens the
+# contiguous run each block pulls out of a peer's window, and a shard
+# rendezvous pays more for the shorter burst than it gains from the extra
+# blocks -- measured still true once the flag traffic was taken out of it.
+SHARD_RENDEZVOUS_BLOCKS = 96
 
 # Cache policy for the stores a TP peer reads. The value is the gfx950 CPol
 # field: 1 is sc0, 2 is nt, 16 is sc1, so 17 is the `sc0 sc1` write-through
@@ -397,22 +407,38 @@ def _shard_rendezvous_geometry(config: AtomicConfig) -> tuple[int, int, int, int
     A block owns one column group of one row per shard, so the rows it reduces
     are a quarter of the rows it quantizes and the work stays balanced across
     the grid however the shards are split. That leaves the column split as the
-    only free dimension, and the narrowest one whose grid still fits the
-    reserved flags is the one that keeps the most blocks -- and so the most of
-    each phase's round trip -- in flight.
+    only free dimension: the narrowest one keeps a shard slot down to a single
+    wave, which is what the reduce phase wants, but it also shortens the run
+    each block pulls out of a peer's window, so the split only stays narrow
+    while the grid does. Measured (fused us): m=64 grid 96 89.2-89.6 against
+    grid 48 90.3, m=128 grid 96 94.0-94.4 against grid 192 95.3-97.1.
+
+    Widening a group by giving each lane several chunks instead, so that m=128
+    could hold its grid at 96 with a slot of one wave, measured 94.7-95.2
+    against 93.3-93.8 -- with m=64's geometry untouched at 88.66-88.71 in the
+    same reads. Halving the threads doubles the reduce phase's serial chain of
+    peer read, sum, requantize and publish, and that costs more than aligning
+    the slot to a wave saves. So a chunk stays one per thread.
     """
     chunks_per_row = config.shape.model_dim // VECTOR_WIDTH
-    for shard_chunks in SHARD_CHUNKS_CHOICES:
-        if chunks_per_row % shard_chunks:
-            continue
-        column_groups = chunks_per_row // shard_chunks
-        grid = config.shard_rows * column_groups
-        if grid <= RENDEZVOUS_FLAG_SLOTS:
-            block = config.shape.tp_size * shard_chunks
-            return block, grid, column_groups, shard_chunks
-    raise ValueError(
-        f"m={config.m} model_dim={config.shape.model_dim} has no column split "
-        f"that fits {RENDEZVOUS_FLAG_SLOTS} rendezvous flags"
+    splits = [
+        (config.shard_rows * (chunks_per_row // shard_chunks), shard_chunks)
+        for shard_chunks in SHARD_CHUNKS_CHOICES
+        if chunks_per_row % shard_chunks == 0
+    ]
+    splits = [split for split in splits if split[0] <= RENDEZVOUS_FLAG_SLOTS]
+    if not splits:
+        raise ValueError(
+            f"m={config.m} model_dim={config.shape.model_dim} has no column "
+            f"split that fits {RENDEZVOUS_FLAG_SLOTS} rendezvous flags"
+        )
+    fitting = [split for split in splits if split[0] <= SHARD_RENDEZVOUS_BLOCKS]
+    grid, shard_chunks = max(fitting) if fitting else min(splits)
+    return (
+        config.shape.tp_size * shard_chunks,
+        grid,
+        chunks_per_row // shard_chunks,
+        shard_chunks,
     )
 
 
@@ -498,6 +524,9 @@ def compile_fused_rsag(config: AtomicConfig, zero_local: bool):
     block, grid, column_groups, shard_chunks = _shard_rendezvous_geometry(config)
     publish_flag = config.block_flag_offset(0)
     reduced_flag = config.block_flag_offset(1)
+    # A slot that is exactly one wave owns a whole phase of the chain on its
+    # own, which lets the release drop to wave scope.
+    wave_slot = shard_chunks == 64
 
     @flyc.kernel(
         name=(
@@ -533,8 +562,8 @@ def compile_fused_rsag(config: AtomicConfig, zero_local: bool):
 
         # Neither flag read is ordered, so issuing both up front hides their
         # round trip behind the quantize below.
-        publish_epoch = emit_rendezvous_epoch(partial, publish_flag, tp)
-        reduced_epoch = emit_rendezvous_epoch(partial, reduced_flag, tp)
+        publish_epoch = emit_rendezvous_wide_epoch(partial, publish_flag, rank)
+        reduced_epoch = emit_rendezvous_wide_epoch(partial, reduced_flag, rank)
 
         e8m0, packed = _emit_quantize_values(
             config, local, shared, token, column, False
@@ -548,16 +577,31 @@ def compile_fused_rsag(config: AtomicConfig, zero_local: bool):
             )
 
         # Write-through stores are at the coherence point once they retire, so
-        # draining them is the whole release the peers need.
+        # draining them is the whole release the peers need. A slot publishes
+        # exactly the row the peer of the same index reads, so once a slot is a
+        # whole wave it can drain by itself and release that one peer, with
+        # nothing here waiting on the rest of the block. A wider slot still
+        # lines up first: giving each of its waves its own flag word so that it
+        # would not have to measured no better.
         fx.rocdl.s_waitcnt(0)
-        gpu.barrier()
-        emit_rendezvous_mark(partial, publish_flag, publish_epoch)
+        if const_expr(not wave_slot):
+            gpu.barrier()
+        if lane == fx.Int32(0):
+            emit_rendezvous_peer_signal(
+                partial_base, publish_flag, publish_epoch, rank, slot
+            )
 
         # Reseeding the accumulator is the one thing left that no peer gates,
         # so it goes in the window where the peers are still catching up.
         if const_expr(zero_local):
             _emit_clear_local(config, local, token, column)
-        emit_rendezvous_acquire(partial_base, publish_flag, publish_epoch, tp)
+
+        # The wait stays block wide even though only the reduce slot needs it:
+        # the slots do identical work and reach the flag together, so a barrier
+        # between them is nearly free, and dropping it to wave scope measured a
+        # wash at m=64 (88.68-88.82 against 88.52-88.74). The release above is
+        # the asymmetric half of the pair, which is why only it went per wave.
+        emit_rendezvous_collect(partial, publish_flag, publish_epoch, tp)
 
         if slot == rank:
             acc = _emit_decoded_chunk(e8m0, packed)
@@ -583,11 +627,24 @@ def compile_fused_rsag(config: AtomicConfig, zero_local: bool):
                 _emit_decoded_chunk(reduced_e8m0, reduced_packed),
                 VECTOR_WIDTH,
             )
+            # The reduce slot holds the only stores a peer reads out of this
+            # phase, so when it is a whole wave it drains and releases all of
+            # them, again without the rest of the block having to arrive.
+            if const_expr(wave_slot):
+                fx.rocdl.s_waitcnt(0)
+                if lane < fx.Int32(tp):
+                    emit_rendezvous_peer_signal(
+                        partial_base, reduced_flag, reduced_epoch, rank, lane
+                    )
 
-        fx.rocdl.s_waitcnt(0)
-        gpu.barrier()
-        emit_rendezvous_mark(partial, reduced_flag, reduced_epoch)
-        emit_rendezvous_acquire(partial_base, reduced_flag, reduced_epoch, tp)
+        if const_expr(not wave_slot):
+            # Handing these four to the slot leaders instead measured worse:
+            # nobody is released early once the block has to line up anyway,
+            # and one wave issues the four stores back to back.
+            fx.rocdl.s_waitcnt(0)
+            gpu.barrier()
+            emit_rendezvous_signal(partial_base, reduced_flag, reduced_epoch, rank, tp)
+        emit_rendezvous_collect(partial, reduced_flag, reduced_epoch, tp)
 
         if slot != rank:
             gathered = _emit_reduced_chunk(

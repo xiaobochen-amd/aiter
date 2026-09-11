@@ -153,6 +153,82 @@ def _rendezvous_slot(flag_offset):
     )
 
 
+def _rendezvous_source_slot(flag_offset, source):
+    """Byte offset of the word rank ``source`` signals this block's line on.
+
+    One flag stride holds a word per rank, so a block's whole line arrives in
+    a single cache line and the poll that reads it never leaves this rank.
+    A stride would also fit a word per publishing wave, which would let every
+    wave release its own peers; measured no better than one word per rank, so
+    the line stays per rank and the waves that share a word line up first.
+    """
+    return _rendezvous_slot(flag_offset) + fx.Int64(source) * fx.Int64(4)
+
+
+@flyc.jit
+def emit_rendezvous_wide_epoch(partial, flag_offset, rank):
+    """Read the epoch this block is about to signal, on every thread.
+
+    Whoever signals has to have read the epoch itself. Once the signal is
+    spread over the waves instead of being kept in the leading lanes, the
+    cheapest way to keep that true is to let the whole block read the one
+    word its own rank owns: the lanes of a wave all hit the same address, so
+    it costs one request per wave and it is unordered, hence free to issue
+    ahead of the payload. Confining it to the leading lanes instead measured
+    slower even where that was legal.
+
+    Split from the signal for the same reason as ``emit_rendezvous_epoch``:
+    nothing orders the read, so a caller can issue it ahead of the payload it
+    has to publish first and let the payload hide the load.
+    """
+    return fx.Int32(
+        comm_ops.load_i32_global_system(
+            fx.Int64(ptrtoint(partial)) + _rendezvous_source_slot(flag_offset, rank)
+        )
+    ) + fx.Int32(1)
+
+
+@flyc.jit
+def emit_rendezvous_peer_signal(partial_base, flag_offset, epoch, rank, peer):
+    """Push this block's epoch into one TP peer's copy of its flag line.
+
+    The block-wide form has to drain every wave before any of them may
+    speak, because one signal stands for the whole block's payload. A wave
+    that owns exactly the rows one peer reads can drain on its own instead
+    and release that peer the moment it is done.
+    """
+    comm_ops.store_i32_global_system_monotonic(
+        peer_base(partial_base, peer) + _rendezvous_source_slot(flag_offset, rank),
+        epoch,
+    )
+
+
+@flyc.jit
+def emit_rendezvous_signal(partial_base, flag_offset, epoch, rank, tp_size):
+    """Push this block's epoch into every TP peer's copy of its flag line."""
+    tid = fx.Int32(gpu.thread_id("x"))
+    if tid < fx.Int32(tp_size):
+        emit_rendezvous_peer_signal(partial_base, flag_offset, epoch, rank, tid)
+
+
+@flyc.jit
+def emit_rendezvous_collect(partial, flag_offset, epoch, tp_size):
+    """Wait for every TP peer's signal on this block's own flag line.
+
+    The pull form of this wait spins on the peers' memory, so every block of
+    every rank keeps a read in flight on the same fabric the payload needs.
+    Signalling instead leaves each rank polling only lines it owns, and the
+    peers' epochs arrive one way rather than being fetched.
+    """
+    tid = fx.Int32(gpu.thread_id("x"))
+    if tid < fx.Int32(tp_size):
+        comm_ops.spin_until_ge_i32_system(
+            fx.Int64(ptrtoint(partial)) + _rendezvous_source_slot(flag_offset, tid),
+            epoch,
+        )
+    gpu.barrier()
+
+
 @flyc.jit
 def emit_rendezvous_epoch(partial, flag_offset, tp_size):
     """Read the epoch this block is about to reach, without announcing it.
