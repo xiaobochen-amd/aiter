@@ -154,6 +154,31 @@ def _rendezvous_slot(flag_offset):
 
 
 @flyc.jit
+def emit_rendezvous_epoch(partial, flag_offset, tp_size):
+    """Read the epoch this block is about to reach, without announcing it.
+
+    Split from the announcement so a caller that has to order the publish
+    behind its payload can still issue this load first, where the round trip
+    to the flag hides behind the payload itself.
+    """
+    tid = fx.Int32(gpu.thread_id("x"))
+    epoch = fx.Int32(0)
+    if tid < fx.Int32(tp_size):
+        local_flag = fx.Int64(ptrtoint(partial)) + _rendezvous_slot(flag_offset)
+        epoch = fx.Int32(comm_ops.load_i32_global_system(local_flag)) + fx.Int32(1)
+    return epoch
+
+
+@flyc.jit
+def emit_rendezvous_mark(partial, flag_offset, epoch):
+    """Announce the epoch this block has reached."""
+    if fx.Int32(gpu.thread_id("x")) == fx.Int32(0):
+        comm_ops.store_i32_global_system_monotonic(
+            fx.Int64(ptrtoint(partial)) + _rendezvous_slot(flag_offset), epoch
+        )
+
+
+@flyc.jit
 def emit_rendezvous_publish(partial, flag_offset, tp_size):
     """Publish this block's epoch and return the one its peers will reach.
 
@@ -161,13 +186,8 @@ def emit_rendezvous_publish(partial, flag_offset, tp_size):
     its own window, which no flag guards: see ``emit_block_rendezvous`` for
     the protocol this is half of.
     """
-    tid = fx.Int32(gpu.thread_id("x"))
-    epoch = fx.Int32(0)
-    if tid < fx.Int32(tp_size):
-        local_flag = fx.Int64(ptrtoint(partial)) + _rendezvous_slot(flag_offset)
-        epoch = fx.Int32(comm_ops.load_i32_global_system(local_flag)) + fx.Int32(1)
-        if tid == fx.Int32(0):
-            comm_ops.store_i32_global_system_monotonic(local_flag, epoch)
+    epoch = emit_rendezvous_epoch(partial, flag_offset, tp_size)
+    emit_rendezvous_mark(partial, flag_offset, epoch)
     return epoch
 
 

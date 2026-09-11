@@ -500,16 +500,11 @@ class _AtomicRunner:
             **stage2_kwargs,
         )
         stream = torch.cuda.current_stream(self.device)
-        _run_compiled(
-            atomic.compile_quantize(config, zero_local),
-            ptr_arg(self.accum),
-            ptr_arg(shared_partial),
-            ptr_arg(self.partial),
-            stream,
-        )
         if config.use_full_reduce:
             _run_compiled(
-                atomic.compile_full_reduce(config),
+                atomic.compile_fused_reduce(config, zero_local),
+                ptr_arg(self.accum),
+                ptr_arg(shared_partial),
                 ptr_arg(self.partial),
                 fx.Int64(self.partial_flat_base),
                 ptr_arg(self.output),
@@ -517,6 +512,13 @@ class _AtomicRunner:
                 stream,
             )
             return self.output
+        _run_compiled(
+            atomic.compile_quantize(config, zero_local),
+            ptr_arg(self.accum),
+            ptr_arg(shared_partial),
+            ptr_arg(self.partial),
+            stream,
+        )
         _run_compiled(
             atomic.compile_reduce_scatter(config),
             ptr_arg(self.partial),

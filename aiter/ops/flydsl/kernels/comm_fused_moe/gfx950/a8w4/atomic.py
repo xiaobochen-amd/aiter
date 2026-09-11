@@ -15,7 +15,8 @@ from .collectives import (
     e8m0_scale,
     emit_block_rendezvous,
     emit_rendezvous_acquire,
-    emit_rendezvous_publish,
+    emit_rendezvous_epoch,
+    emit_rendezvous_mark,
     load_bf16,
     load_buffer,
     load_e8m0_scale,
@@ -37,23 +38,39 @@ from .config import (
 VECTOR_WIDTH = 16
 QUANT_BLOCK = 256
 
+# Cache policy for the stores a TP peer reads. The value is the gfx950 CPol
+# field: 1 is sc0, 2 is nt, 16 is sc1, so 17 is the `sc0 sc1` write-through
+# that puts a store at the system coherence point without an L2 writeback.
+PUBLISH_CACHE_MODIFIER = 17
 
-@flyc.jit
-def _emit_quantize_chunk(config, local, shared, partial, token, column, zero_local):
-    """Sum one VECTOR_WIDTH chunk with the shared partial and store it MXFP8."""
-    shape = config.shape
-    h = shape.model_dim
-    groups_per_row = h // 32
-    local_row = buffer_tensor_from_addr(
-        fx.Int64(ptrtoint(local)) + fx.Int64(token) * fx.Int64(h * 2),
+
+def _emit_local_row(pointer, token, h):
+    return buffer_tensor_from_addr(
+        fx.Int64(ptrtoint(pointer)) + fx.Int64(token) * fx.Int64(h * 2),
         fx.BFloat16,
         h * 2,
     )
-    shared_row = buffer_tensor_from_addr(
-        fx.Int64(ptrtoint(shared)) + fx.Int64(token) * fx.Int64(h * 2),
-        fx.BFloat16,
-        h * 2,
+
+
+def _emit_clear_local(config, local, token, column):
+    """Reseed the GEMM's atomic-scatter accumulator, once it has been read.
+
+    The GEMM adds into `local`, so it needs a zeroed target; clearing it from
+    the kernel that consumes it saves a host-side copy per call.
+    """
+    store_bf16(
+        _emit_local_row(local, token, config.shape.model_dim),
+        column,
+        [fx.Float32(0.0) for _ in range_constexpr(VECTOR_WIDTH)],
+        VECTOR_WIDTH,
     )
+
+
+def _emit_quantize_values(config, local, shared, token, column, zero_local):
+    """Sum one VECTOR_WIDTH chunk with the shared partial, MXFP8 it."""
+    h = config.shape.model_dim
+    local_row = _emit_local_row(local, token, h)
+    shared_row = _emit_local_row(shared, token, h)
     values = []
     for chunk in range_constexpr(VECTOR_WIDTH // 8):
         chunk_offset = column + fx.Int32(chunk * 8)
@@ -64,16 +81,8 @@ def _emit_quantize_chunk(config, local, shared, partial, token, column, zero_loc
         loaded = (loaded + shared_values).to(fx.BFloat16).to(fx.Float32)
         values.extend(loaded[element] for element in range_constexpr(8))
 
-    if const_expr(zero_local):
-        # The GEMM scatters into `local` with atomics, so it needs a zeroed
-        # target. Clearing the row here, once it has been read in full, keeps
-        # that invariant without a host-side copy per call.
-        store_bf16(
-            local_row,
-            column,
-            [fx.Float32(0.0) for _ in range_constexpr(VECTOR_WIDTH)],
-            VECTOR_WIDTH,
-        )
+    if zero_local:
+        _emit_clear_local(config, local, token, column)
 
     vector = fx.Vector.from_elements(values, fx.Float32)
     local_max = fx.Float32(1e-10).maximumf(fmath.absf(vector).reduce(ReductionOp.MAX))
@@ -85,8 +94,12 @@ def _emit_quantize_chunk(config, local, shared, partial, token, column, zero_loc
     )
     local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(fx.Float32))
     e8m0, quant_scale = e8m0_scale(local_max)
-    packed = pack_fp8_words(vector, quant_scale, VECTOR_WIDTH // 4)
+    return e8m0, pack_fp8_words(vector, quant_scale, VECTOR_WIDTH // 4)
 
+
+def _emit_publish_payload(config, partial, token, column, packed, cache_modifier):
+    """Store one quantized chunk into this rank's symmetric window."""
+    h = config.shape.model_dim
     payload_row = buffer_tensor_from_addr(
         fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(h),
         fx.Int32,
@@ -97,33 +110,60 @@ def _emit_quantize_chunk(config, local, shared, partial, token, column, zero_loc
         column,
         packed,
         VECTOR_WIDTH // 4,
+        cache_modifier=cache_modifier,
     )
+
+
+def _emit_publish_scale(config, partial, token, column, e8m0, cache_modifier):
+    """Store one MXFP8 group's shared exponent, once per group."""
+    h = config.shape.model_dim
+    groups_per_row = h // 32
+    scale_row = buffer_tensor_from_addr(
+        fx.Int64(ptrtoint(partial))
+        + fx.Int64(config.m * h)
+        + fx.Int64(token) * fx.Int64(groups_per_row),
+        fx.Int8,
+        groups_per_row,
+    )
+    store_buffer(
+        scale_row,
+        column // fx.Int32(32),
+        e8m0.to(fx.Int8),
+        fx.Int8,
+        cache_modifier=cache_modifier,
+    )
+
+
+def _emit_decoded_chunk(e8m0, packed):
+    """Rebuild the values a peer will read back out of a quantized chunk."""
+    scale = (fx.Uint32(e8m0) << fx.Uint32(23)).bitcast(fx.Float32)
+    return fx.Vector.from_elements(
+        decode_scaled_fp8_f32(packed, scale), fx.Float32
+    )
+
+
+@flyc.jit
+def _emit_quantize_chunk(config, local, shared, partial, token, column, zero_local):
+    """Sum one VECTOR_WIDTH chunk with the shared partial and store it MXFP8."""
+    e8m0, packed = _emit_quantize_values(
+        config, local, shared, token, column, zero_local
+    )
+    _emit_publish_payload(config, partial, token, column, packed, 0)
+    lane = fx.Int32(gpu.thread_id("x")) & fx.Int32(63)
     if lane % fx.Int32(32 // VECTOR_WIDTH) == fx.Int32(0):
-        scale_row = buffer_tensor_from_addr(
-            fx.Int64(ptrtoint(partial))
-            + fx.Int64(config.m * h)
-            + fx.Int64(token) * fx.Int64(groups_per_row),
-            fx.Int8,
-            groups_per_row,
-        )
-        store_buffer(
-            scale_row,
-            column // fx.Int32(32),
-            e8m0.to(fx.Int8),
-            fx.Int8,
-        )
+        _emit_publish_scale(config, partial, token, column, e8m0, 0)
 
 
-def _emit_peer_rotation(shape, rank, row, source_round):
-    """Name one peer, rotated by row and by rank.
+def _emit_peer_rotation(shape, rank, row, offset):
+    """Name one peer, rotated by row, by rank, and by ``offset``.
 
-    Rotating by row keeps the waves that share a row reading one contiguous
-    stretch of a single peer's window, and rotating by rank on top keeps the
-    ranks from all starting on the same peer.
+    Rotating by row keeps the rows spread over the peers and rotating by rank
+    on top keeps the ranks from all starting on the same peer. ``offset`` is
+    the round, plus whatever else the caller wants to rotate by; it is folded
+    modulo the peer count, so it need not already be in range.
     """
     peers = shape.tp_size - 1
-    slot = row % fx.Int32(peers) + fx.Int32(source_round)
-    slot = (slot >= fx.Int32(peers)).select(slot - fx.Int32(peers), slot)
+    slot = (row + fx.Int32(offset)) % fx.Int32(peers)
     source = rank + fx.Int32(1) + slot
     return (source >= fx.Int32(shape.tp_size)).select(
         source - fx.Int32(shape.tp_size), source
@@ -204,17 +244,24 @@ def compile_quantize(config: AtomicConfig, zero_local: bool):
 
 
 @functools.cache
-def compile_full_reduce(config: AtomicConfig):
-    """Reduce every row from every TP peer straight into the BF16 output.
+def compile_fused_reduce(config: AtomicConfig, zero_local: bool):
+    """Quantize, publish, and reduce every TP peer in a single launch.
 
-    One launch instead of reduce-scatter + barrier + all-gather. It reads
-    ``tp-1`` times more peer bytes than the sharded pair, which only pays off
-    while the launches dominate the byte traffic -- see ``use_full_reduce``.
+    The split pair spends a whole dispatch -- measured at 1.8-2.4 us on this
+    pipeline, wherever in the chain it sits -- on handing the partial from one
+    kernel to the next, and the second kernel then reads back the quarter of
+    the payload it just wrote. Both go away once the two share a block: the
+    per-block rendezvous already covers exactly the work items block ``b``
+    owns, so block ``b`` can publish as soon as its own chunk is stored and
+    keep its own contribution in registers.
 
-    The per-block rendezvous that replaces the epoch barrier launch is split
-    around this rank's own quarter of the reduction: the quantize launch that
-    produced the partials has already released them, so the flag only guards
-    the peers, and the wait is worth whatever the peers are still doing.
+    What made this expensive before is the release. A system-scope release
+    fence lowers to an L2 writeback, and one per block costs 10 us at m=64 --
+    the whole reason a launch boundary looked cheaper. Writing the payload
+    through the L2 instead (``sc0 sc1``) removes the need for it: the stores
+    land at the coherence point on their own, so retiring them is the whole
+    release. The clear of the GEMM accumulator is deferred past the publish,
+    where it fills the peers' remaining skew the way the local decode used to.
     """
     shape = config.shape
     h = shape.model_dim
@@ -226,17 +273,19 @@ def compile_full_reduce(config: AtomicConfig):
     @flyc.kernel(
         name=(
             f"gemm2_tp_atomic_pipeline_{shape.tag}_m{config.m}"
-            f"_full_reduce_rendezvous_g{grid}_b{block}"
+            f"_fused_reduce_rendezvous_g{grid}_b{block}"
+            f"{'_zero_local' if zero_local else ''}"
         ),
         known_block_size=[block, 1, 1],
     )
     def kernel(
+        local: fx.Pointer,
+        shared: fx.Pointer,
         partial: fx.Pointer,
         partial_base: fx.Int64,
         output: fx.Pointer,
         rank: fx.Int32,
     ):
-        epoch = emit_rendezvous_publish(partial, flag_offset, shape.tp_size)
         item = fx.Int32(gpu.block_id("x")) * fx.Int32(block) + fx.Int32(
             gpu.thread_id("x")
         )
@@ -246,12 +295,31 @@ def compile_full_reduce(config: AtomicConfig):
         group = group_item - token * fx.Int32(groups_per_row)
         column = group * fx.Int32(32) + pack_in_group * fx.Int32(VECTOR_WIDTH)
 
-        # This rank's own window is released by the launch that wrote it, so
-        # folding it in here spends the peers' remaining quantize time on a
-        # quarter of the reduction instead of on the spin.
-        acc = _emit_source_chunk(
-            config, fx.Int64(ptrtoint(partial)), token, group, column, 0
+        # Nothing orders this read, so issuing it up front hides the round
+        # trip to the flag behind the quantize below.
+        epoch = emit_rendezvous_epoch(partial, flag_offset, shape.tp_size)
+        e8m0, packed = _emit_quantize_values(
+            config, local, shared, token, column, False
         )
+        _emit_publish_payload(
+            config, partial, token, column, packed, PUBLISH_CACHE_MODIFIER
+        )
+        if pack_in_group == fx.Int32(0):
+            _emit_publish_scale(
+                config, partial, token, column, e8m0, PUBLISH_CACHE_MODIFIER
+            )
+        acc = _emit_decoded_chunk(e8m0, packed)
+
+        # Write-through stores are at the coherence point once they retire, so
+        # draining them is the whole release the peers need.
+        fx.rocdl.s_waitcnt(0)
+        gpu.barrier()
+        emit_rendezvous_mark(partial, flag_offset, epoch)
+
+        # Reseeding the accumulator is the one thing left that no peer gates,
+        # so it goes in the window where the peers are still catching up.
+        if const_expr(zero_local):
+            _emit_clear_local(config, local, token, column)
         emit_rendezvous_acquire(partial_base, flag_offset, epoch, shape.tp_size)
 
         for source_round in range_constexpr(shape.tp_size - 1):
@@ -268,8 +336,8 @@ def compile_full_reduce(config: AtomicConfig):
         store_bf16(output_row, column, acc, VECTOR_WIDTH)
 
     @flyc.jit
-    def launch(partial, partial_base, output, rank, stream):
-        kernel(partial, partial_base, output, rank).launch(
+    def launch(local, shared, partial, partial_base, output, rank, stream):
+        kernel(local, shared, partial, partial_base, output, rank).launch(
             grid=(grid, 1, 1),
             block=(block, 1, 1),
             stream=stream,
