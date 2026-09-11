@@ -18,6 +18,16 @@ Packed token ID format: (topk_position << 24) | token_id
   - Upper 8 bits: topk slot (0..topk-1)
   - Lower 24 bits: token index (0..M-1)
   - Padding sentinel: (topk << 24) | M
+
+``num_valid_ids`` is a small metadata buffer: [0] is the padded row total and
+[1] the runtime token count. When the caller sizes it to hold
+``ROW_INV_BASE + M * topk`` entries, the multiphase paths also fill the
+*sorted-row inverse table* at ``[ROW_INV_BASE + t * topk + k]``: the sorted row
+that assignment (token ``t``, topk slot ``k``) landed on, ``-1`` when that
+expert is not local, or the row with ``ROW_INV_ZERO_WEIGHT`` set when its routed
+weight is zero. Consumers that address a token's sorted rows (the fused MXFP4
+quant + scale scatter) then need ``topk`` direct reads instead of a scan of the
+whole ``sorted_ids`` allocation.
 """
 
 import functools
@@ -25,7 +35,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
@@ -34,7 +44,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from .kernels_common import get_warp_size
+from .kernels_common import ROW_INV_BASE, ROW_INV_ZERO_WEIGHT, get_warp_size
 from .tensor_shim import _run_compiled
 
 BLOCK_SIZE = 256
@@ -166,6 +176,20 @@ def _fill_sentinel_slots(
         safe = (slot < end).select(slot, oob_idx)
         buffer_ops.buffer_store(sentinel, sorted_ids_rsrc, safe)
         buffer_ops.buffer_store(c_zero, sorted_w_rsrc, safe)
+
+
+def _store_row_inv(row_inv_rsrc, present, assign_idx, sorted_row, weight_bits):
+    """Publish sorted_row for one (token, topk slot) assignment, if present.
+
+    The routed weight is already in a register here, so its zero test rides
+    along in the payload and consumers do not have to re-read sorted_weights.
+    """
+    zero_w = (weight_bits & fx.Int32(0x7FFFFFFF)) == fx.Int32(0)
+    val = zero_w.select(sorted_row | fx.Int32(ROW_INV_ZERO_WEIGHT), sorted_row)
+    addr = present.select(
+        fx.Int32(ROW_INV_BASE) + assign_idx, fx.Int32(0x7FFFFFFF)
+    )
+    buffer_ops.buffer_store(val, row_inv_rsrc, addr)
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +845,7 @@ def _compile_moe_sorting_multiphase(
     has_mask: bool = False,
     has_local_tokens: bool = False,
     k4_block: int = 256,
+    has_row_inv: bool = False,
 ):
     """Compile the multiphase MoE sorting kernels (2 or 4 kernels via HBM workspace).
 
@@ -876,6 +901,7 @@ def _compile_moe_sorting_multiphase(
         weights_rsrc,
         sorted_ids_rsrc,
         sorted_w_rsrc,
+        row_inv_rsrc,
         my_expert,
         my_start,
         my_end,
@@ -883,6 +909,7 @@ def _compile_moe_sorting_multiphase(
         i32_scan_words_per_row,
         c_topk,
         K4_BLOCK,
+        has_row_inv,
     ):
 
         lane = tid % WARP_SIZE
@@ -938,14 +965,14 @@ def _compile_moe_sorting_multiphase(
             gpu.barrier()
             my_exclusive = my_cnt - my_pre_scan + wave_offset
             scatter_base = position + my_exclusive
-            pid_0 = (h0.select(x0 - c_one, c_zero) << fx.Int32(24)) | base_col
-            pid_1 = (h1.select(x1 - c_one, c_zero) << fx.Int32(24)) | (base_col + c_one)
-            pid_2 = (h2.select(x2 - c_one, c_zero) << fx.Int32(24)) | (
-                base_col + fx.Int32(2)
-            )
-            pid_3 = (h3.select(x3 - c_one, c_zero) << fx.Int32(24)) | (
-                base_col + fx.Int32(3)
-            )
+            slot_0 = h0.select(x0 - c_one, c_zero)
+            slot_1 = h1.select(x1 - c_one, c_zero)
+            slot_2 = h2.select(x2 - c_one, c_zero)
+            slot_3 = h3.select(x3 - c_one, c_zero)
+            pid_0 = (slot_0 << fx.Int32(24)) | base_col
+            pid_1 = (slot_1 << fx.Int32(24)) | (base_col + c_one)
+            pid_2 = (slot_2 << fx.Int32(24)) | (base_col + fx.Int32(2))
+            pid_3 = (slot_3 << fx.Int32(24)) | (base_col + fx.Int32(3))
             safe_slot_0 = h0.select(scatter_base, c_oob_idx)
             off1 = scatter_base + h0.select(c_one, c_zero)
             safe_slot_1 = h1.select(off1, c_oob_idx)
@@ -953,38 +980,29 @@ def _compile_moe_sorting_multiphase(
             safe_slot_2 = h2.select(off2, c_oob_idx)
             off3 = off2 + h2.select(c_one, c_zero)
             safe_slot_3 = h3.select(off3, c_oob_idx)
+            # Flat (token, topk slot) index of each of the four assignments; it
+            # addresses both topk_weights and the sorted-row inverse table.
+            a_idx_0 = base_col * c_topk + slot_0
+            a_idx_1 = (base_col + c_one) * c_topk + slot_1
+            a_idx_2 = (base_col + fx.Int32(2)) * c_topk + slot_2
+            a_idx_3 = (base_col + fx.Int32(3)) * c_topk + slot_3
             w_val_0 = buffer_ops.buffer_load(
-                weights_rsrc,
-                h0.select(base_col * c_topk + h0.select(x0 - c_one, c_zero), c_zero),
-                vec_width=1,
-                dtype=T.i32,
+                weights_rsrc, h0.select(a_idx_0, c_zero), vec_width=1, dtype=T.i32
             )
             w_val_1 = buffer_ops.buffer_load(
-                weights_rsrc,
-                h1.select(
-                    (base_col + c_one) * c_topk + h1.select(x1 - c_one, c_zero), c_zero
-                ),
-                vec_width=1,
-                dtype=T.i32,
+                weights_rsrc, h1.select(a_idx_1, c_zero), vec_width=1, dtype=T.i32
             )
             w_val_2 = buffer_ops.buffer_load(
-                weights_rsrc,
-                h2.select(
-                    (base_col + fx.Int32(2)) * c_topk + h2.select(x2 - c_one, c_zero),
-                    c_zero,
-                ),
-                vec_width=1,
-                dtype=T.i32,
+                weights_rsrc, h2.select(a_idx_2, c_zero), vec_width=1, dtype=T.i32
             )
             w_val_3 = buffer_ops.buffer_load(
-                weights_rsrc,
-                h3.select(
-                    (base_col + fx.Int32(3)) * c_topk + h3.select(x3 - c_one, c_zero),
-                    c_zero,
-                ),
-                vec_width=1,
-                dtype=T.i32,
+                weights_rsrc, h3.select(a_idx_3, c_zero), vec_width=1, dtype=T.i32
             )
+            if const_expr(has_row_inv):
+                _store_row_inv(row_inv_rsrc, h0, a_idx_0, scatter_base, w_val_0)
+                _store_row_inv(row_inv_rsrc, h1, a_idx_1, off1, w_val_1)
+                _store_row_inv(row_inv_rsrc, h2, a_idx_2, off2, w_val_2)
+                _store_row_inv(row_inv_rsrc, h3, a_idx_3, off3, w_val_3)
             buffer_ops.buffer_store(pid_0, sorted_ids_rsrc, safe_slot_0)
             buffer_ops.buffer_store(pid_1, sorted_ids_rsrc, safe_slot_1)
             buffer_ops.buffer_store(pid_2, sorted_ids_rsrc, safe_slot_2)
@@ -1036,6 +1054,7 @@ def _compile_moe_sorting_multiphase(
     def p0_scatter_kernel(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
@@ -1045,6 +1064,7 @@ def _compile_moe_sorting_multiphase(
         stride = gpu.grid_dim.x * fx.Int32(K2_BLOCK)
         topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
         c_zero = fx.Int32(0)
         c_topk = fx.Int32(topk)
         c_one = fx.Int32(1)
@@ -1075,11 +1095,17 @@ def _compile_moe_sorting_multiphase(
                 buffer_ops.buffer_store(
                     val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
                 )
+                # Seed the inverse table; `safe_flat` is token_id * topk + slot.
+                if const_expr(has_row_inv):
+                    buffer_ops.buffer_store(
+                        fx.Int32(-1), nv_rsrc, fx.Int32(ROW_INV_BASE) + safe_flat
+                    )
 
     @flyc.jit
     def launch_p0(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
@@ -1091,6 +1117,7 @@ def _compile_moe_sorting_multiphase(
         launcher = p0_scatter_kernel(
             topk_ids,
             workspace,
+            num_valid_ids,
             local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
@@ -1267,6 +1294,7 @@ def _compile_moe_sorting_multiphase(
     def p0v2_kernel(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
         local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
@@ -1279,6 +1307,7 @@ def _compile_moe_sorting_multiphase(
         wave = tid // WARP_SIZE
 
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
         topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
         c_zero = fx.Int32(0)
@@ -1305,12 +1334,6 @@ def _compile_moe_sorting_multiphase(
         clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
         total_assignments = tokens_ * c_topk
         scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
-        # Phase 3 re-scans topk_ids instead of reading the mesh row back. The two
-        # agree because a token's topk slots hold distinct experts, so the number
-        # of assignments matching this expert equals the number of non-zero bytes
-        # Phase 2 wrote into its row -- the same uniqueness the mesh itself relies
-        # on to keep Phase 2 store-conflict-free.
-        count_niters = scatter_niters
 
         # Hoist before if/else: AST rewriter extracts branches into separate
         # functions, so variables must be defined in outer scope first.
@@ -1334,10 +1357,19 @@ def _compile_moe_sorting_multiphase(
 
         gpu.barrier()
 
-        # ---- Phase 2: Scatter (scan all T*topk, filter by expert) ----
-        for _si in range(
-            fx.Index(0), ArithValue(scatter_niters).index_cast(T.index), fx.Index(1)
+        # ---- Phase 2: Scatter (scan all T*topk, filter by expert) + count ----
+        # The count rides along in the same sweep: a token's topk slots hold
+        # distinct experts, so the assignments matching this expert are exactly
+        # the bytes this block stores -- the same uniqueness that keeps the
+        # scatter store-conflict-free. Counting here instead of in a second
+        # sweep keeps `topk_ids` off the critical path a second time.
+        for _si, state in range(
+            fx.Index(0),
+            ArithValue(scatter_niters).index_cast(T.index),
+            fx.Index(1),
+            init=[c_zero],
         ):
+            cnt_so_far = state[0]
             flat = fx.Int32(_si) * c_block + tid
             valid = flat < total_assignments
             safe_flat = valid.select(flat, c_zero)
@@ -1366,28 +1398,20 @@ def _compile_moe_sorting_multiphase(
                 buffer_ops.buffer_store(
                     val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
                 )
+                # Every assignment is owned by exactly one expert block, so this
+                # seeds the whole inverse table with "no sorted row" once. P23
+                # then overwrites the entries whose expert is local; `flat` is
+                # already token_id * topk + topk_slot.
+                if const_expr(has_row_inv):
+                    buffer_ops.buffer_store(
+                        fx.Int32(-1), nv_rsrc, fx.Int32(ROW_INV_BASE) + safe_flat
+                    )
 
-        # ---- Phase 3: Count this expert's assignments + warp/cross-wave reduce ----
-        for _ki, state in range(
-            fx.Index(0),
-            ArithValue(count_niters).index_cast(T.index),
-            fx.Index(1),
-            init=[c_zero],
-        ):
-            cnt_so_far = state[0]
-
-            flat_c = fx.Int32(_ki) * c_block + tid
-            valid = flat_c < total_assignments
-            safe_flat_c = valid.select(flat_c, c_zero)
-            eid_c = buffer_ops.buffer_load(
-                topk_rsrc, safe_flat_c, vec_width=1, dtype=T.i32
-            )
-            iter_cnt = (valid & (eid_c == eid)).select(c_one, c_zero)
-
-            new_cnt = cnt_so_far + iter_cnt
+            new_cnt = cnt_so_far + is_mine.select(c_one, c_zero)
             results = yield [new_cnt]
         cnt = results
 
+        # ---- Phase 3: warp/cross-wave reduce of this expert's count ----
         # Intra-warp reduce via shuffle_xor
         width_ws = fx.Int32(WARP_SIZE)
         for sh in range_constexpr(int.bit_length(WARP_SIZE) - 1):
@@ -1417,6 +1441,7 @@ def _compile_moe_sorting_multiphase(
     def launch_p0v2(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        num_valid_ids: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
         local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
@@ -1428,6 +1453,7 @@ def _compile_moe_sorting_multiphase(
         launcher = p0v2_kernel(
             topk_ids,
             workspace,
+            num_valid_ids,
             expert_mask_tensor,
             local_tokens_tensor,
             i32_tokens,
@@ -1492,6 +1518,7 @@ def _compile_moe_sorting_multiphase(
             sorted_weights_out, max_size=True
         )
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
+        nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
 
         # LDS: cumsum[E+1] for prefix sums + cross-wave scratch
         lds = fx.SharedAllocator().allocate(K4SharedStorage).peek()
@@ -1613,9 +1640,6 @@ def _compile_moe_sorting_multiphase(
 
             # Block 0, thread 0 writes num_valid_ids
             if (bid == c_zero) & (tid == c_zero):
-                nvalid_rsrc = buffer_ops.create_buffer_resource(
-                    num_valid_ids, max_size=True
-                )
                 buffer_ops.buffer_store(total_padded, nvalid_rsrc, c_zero)
                 buffer_ops.buffer_store(tokens_, nvalid_rsrc, c_one)
 
@@ -1652,6 +1676,7 @@ def _compile_moe_sorting_multiphase(
                 weights_rsrc,
                 sorted_ids_rsrc,
                 sorted_w_rsrc,
+                nvalid_rsrc,
                 my_expert,
                 my_start,
                 my_end,
@@ -1659,6 +1684,7 @@ def _compile_moe_sorting_multiphase(
                 i32_scan_words_per_row,
                 c_topk,
                 K4_BLOCK,
+                has_row_inv,
             )
 
             # Step 5: Fill padding with sentinel for THIS expert (parallel)
@@ -1732,6 +1758,7 @@ def _compile_moe_sorting_multiphase(
         l1 = p0v2_kernel(
             topk_ids,
             workspace,
+            num_valid_ids_out,
             expert_mask_tensor,
             local_tokens_tensor,
             i32_tokens,
@@ -1787,6 +1814,7 @@ def _compile_moe_sorting_multiphase(
         l2 = p0_scatter_kernel(
             topk_ids,
             workspace,
+            num_valid_ids_out,
             local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
@@ -1862,12 +1890,29 @@ def _compute_sub_tokens(num_experts, arch=None):
     return r_for_sub
 
 
+def moe_sorting_uses_multiphase(M, num_experts, topk):
+    """True when T selects one of the multiphase paths over the oneshot kernel."""
+    sub_tokens = _compute_sub_tokens(num_experts)
+    ONESHOT_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
+    return M > min(sub_tokens, ONESHOT_MAX_T)
+
+
+def moe_sorting_num_valid_ids_size(M, num_experts, topk):
+    """i32 elements to allocate for num_valid_ids.
+
+    Sizing it past the two scalars asks the multiphase paths to also fill the
+    sorted-row inverse table (see module docstring); the oneshot kernel does not
+    write it, so only ask for it on the paths that do.
+    """
+    if not moe_sorting_uses_multiphase(M, num_experts, topk):
+        return ROW_INV_BASE
+    return ROW_INV_BASE + M * topk
+
+
 def moe_sorting_get_workspace_size(M, num_experts, topk, unit_size=UNIT_SIZE):
     """Return workspace size (in i32 elements) needed for the multiphase path.
     Returns 0 if the oneshot path will be used."""
-    sub_tokens = _compute_sub_tokens(num_experts)
-    ONESHOT_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
-    if M <= min(sub_tokens, ONESHOT_MAX_T):
+    if not moe_sorting_uses_multiphase(M, num_experts, topk):
         return 0
     mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
     ws_mesh_bytes = num_experts * mesh_stride
@@ -1884,6 +1929,7 @@ def compile_moe_sorting(
     has_mask=False,
     has_local_tokens=False,
     k4_block=256,
+    has_row_inv=False,
 ):
     """Compile MoE sorting kernels for all paths (oneshot + multiphase).
 
@@ -1905,6 +1951,7 @@ def compile_moe_sorting(
         has_mask=has_mask,
         has_local_tokens=has_local_tokens,
         k4_block=k4_block,
+        has_row_inv=has_row_inv,
     )
     return launch_oneshot, launch_p0v2_p23, launch_4k_fused
 
@@ -2054,6 +2101,10 @@ def moe_sorting_flydsl(
             )
 
         k4_block = _p23_block_size(num_experts, M)
+        # The caller opts into the sorted-row inverse table by over-sizing
+        # num_valid_ids; sizing is keyed on the static token capacity because M
+        # may be a runtime-only count under CUDA graph capture.
+        has_row_inv = num_valid_ids.numel() >= ROW_INV_BASE + topk_ids.shape[0] * topk
         _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
             num_experts=num_experts,
             topk=topk,
@@ -2061,6 +2112,7 @@ def moe_sorting_flydsl(
             has_mask=has_mask,
             has_local_tokens=has_local_tokens,
             k4_block=k4_block,
+            has_row_inv=has_row_inv,
         )
         stream = torch.cuda.current_stream(device)
         n_zero_blocks = min(

@@ -11,16 +11,26 @@ bytes that many times (~27x at the GLM-5.2 EP4 decode shape, where 64 tokens
 expand to 1760 sorted rows).
 
 This kernel is parallelised over ``(token, column slice)`` instead: a block
-quantises its slice of one token exactly once, keeps the E8M0 bytes of that
-slice in LDS, then locates the token's sorted rows and scatters the bytes into
-the swizzled layout. Splitting quant and scatter into two kernels instead costs
-a second launch boundary plus a global round trip through the per-token scale,
-which at this size is more than the redundant work it removes.
+quantises its slice of one token exactly once and scatters the resulting E8M0
+bytes into the swizzled layout of that token's sorted rows. Splitting quant and
+scatter into two kernels instead costs a second launch boundary plus a global
+round trip through the per-token scale, which at this size is more than the
+redundant work it removes.
 
-The packed sorted id is ``(topk_slot << 24) | token_id`` and a token's slots
-are distinct, so the rows found by the scan can be bucketed by slot without an
-atomic. Padding rows carry ``token_id == num_tokens`` and therefore match no
-block, which reproduces the HIP kernel leaving their scale bytes untouched.
+Locating a token's sorted rows is what the sorting kernel's inverse table is
+for: ``topk`` direct reads, all issued alongside the activation load. Without it
+(oneshot sorting, or a non-FlyDSL sort) the fallback is a static dwordx4 sweep
+of the whole ``sorted_ids`` allocation, bucketed by the ``(topk_slot << 24) |
+token_id`` packing -- a token's slots are distinct so no atomic is needed, and
+padding rows carry ``token_id == num_tokens`` so they match no block, which
+reproduces the HIP kernel leaving their scale bytes untouched.
+
+Stage 2 quantises one input row per (token, expert slot) assignment, so it has
+no redundant work for this kernel to remove, but ``per_assignment`` mode still
+wins on the same table: walking sorted rows means the HIP kernel cannot issue an
+activation load until both ``num_valid_ids`` and ``sorted_ids`` have come back,
+whereas here the block owns its input row by construction and the single
+inverse-table read rides alongside the load it would otherwise gate.
 """
 
 import functools
@@ -28,18 +38,20 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from .kernels_common import get_warp_size
+from .kernels_common import ROW_INV_BASE, ROW_INV_ZERO_WEIGHT, get_warp_size
 from .tensor_shim import _run_compiled
 
 GROUP = 32  # MX block size
 ELEMS_PER_THREAD = 8  # one dwordx4 load of bf16
+LANES_PER_GROUP = GROUP // ELEMS_PER_THREAD
+ROW_MASK = ~ROW_INV_ZERO_WEIGHT & 0x7FFFFFFF
 WARP_SIZE = get_warp_size()
 
 # fp32 bits of 1/max_pos for RoundUp ceil_pow2(amax / max_pos); fp4 max_pos = 6.
@@ -80,28 +92,34 @@ def _compile_token_major_quant_sort(
     sorted_len: int,
     sort_topk: int,
     has_weights: bool,
+    has_row_inv: bool,
+    per_assignment: bool,
     nsplit: int,
     block: int,
 ):
-    n_iters = cols // (nsplit * block * ELEMS_PER_THREAD)
-    scale_n = cols // GROUP  # valid scale columns of the whole row
-    scale_n_local = scale_n // nsplit  # ... of one column slice
-    # Phase 3 lays the block out as (slot group, column) so every lane stores on
-    # every pass; one column slice is exactly `block // slots_per_pass` wide.
-    slots_per_pass = block // scale_n_local
-    n_passes = (sort_topk + slots_per_pass - 1) // slots_per_pass
+    assert has_row_inv or not per_assignment
+    scale_n_local = cols // GROUP // nsplit  # scale columns of one column slice
+    # `_pick_geometry` splits a row so that one thread owns exactly one dwordx4,
+    # which makes the block exactly `LANES_PER_GROUP` lanes wide per MX group.
+    assert block == scale_n_local * LANES_PER_GROUP
+    # Phase 3 lays the block out as (slot, column) with the slot on the low bits
+    # of the lane id: all `LANES_PER_GROUP` lanes of a group hold that group's
+    # E8M0 after the reduce, so every pass stores from the register that
+    # produced it -- no LDS staging and no barrier.
+    n_passes = 1 if per_assignment else (
+        (sort_topk + LANES_PER_GROUP - 1) // LANES_PER_GROUP
+    )
     tile_bytes = scale_n_pad * GROUP  # bytes of one 32-row swizzle tile
-    # The scan is a static dwordx4 sweep of the whole `sorted_ids` allocation.
-    # A dynamic `num_valid`-bounded loop serialises one global load per trip;
-    # unrolling lets every load issue up front and overlap the activation
-    # loads. Clamping the tail index re-reads a few rows, which is harmless
-    # because writing a row into its slot is idempotent.
+    # Fallback scan: a static dwordx4 sweep of the whole `sorted_ids`
+    # allocation. A dynamic `num_valid`-bounded loop serialises one global load
+    # per trip; unrolling lets every load issue up front. Clamping the tail
+    # index re-reads a few rows, which is harmless because writing a row into
+    # its slot is idempotent.
     scan_iters = (sorted_len + block * 4 - 1) // (block * 4)
     scan_clamp = sorted_len - 4
 
     @fx.struct
     class SharedStorage:
-        e8m0: fx.Array[fx.Int32, scale_n_local, 16]
         rows: fx.Array[fx.Int32, sort_topk, 16]
 
     @flyc.kernel(known_block_size=[block, 1, 1])
@@ -115,130 +133,156 @@ def _compile_token_major_quant_sort(
     ):
         tid = gpu.thread_idx.x
         bid = gpu.block_idx.x
-        token = bid // fx.Int32(nsplit) if nsplit > 1 else bid
+        # One input row per block: a token in stage 1, a (token, slot)
+        # assignment in `per_assignment` mode.
+        in_row = bid // fx.Int32(nsplit) if nsplit > 1 else bid
         part = bid % fx.Int32(nsplit) if nsplit > 1 else fx.Int32(0)
 
         out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
         scale_rsrc = buffer_ops.create_buffer_resource(scale, max_size=True)
         in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
-        sid_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
-        nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
-        sw_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
 
         c_zero = fx.Int32(0)
         c_one = fx.Int32(1)
         c_wave = fx.Int32(WARP_SIZE)
+        c_topk = fx.Int32(sort_topk)
+        c_wflag = fx.Int32(ROW_INV_ZERO_WEIGHT)
 
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        e8m0_mr = lds.e8m0.ptr
-        rows_mr = lds.rows.ptr
+        # The activation load feeds the longest chain, so issue it first and let
+        # the row lookup below overlap with it.
+        in_dw_base = in_row * fx.Int32(cols // 2) + (
+            (part * fx.Int32(block)) << fx.Int32(2)
+        )
+        raw = buffer_ops.buffer_load(
+            in_rsrc,
+            in_dw_base + (tid << fx.Int32(2)),
+            vec_width=4,
+            dtype=T.i32,
+        )
 
-        if tid < fx.Int32(sort_topk):
-            _lds_store(rows_mr, fx.Int32(-1), tid)
-        num_valid = buffer_ops.buffer_load(nv_rsrc, c_zero, vec_width=1, dtype=T.i32)
-        gpu.barrier()
-
-        # ---- Phase 1: bucket this token's sorted rows by topk slot ----
-        c_clamp = fx.Int32(scan_clamp)
-        for sit in range_constexpr(scan_iters):
-            base = (fx.Int32(sit * block) + tid) << fx.Int32(2)
-            base = (base > c_clamp).select(c_clamp, base)
-            quad = Vec(
-                buffer_ops.buffer_load(sid_rsrc, base, vec_width=4, dtype=T.i32)
+        # ---- Phase 1: this token's sorted row per topk slot, `-1` if none ----
+        # The payload carries ROW_INV_ZERO_WEIGHT for a row whose routed weight
+        # is zero, matching the HIP kernel's zero scale byte for those rows.
+        sub = tid & fx.Int32(LANES_PER_GROUP - 1)
+        slot_rows = []
+        if const_expr(per_assignment):
+            # The block already owns one assignment, so its sorted row is a
+            # single uniform read that the activation load above covers.
+            nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            slot_rows.append(
+                buffer_ops.buffer_load(
+                    nv_rsrc,
+                    fx.Int32(ROW_INV_BASE) + in_row,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
             )
-            for e in range_constexpr(4):
-                row = base + fx.Int32(e)
-                fused = quad[e]
-                if (row < num_valid) & ((fused & fx.Int32(0xFFFFFF)) == token):
-                    _lds_store(rows_mr, row, fused >> fx.Int32(24))
+        elif const_expr(has_row_inv):
+            nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            inv_base = fx.Int32(ROW_INV_BASE) + in_row * c_topk
+            for pss in range_constexpr(n_passes):
+                slot = fx.Int32(pss * LANES_PER_GROUP) + sub
+                has_slot = slot < c_topk
+                packed_row = buffer_ops.buffer_load(
+                    nv_rsrc,
+                    inv_base + has_slot.select(slot, c_zero),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                slot_rows.append(has_slot.select(packed_row, fx.Int32(-1)))
+        else:
+            sid_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
+            nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+            sw_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+            rows_mr = fx.SharedAllocator().allocate(SharedStorage).peek().rows.ptr
+            if tid < c_topk:
+                _lds_store(rows_mr, fx.Int32(-1), tid)
+            num_valid = buffer_ops.buffer_load(
+                nv_rsrc, c_zero, vec_width=1, dtype=T.i32
+            )
+            gpu.barrier()
+            c_clamp = fx.Int32(scan_clamp)
+            for sit in range_constexpr(scan_iters):
+                base = (fx.Int32(sit * block) + tid) << fx.Int32(2)
+                base = (base > c_clamp).select(c_clamp, base)
+                quad = Vec(
+                    buffer_ops.buffer_load(sid_rsrc, base, vec_width=4, dtype=T.i32)
+                )
+                for e in range_constexpr(4):
+                    row = base + fx.Int32(e)
+                    fused = quad[e]
+                    # Only stage 1 reaches the scan, where `in_row` is a token.
+                    if (row < num_valid) & ((fused & fx.Int32(0xFFFFFF)) == in_row):
+                        _lds_store(rows_mr, row, fused >> fx.Int32(24))
+            gpu.barrier()
+            for pss in range_constexpr(n_passes):
+                slot = fx.Int32(pss * LANES_PER_GROUP) + sub
+                has_slot = slot < c_topk
+                row = _lds_load(rows_mr, has_slot.select(slot, c_zero))
+                row = has_slot.select(row, fx.Int32(-1))
+                if has_weights:
+                    w_bits = buffer_ops.buffer_load(
+                        sw_rsrc,
+                        (row >= c_zero).select(row, c_zero),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    row = ((w_bits & fx.Int32(0x7FFFFFFF)) == c_zero).select(
+                        row | c_wflag, row
+                    )
+                slot_rows.append(row)
 
         # ---- Phase 2: quantise this token's column slice, once ----
-        slice_chunks = fx.Int32(n_iters * block)
-        in_dw_base = token * fx.Int32(cols // 2) + (part * slice_chunks << fx.Int32(2))
-        out_dw_base = token * fx.Int32(cols // 8) + part * slice_chunks
-        for it in range_constexpr(n_iters):
-            vec_idx = fx.Int32(it * block) + tid
-            raw = buffer_ops.buffer_load(
-                in_rsrc,
-                in_dw_base + (vec_idx << fx.Int32(2)),
-                vec_width=4,
-                dtype=T.i32,
+        values = Vec(raw).bitcast(fx.BFloat16).to(fx.Float32)
+        local_max = fmath.absf(values).reduce(ReductionOp.MAX)
+        local_max = local_max.maximumf(fx.Float32(1e-10))
+
+        # A 32-element MX group spans 4 consecutive lanes. |x| >= 0, so the
+        # fp32 bit pattern orders the same way as the value and the reduce
+        # can stay on the (always-available) i32 shuffle path.
+        lm_i = local_max.bitcast(fx.Int32)
+        for sh in range_constexpr(2):
+            peer = lm_i.shuffle_xor(fx.Int32(1 << sh), c_wave)
+            lm_i = (peer > lm_i).select(peer, lm_i)
+
+        working = (
+            lm_i.bitcast(fx.Float32)
+            * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)
+        ).bitcast(fx.Int32)
+        biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
+        e8m0 = ((working & fx.Int32(0x7FFFFF)) != c_zero).select(
+            biased_exp + c_one, biased_exp
+        )
+        e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
+
+        dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+        packed = fx.Int32(0)
+        for pair in range_constexpr(ELEMS_PER_THREAD // 2):
+            packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                T.i32,
+                packed,
+                values[2 * pair],
+                values[2 * pair + 1],
+                dequant_scale,
+                pair,
             )
-            values = Vec(raw).bitcast(fx.BFloat16).to(fx.Float32)
-            local_max = fmath.absf(values).reduce(ReductionOp.MAX)
-            local_max = local_max.maximumf(fx.Float32(1e-10))
-
-            # A 32-element MX group spans 4 consecutive lanes. |x| >= 0, so the
-            # fp32 bit pattern orders the same way as the value and the reduce
-            # can stay on the (always-available) i32 shuffle path.
-            lm_i = local_max.bitcast(fx.Int32)
-            for sh in range_constexpr(2):
-                peer = lm_i.shuffle_xor(fx.Int32(1 << sh), c_wave)
-                lm_i = (peer > lm_i).select(peer, lm_i)
-
-            working = (
-                lm_i.bitcast(fx.Float32)
-                * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)
-            ).bitcast(fx.Int32)
-            biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-            e8m0 = ((working & fx.Int32(0x7FFFFF)) != c_zero).select(
-                biased_exp + c_one, biased_exp
-            )
-            e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
-
-            dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-            packed = fx.Int32(0)
-            for pair in range_constexpr(ELEMS_PER_THREAD // 2):
-                packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                    T.i32,
-                    packed,
-                    values[2 * pair],
-                    values[2 * pair + 1],
-                    dequant_scale,
-                    pair,
-                )
-            buffer_ops.buffer_store(fx.Int32(packed), out_rsrc, out_dw_base + vec_idx)
-
-            if (tid & fx.Int32(3)) == c_zero:
-                _lds_store(e8m0_mr, e8m0, vec_idx >> fx.Int32(2))
-        gpu.barrier()
+        out_dw_base = in_row * fx.Int32(cols // 8) + part * fx.Int32(block)
+        buffer_ops.buffer_store(fx.Int32(packed), out_rsrc, out_dw_base + tid)
 
         # ---- Phase 3: scatter the E8M0 bytes into the swizzled sorted rows ----
         # mx_scale_shuffle_idx(scale_n_pad, x, y) splits into a row-only and a
-        # column-only half; each lane owns one column for `n_passes` slots, so
-        # the column half is computed once and every load is issued up front.
-        sub = tid // fx.Int32(scale_n_local)
-        col = part * fx.Int32(scale_n_local) + tid % fx.Int32(scale_n_local)
+        # column-only half, so the column half is computed once per lane.
+        col = part * fx.Int32(scale_n_local) + (tid >> fx.Int32(2))
         col_addr = (
             ((col >> fx.Int32(3)) << fx.Int32(8))
             + ((col & fx.Int32(3)) << fx.Int32(6))
             + (((col & fx.Int32(7)) >> fx.Int32(2)) << fx.Int32(1))
         )
-        c_topk = fx.Int32(sort_topk)
-        slot_rows = []
         for pss in range_constexpr(n_passes):
-            slot = fx.Int32(pss * slots_per_pass) + sub
-            has_slot = slot < c_topk
-            row = _lds_load(rows_mr, has_slot.select(slot, c_zero))
-            slot_rows.append(has_slot.select(row, fx.Int32(-1)))
-        keeps = []
-        for row in slot_rows:
-            if has_weights:
-                w_bits = buffer_ops.buffer_load(
-                    sw_rsrc,
-                    (row >= c_zero).select(row, c_zero),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
-                keeps.append(
-                    ((w_bits & fx.Int32(0x7FFFFFFF)) != c_zero).select(c_one, c_zero)
-                )
-            else:
-                keeps.append(c_one)
-        val = _lds_load(e8m0_mr, tid % fx.Int32(scale_n_local))
-        for pss in range_constexpr(n_passes):
-            row = slot_rows[pss]
-            if row >= c_zero:
+            packed_row = slot_rows[pss]
+            keep = ((packed_row & c_wflag) == c_zero).select(c_one, c_zero)
+            row = packed_row & fx.Int32(ROW_MASK)
+            if packed_row >= c_zero:
                 addr = (
                     (row >> fx.Int32(5)) * fx.Int32(tile_bytes)
                     + ((row & fx.Int32(15)) << fx.Int32(2))
@@ -246,7 +290,7 @@ def _compile_token_major_quant_sort(
                     + col_addr
                 )
                 buffer_ops.buffer_store(
-                    (val * keeps[pss]).to(fx.Uint8),
+                    (e8m0 * keep).to(fx.Uint8),
                     scale_rsrc,
                     addr,
                     offset_is_bytes=True,
@@ -288,6 +332,11 @@ def can_run_token_major_quant_sort(cols: int, group_size: int) -> bool:
     return group_size == GROUP and cols % GROUP == 0 and _pick_geometry(cols) is not None
 
 
+def has_sorted_row_inverse(num_valid_ids: torch.Tensor, num_assignments: int) -> bool:
+    """True when ``num_valid_ids`` carries the sorted-row inverse table."""
+    return num_valid_ids.numel() >= ROW_INV_BASE + num_assignments
+
+
 def token_major_mxfp4_quant_moe_sort(
     out: torch.Tensor,
     scale: torch.Tensor,
@@ -296,16 +345,23 @@ def token_major_mxfp4_quant_moe_sort(
     num_valid_ids: torch.Tensor,
     sorted_weights,
     sort_topk: int,
+    per_assignment: bool = False,
     stream=None,
 ) -> None:
     """Quantise ``inp`` to MXFP4 and scatter its E8M0 scales into ``scale``.
 
-    ``out`` is token-indexed ``[num_tokens, cols // 2]``; ``scale`` is
-    sorted-row-indexed ``[pad32(num_sorted_rows), scale_n_pad]`` in the
-    swizzled GEMM layout. Only stage 1 (one input row per token) is supported.
+    ``out`` is indexed like ``inp``; ``scale`` is sorted-row-indexed
+    ``[pad32(num_sorted_rows), scale_n_pad]`` in the swizzled GEMM layout.
+
+    A ``num_valid_ids`` sized past its two scalars carries the sorting kernel's
+    sorted-row inverse table, which turns the row lookup into direct reads;
+    otherwise the kernel scans ``sorted_ids``. ``per_assignment`` switches
+    ``inp`` from one row per token (stage 1) to one row per (token, expert slot)
+    assignment (stage 2) and requires the table.
     """
-    num_tokens, cols = inp.shape
+    num_rows, cols = inp.shape
     nsplit, block = _pick_geometry(cols)
+    num_assignments = num_rows if per_assignment else num_rows * sort_topk
 
     launcher = _compile_token_major_quant_sort(
         cols=cols,
@@ -313,6 +369,8 @@ def token_major_mxfp4_quant_moe_sort(
         sorted_len=sorted_ids.shape[0],
         sort_topk=sort_topk,
         has_weights=sorted_weights is not None,
+        has_row_inv=has_sorted_row_inverse(num_valid_ids, num_assignments),
+        per_assignment=per_assignment,
         nsplit=nsplit,
         block=block,
     )
@@ -328,6 +386,6 @@ def token_major_mxfp4_quant_moe_sort(
         sorted_ids,
         num_valid_ids,
         weights,
-        int(num_tokens * nsplit),
+        int(num_rows * nsplit),
         fx.Stream(stream),
     )

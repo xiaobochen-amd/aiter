@@ -1035,7 +1035,13 @@ def quant_mxfp4_hip(
 
 
 @functools.lru_cache(maxsize=8)
-def _token_major_quant_moe_sort(cols: int, group_size: int):
+def _token_major_quant_moe_sort(
+    cols: int,
+    group_size: int,
+    per_assignment: bool,
+    num_valid_ids: torch.Tensor,
+    num_assignments: int,
+):
     """Token-major MXFP4 quant + sorted-scale scatter, or ``None`` if unusable.
 
     The FlyDSL kernel uses the gfx950 native ``v_cvt_scalef32_pk_fp4_f32``.
@@ -1045,11 +1051,16 @@ def _token_major_quant_moe_sort(cols: int, group_size: int):
     try:
         from .flydsl.kernels.moe_quant_sort_kernel import (
             can_run_token_major_quant_sort,
+            has_sorted_row_inverse,
             token_major_mxfp4_quant_moe_sort,
         )
     except ImportError:
         return None
     if not can_run_token_major_quant_sort(cols, group_size):
+        return None
+    # The per-assignment mode addresses its sorted row through the sorting
+    # kernel's inverse table only; it has no scan fallback.
+    if per_assignment and not has_sorted_row_inverse(num_valid_ids, num_assignments):
         return None
     return token_major_mxfp4_quant_moe_sort
 
@@ -1132,12 +1143,14 @@ def fused_dynamic_mx_quant_moe_sort(
     )
     # Stage 1 has one input row per token but `topk` sorted rows per token, so
     # the row-major fused kernel re-quantises every token `topk` times. The
-    # token-major kernel does the same work in one pass; stage 2 has a distinct
-    # input row per sorted row and is already redundancy-free.
+    # token-major kernel does the same work in one pass. Stage 2 has one input
+    # row per assignment and so no redundancy to remove, but the same kernel
+    # still wins there when the sorted-row inverse table is available: the
+    # row-major kernel walks sorted rows, so it cannot issue an activation load
+    # before `num_valid_ids` and `sorted_ids` have both come back.
     token_major = (
-        _token_major_quant_moe_sort(N, group_size)
-        if is_stage1
-        and quant_dtype == dtypes.fp4x2
+        _token_major_quant_moe_sort(N, group_size, not is_stage1, num_valid_ids, M)
+        if quant_dtype == dtypes.fp4x2
         and num_rows is None
         and sorted_ids.shape[0] >= 4
         else None
@@ -1152,6 +1165,7 @@ def fused_dynamic_mx_quant_moe_sort(
             num_valid_ids,
             sorted_weights,
             topk,
+            per_assignment=not is_stage1,
         )
         return out, scale
 

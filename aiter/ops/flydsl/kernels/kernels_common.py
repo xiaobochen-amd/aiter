@@ -16,6 +16,13 @@ from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 from aiter.ops.flydsl.kernels import buffer_ops
 
 
+# Layout of the sorted-row inverse table that the MoE sorting kernel publishes
+# behind the two num_valid_ids scalars, shared with its consumers. See the
+# `moe_sorting_kernel` module docstring.
+ROW_INV_BASE = 2
+ROW_INV_ZERO_WEIGHT = 0x40000000
+
+
 def format_kernel_name(name: str) -> str:
     """Sanitize a kernel symbol name for the amdhsa assembler.
 

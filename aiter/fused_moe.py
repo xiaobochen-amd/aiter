@@ -313,6 +313,9 @@ def _flydsl_moe_sorting(
     num_local_experts=None,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
+    from aiter.ops.flydsl.kernels.moe_sorting_kernel import (
+        moe_sorting_num_valid_ids_size,
+    )
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
@@ -339,7 +342,15 @@ def _flydsl_moe_sorting(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    # Over-sized num_valid_ids asks the sorting kernel for the sorted-row
+    # inverse table behind the two scalars, so consumers that address a token's
+    # sorted rows (the fused MXFP4 quant + scale scatter) can read them
+    # directly instead of scanning the whole sorted_ids allocation.
+    num_valid_ids = torch.empty(
+        moe_sorting_num_valid_ids_size(M, num_experts, topk),
+        dtype=dtypes.i32,
+        device=device,
+    )
     # moe_buf shape mirrors _moe_sorting_impl: full [M, model_dim] when stage2
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
