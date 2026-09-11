@@ -38,6 +38,14 @@ from .config import (
 VECTOR_WIDTH = 16
 QUANT_BLOCK = 256
 
+# Column chunks one row slot of a shard-rendezvous block may own, narrowest
+# first. One chunk per thread makes the block TP slots wide, so a slot is a
+# whole wave at the narrowest choice: the reduce phase, which only the owning
+# shard runs, then costs no divergence, and a slot's payload footprint is a
+# whole number of cache lines. Splitting below a wave measured 2 us worse at
+# m=64 even though it doubles the grid.
+SHARD_CHUNKS_CHOICES = (64, 128)
+
 # Cache policy for the stores a TP peer reads. The value is the gfx950 CPol
 # field: 1 is sc0, 2 is nt, 16 is sc1, so 17 is the `sc0 sc1` write-through
 # that puts a store at the system coherence point without an L2 writeback.
@@ -66,6 +74,25 @@ def _emit_clear_local(config, local, token, column):
     )
 
 
+def _emit_quantize_vector(vector):
+    """MXFP8 one VECTOR_WIDTH chunk, sharing one exponent across its group.
+
+    A chunk is half an MXFP8 group, and the two halves of a group always land
+    on adjacent lanes, so one ``ds_bpermute`` against ``lane ^ 1`` is the whole
+    group reduction.
+    """
+    local_max = fx.Float32(1e-10).maximumf(fmath.absf(vector).reduce(ReductionOp.MAX))
+    lane = fx.Int32(gpu.thread_id("x")) & fx.Int32(63)
+    remote_bits = fx.rocdl.ds_bpermute(
+        T.i32,
+        (lane ^ fx.Int32(1)) * fx.Int32(4),
+        local_max.bitcast(fx.Int32),
+    )
+    local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(fx.Float32))
+    e8m0, quant_scale = e8m0_scale(local_max)
+    return e8m0, pack_fp8_words(vector, quant_scale, VECTOR_WIDTH // 4)
+
+
 def _emit_quantize_values(config, local, shared, token, column, zero_local):
     """Sum one VECTOR_WIDTH chunk with the shared partial, MXFP8 it."""
     h = config.shape.model_dim
@@ -84,17 +111,7 @@ def _emit_quantize_values(config, local, shared, token, column, zero_local):
     if zero_local:
         _emit_clear_local(config, local, token, column)
 
-    vector = fx.Vector.from_elements(values, fx.Float32)
-    local_max = fx.Float32(1e-10).maximumf(fmath.absf(vector).reduce(ReductionOp.MAX))
-    lane = fx.Int32(gpu.thread_id("x")) & fx.Int32(63)
-    remote_bits = fx.rocdl.ds_bpermute(
-        T.i32,
-        (lane ^ fx.Int32(1)) * fx.Int32(4),
-        local_max.bitcast(fx.Int32),
-    )
-    local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(fx.Float32))
-    e8m0, quant_scale = e8m0_scale(local_max)
-    return e8m0, pack_fp8_words(vector, quant_scale, VECTOR_WIDTH // 4)
+    return _emit_quantize_vector(fx.Vector.from_elements(values, fx.Float32))
 
 
 def _emit_publish_payload(config, partial, token, column, packed, cache_modifier):
@@ -372,6 +389,245 @@ def _rendezvous_geometry(work_items: int) -> tuple[int, int]:
             f"{RENDEZVOUS_FLAG_SLOTS} are reserved"
         )
     return block, grid
+
+
+def _shard_rendezvous_geometry(config: AtomicConfig) -> tuple[int, int, int, int]:
+    """Pick the (block, grid, column groups, chunks) shape of a shard rendezvous.
+
+    A block owns one column group of one row per shard, so the rows it reduces
+    are a quarter of the rows it quantizes and the work stays balanced across
+    the grid however the shards are split. That leaves the column split as the
+    only free dimension, and the narrowest one whose grid still fits the
+    reserved flags is the one that keeps the most blocks -- and so the most of
+    each phase's round trip -- in flight.
+    """
+    chunks_per_row = config.shape.model_dim // VECTOR_WIDTH
+    for shard_chunks in SHARD_CHUNKS_CHOICES:
+        if chunks_per_row % shard_chunks:
+            continue
+        column_groups = chunks_per_row // shard_chunks
+        grid = config.shard_rows * column_groups
+        if grid <= RENDEZVOUS_FLAG_SLOTS:
+            block = config.shape.tp_size * shard_chunks
+            return block, grid, column_groups, shard_chunks
+    raise ValueError(
+        f"m={config.m} model_dim={config.shape.model_dim} has no column split "
+        f"that fits {RENDEZVOUS_FLAG_SLOTS} rendezvous flags"
+    )
+
+
+def _emit_reduced_chunk(config, payload_base, scale_base, row, group, column):
+    """Decode one VECTOR_WIDTH chunk of one row of a rank's reduced shard."""
+    h = config.shape.model_dim
+    groups_per_row = h // 32
+    payload_row = buffer_tensor_from_addr(
+        payload_base + fx.Int64(row) * fx.Int64(h),
+        fx.Int32,
+        h,
+    )
+    words = load_fp8_words(
+        payload_row,
+        column // fx.Int32(4),
+        word_count=VECTOR_WIDTH // 4,
+        load_width=4,
+        cache_modifier=0,
+    )
+    scale_row = buffer_tensor_from_addr(
+        scale_base + fx.Int64(row) * fx.Int64(groups_per_row),
+        fx.Int8,
+        groups_per_row,
+    )
+    values = decode_scaled_fp8_f32(words, load_e8m0_scale(scale_row, group, 0))
+    return fx.Vector.from_elements(values, fx.Float32)
+
+
+@flyc.jit
+def _emit_publish_reduced(config, payload, scales, row, group, column, packed, e8m0):
+    """Store one re-quantized chunk of this rank's shard for its peers."""
+    h = config.shape.model_dim
+    groups_per_row = h // 32
+    payload_row = buffer_tensor_from_addr(
+        fx.Int64(ptrtoint(payload)) + fx.Int64(row) * fx.Int64(h),
+        fx.Int32,
+        h,
+    )
+    store_fp8_words(
+        payload_row,
+        column,
+        packed,
+        VECTOR_WIDTH // 4,
+        cache_modifier=PUBLISH_CACHE_MODIFIER,
+    )
+    if fx.Int32(gpu.thread_id("x")) % fx.Int32(32 // VECTOR_WIDTH) == fx.Int32(0):
+        scale_row = buffer_tensor_from_addr(
+            fx.Int64(ptrtoint(scales)) + fx.Int64(row) * fx.Int64(groups_per_row),
+            fx.Int8,
+            groups_per_row,
+        )
+        store_buffer(
+            scale_row,
+            group,
+            e8m0.to(fx.Int8),
+            fx.Int8,
+            cache_modifier=PUBLISH_CACHE_MODIFIER,
+        )
+
+
+@functools.cache
+def compile_fused_rsag(config: AtomicConfig, zero_local: bool):
+    """Quantize, reduce-scatter, and all-gather in a single launch.
+
+    The full reduce buys its single dispatch by having every rank read every
+    peer's whole payload -- three times the bytes a reduce-scatter moves. The
+    split pair keeps those bytes but pays three dispatches, measured at 1.8-2.4
+    us each, and hands the payload between them through memory twice.
+
+    A block can have both if it owns a column group of one row per shard: the
+    rows it reduces are exactly the rows of its own shard, and every peer's
+    block of the same index published exactly those rows, so the per-block
+    rendezvous that already covers the quantize covers the reduce as well. The
+    same holds one phase later -- peer ``p``'s block reduced the row this
+    block gathers from ``p`` -- so a second flag finishes the chain. Peer
+    bytes stay at the reduce-scatter optimum, the payload never leaves
+    registers between phases, and the whole tail is one dispatch.
+    """
+    shape = config.shape
+    h = shape.model_dim
+    tp = shape.tp_size
+    shard_rows = config.shard_rows
+    block, grid, column_groups, shard_chunks = _shard_rendezvous_geometry(config)
+    publish_flag = config.block_flag_offset(0)
+    reduced_flag = config.block_flag_offset(1)
+
+    @flyc.kernel(
+        name=(
+            f"gemm2_tp_atomic_pipeline_{shape.tag}_m{config.m}"
+            f"_fused_rsag_rendezvous_g{grid}_b{block}"
+            f"{'_zero_local' if zero_local else ''}"
+        ),
+        known_block_size=[block, 1, 1],
+    )
+    def kernel(
+        local: fx.Pointer,
+        shared: fx.Pointer,
+        partial: fx.Pointer,
+        partial_base: fx.Int64,
+        reduced_payload: fx.Pointer,
+        reduced_payload_base: fx.Int64,
+        reduced_scale: fx.Pointer,
+        reduced_scale_base: fx.Int64,
+        output: fx.Pointer,
+        rank: fx.Int32,
+    ):
+        thread = fx.Int32(gpu.thread_id("x"))
+        slot = thread // fx.Int32(shard_chunks)
+        lane = thread - slot * fx.Int32(shard_chunks)
+        worker = fx.Int32(gpu.block_id("x"))
+        shard_row = worker // fx.Int32(column_groups)
+        column_group = worker - shard_row * fx.Int32(column_groups)
+        column = (
+            column_group * fx.Int32(shard_chunks) + lane
+        ) * fx.Int32(VECTOR_WIDTH)
+        group = column // fx.Int32(32)
+        token = slot * fx.Int32(shard_rows) + shard_row
+
+        # Neither flag read is ordered, so issuing both up front hides their
+        # round trip behind the quantize below.
+        publish_epoch = emit_rendezvous_epoch(partial, publish_flag, tp)
+        reduced_epoch = emit_rendezvous_epoch(partial, reduced_flag, tp)
+
+        e8m0, packed = _emit_quantize_values(
+            config, local, shared, token, column, False
+        )
+        _emit_publish_payload(
+            config, partial, token, column, packed, PUBLISH_CACHE_MODIFIER
+        )
+        if lane % fx.Int32(32 // VECTOR_WIDTH) == fx.Int32(0):
+            _emit_publish_scale(
+                config, partial, token, column, e8m0, PUBLISH_CACHE_MODIFIER
+            )
+
+        # Write-through stores are at the coherence point once they retire, so
+        # draining them is the whole release the peers need.
+        fx.rocdl.s_waitcnt(0)
+        gpu.barrier()
+        emit_rendezvous_mark(partial, publish_flag, publish_epoch)
+
+        # Reseeding the accumulator is the one thing left that no peer gates,
+        # so it goes in the window where the peers are still catching up.
+        if const_expr(zero_local):
+            _emit_clear_local(config, local, token, column)
+        emit_rendezvous_acquire(partial_base, publish_flag, publish_epoch, tp)
+
+        if slot == rank:
+            acc = _emit_decoded_chunk(e8m0, packed)
+            for source_round in range_constexpr(tp - 1):
+                source = _emit_peer_rotation(shape, rank, shard_row, source_round)
+                acc = acc + _emit_source_chunk(
+                    config, peer_base(partial_base, source), token, group, column, 0
+                )
+            reduced_e8m0, reduced_packed = _emit_quantize_vector(acc)
+            _emit_publish_reduced(
+                config,
+                reduced_payload,
+                reduced_scale,
+                shard_row,
+                group,
+                column,
+                reduced_packed,
+                reduced_e8m0,
+            )
+            store_bf16(
+                _emit_local_row(output, token, h),
+                column,
+                _emit_decoded_chunk(reduced_e8m0, reduced_packed),
+                VECTOR_WIDTH,
+            )
+
+        fx.rocdl.s_waitcnt(0)
+        gpu.barrier()
+        emit_rendezvous_mark(partial, reduced_flag, reduced_epoch)
+        emit_rendezvous_acquire(partial_base, reduced_flag, reduced_epoch, tp)
+
+        if slot != rank:
+            gathered = _emit_reduced_chunk(
+                config,
+                peer_base(reduced_payload_base, slot),
+                peer_base(reduced_scale_base, slot),
+                shard_row,
+                group,
+                column,
+            )
+            store_bf16(_emit_local_row(output, token, h), column, gathered, VECTOR_WIDTH)
+
+    @flyc.jit
+    def launch(
+        local,
+        shared,
+        partial,
+        partial_base,
+        reduced_payload,
+        reduced_payload_base,
+        reduced_scale,
+        reduced_scale_base,
+        output,
+        rank,
+        stream,
+    ):
+        kernel(
+            local,
+            shared,
+            partial,
+            partial_base,
+            reduced_payload,
+            reduced_payload_base,
+            reduced_scale,
+            reduced_scale_base,
+            output,
+            rank,
+        ).launch(grid=(grid, 1, 1), block=(block, 1, 1), stream=stream)
+
+    return launch
 
 
 @functools.cache

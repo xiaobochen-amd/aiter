@@ -500,6 +500,22 @@ class _AtomicRunner:
             **stage2_kwargs,
         )
         stream = torch.cuda.current_stream(self.device)
+        if config.use_fused_rsag:
+            _run_compiled(
+                atomic.compile_fused_rsag(config, zero_local),
+                ptr_arg(self.accum),
+                ptr_arg(shared_partial),
+                ptr_arg(self.partial),
+                fx.Int64(self.partial_flat_base),
+                ptr_arg(self.reduced_payload),
+                fx.Int64(self.reduced_payload_base),
+                ptr_arg(self.reduced_scale),
+                fx.Int64(self.reduced_scale_base),
+                ptr_arg(self.output),
+                self.rank,
+                stream,
+            )
+            return self.output
         if config.use_full_reduce:
             _run_compiled(
                 atomic.compile_fused_reduce(config, zero_local),

@@ -26,6 +26,11 @@ RENDEZVOUS_FLAG_SLOTS = 256
 RENDEZVOUS_FLAG_STRIDE = PRODUCER_COUNTER_STRIDE
 RENDEZVOUS_PHASES = 2
 
+# Smallest bucket the single-launch shard rendezvous serves. It halves a full
+# reduce's peer bytes but adds a second in-kernel rendezvous and the round
+# trip behind it, and below this the bytes it saves stop paying for them.
+FUSED_RSAG_MIN_M = 32
+
 SUPPORTED_TP_SIZES = (2, 4, 8)
 
 
@@ -459,6 +464,18 @@ class AtomicConfig:
     @property
     def shard_rows(self) -> int:
         return self.m // self.shape.tp_size
+
+    @property
+    def use_fused_rsag(self) -> bool:
+        """Collapse quantize + reduce-scatter + all-gather into one launch.
+
+        Sharding the rendezvous by row lets one block own a column group of
+        one row per shard, which moves the reduce-scatter's peer bytes in the
+        full reduce's single dispatch, so where it applies it supersedes both
+        of the paths below. Only the smallest buckets stay behind, where the
+        bytes it saves no longer pay for its second rendezvous.
+        """
+        return self.m >= FUSED_RSAG_MIN_M
 
     @property
     def use_full_reduce(self) -> bool:
