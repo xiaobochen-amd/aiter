@@ -1034,6 +1034,26 @@ def quant_mxfp4_hip(
     return out_packed, out_scale
 
 
+@functools.lru_cache(maxsize=8)
+def _token_major_quant_moe_sort(cols: int, group_size: int):
+    """Token-major MXFP4 quant + sorted-scale scatter, or ``None`` if unusable.
+
+    The FlyDSL kernel uses the gfx950 native ``v_cvt_scalef32_pk_fp4_f32``.
+    """
+    if not get_gfx().startswith("gfx95"):
+        return None
+    try:
+        from .flydsl.kernels.moe_quant_sort_kernel import (
+            can_run_token_major_quant_sort,
+            token_major_mxfp4_quant_moe_sort,
+        )
+    except ImportError:
+        return None
+    if not can_run_token_major_quant_sort(cols, group_size):
+        return None
+    return token_major_mxfp4_quant_moe_sort
+
+
 def fused_dynamic_mx_quant_moe_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -1110,6 +1130,31 @@ def fused_dynamic_mx_quant_moe_sort(
         dtype=dtypes.fp8_e8m0,
         device=input.device,
     )
+    # Stage 1 has one input row per token but `topk` sorted rows per token, so
+    # the row-major fused kernel re-quantises every token `topk` times. The
+    # token-major kernel does the same work in one pass; stage 2 has a distinct
+    # input row per sorted row and is already redundancy-free.
+    token_major = (
+        _token_major_quant_moe_sort(N, group_size)
+        if is_stage1
+        and quant_dtype == dtypes.fp4x2
+        and num_rows is None
+        and sorted_ids.shape[0] >= 4
+        else None
+    )
+    if token_major is not None:
+        out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
+        token_major(
+            out,
+            scale,
+            input.view(-1, N),
+            sorted_ids,
+            num_valid_ids,
+            sorted_weights,
+            topk,
+        )
+        return out, scale
+
     use_fused = (
         (is_stage1 and M <= token_num_quant_moe_sort_switch[0])
         or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * eff_topk)
