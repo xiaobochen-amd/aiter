@@ -876,7 +876,6 @@ def _compile_moe_sorting_multiphase(
         weights_rsrc,
         sorted_ids_rsrc,
         sorted_w_rsrc,
-        mask_rsrc,
         my_expert,
         my_start,
         my_end,
@@ -884,7 +883,6 @@ def _compile_moe_sorting_multiphase(
         i32_scan_words_per_row,
         c_topk,
         K4_BLOCK,
-        has_mask,
     ):
 
         lane = tid % WARP_SIZE
@@ -892,17 +890,15 @@ def _compile_moe_sorting_multiphase(
         K4_NUM_WAVES = K4_BLOCK // WARP_SIZE
         c_zero, c_one, c4 = fx.Int32(0), fx.Int32(1), fx.Int32(4)
         c_ff, c_oob_idx = fx.Int32(0xFF), fx.Int32(0x7FFFFFFF)
-        p23_bid_enabled = c_one != c_zero
-        if has_mask:
-            p23_bid_mask = buffer_ops.buffer_load(
-                mask_rsrc, my_expert, vec_width=1, dtype=T.i32
-            )
-            p23_bid_enabled = p23_bid_mask != c_zero
+        # No mask load here: a masked expert's padded count is zeroed in step 1,
+        # so my_start == my_end and n_mesh_iters is already 0 for it. Loading
+        # the mask again would only put a DRAM miss in front of the mesh read.
         i32_words_per_row = i32_scan_words_per_row
         n_mesh_iters = (my_start != my_end).select(
             (i32_words_per_row + fx.Int32(K4_BLOCK - 1)) // fx.Int32(K4_BLOCK), c_zero
         )
         mesh_row_i32_base = (my_expert * i32_mesh_stride) >> fx.Int32(2)
+        p23_bid_enabled = c_one != c_zero
         for _si, state in range(
             fx.Index(0),
             ArithValue(n_mesh_iters).index_cast(T.index),
@@ -1222,10 +1218,10 @@ def _compile_moe_sorting_multiphase(
         total = c_zero
         for _w in range_constexpr(K3_NUM_WAVES):
             total = total + _lds_load_raw(reduce_mr, fx.Int32(_w))
+        total = is_local_expert.select(total, c_zero)
 
         cs_offset = i32_mesh_size + eid
-        c_oob_idx = fx.Int32(0x7FFFFFFF)
-        safe_cs = is_t0.select(cs_offset, c_oob_idx)
+        safe_cs = is_t0.select(cs_offset, c_oob)
         buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
 
     @flyc.jit
@@ -1288,7 +1284,6 @@ def _compile_moe_sorting_multiphase(
         c_zero = fx.Int32(0)
         c_oob = fx.Int32(0x7FFFFFFF)
         c_one = fx.Int32(1)
-        c_ff = fx.Int32(0xFF)
         c_topk = fx.Int32(topk)
         c_block = fx.Int32(P0V2_BLOCK)
 
@@ -1307,32 +1302,26 @@ def _compile_moe_sorting_multiphase(
                 ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
             )
 
-        # Phase 3 (count) only needs to scan words that can hold real mesh
-        # bytes -- the first tokens_ columns (dynamic per-call count), never
-        # the full static row width used by Phase 1's clear.
-        i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
-
         clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
         total_assignments = tokens_ * c_topk
         scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
-        count_niters = (i32_scan_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(
-            9
-        )
+        # Phase 3 re-scans topk_ids instead of reading the mesh row back. The two
+        # agree because a token's topk slots hold distinct experts, so the number
+        # of assignments matching this expert equals the number of non-zero bytes
+        # Phase 2 wrote into its row -- the same uniqueness the mesh itself relies
+        # on to keep Phase 2 store-conflict-free.
+        count_niters = scatter_niters
 
         # Hoist before if/else: AST rewriter extracts branches into separate
         # functions, so variables must be defined in outer scope first.
         is_local_expert = c_one != c_zero
-        # EP: load mask, write cumsum=0 for masked experts, set loop bounds to 0
+        # EP: the mask does not gate the loop trip counts, only the count this
+        # block publishes. A masked expert therefore still clears and scatters
+        # its own mesh row -- harmless, because its published count of 0 makes
+        # p23 derive my_start == my_end and skip that row entirely.
         if has_mask:
             m_val = buffer_ops.buffer_load(mask_rsrc, eid, vec_width=1, dtype=T.i32)
             is_local_expert = m_val != c_zero
-            should_write_zero = (~is_local_expert) & (tid == c_zero)
-            buffer_ops.buffer_store(
-                c_zero, ws_rsrc, should_write_zero.select(i32_mesh_size + eid, c_oob)
-            )
-            clear_niters = is_local_expert.select(clear_niters, c_zero)
-            scatter_niters = is_local_expert.select(scatter_niters, c_zero)
-            count_niters = is_local_expert.select(count_niters, c_zero)
 
         # ---- Phase 1: Clear this expert's mesh row ----
         for _ci in range(
@@ -1378,9 +1367,7 @@ def _compile_moe_sorting_multiphase(
                     val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
                 )
 
-        gpu.barrier()
-
-        # ---- Phase 3: Count non-zero bytes + warp/cross-wave reduce ----
+        # ---- Phase 3: Count this expert's assignments + warp/cross-wave reduce ----
         for _ki, state in range(
             fx.Index(0),
             ArithValue(count_niters).index_cast(T.index),
@@ -1389,20 +1376,13 @@ def _compile_moe_sorting_multiphase(
         ):
             cnt_so_far = state[0]
 
-            word_base = fx.Int32(_ki) * c_block + tid
-            valid = word_base < i32_scan_words_per_row
-            safe_addr = mesh_row_i32_base + valid.select(word_base, c_zero)
-            word = buffer_ops.buffer_load(ws_rsrc, safe_addr, vec_width=1, dtype=T.i32)
-
-            b0 = word & c_ff
-            b1 = (word >> fx.Int32(8)) & c_ff
-            b2 = (word >> fx.Int32(16)) & c_ff
-            b3 = (word >> fx.Int32(24)) & c_ff
-            nz0 = valid.select((b0 != c_zero).select(c_one, c_zero), c_zero)
-            nz1 = valid.select((b1 != c_zero).select(c_one, c_zero), c_zero)
-            nz2 = valid.select((b2 != c_zero).select(c_one, c_zero), c_zero)
-            nz3 = valid.select((b3 != c_zero).select(c_one, c_zero), c_zero)
-            iter_cnt = nz0 + nz1 + nz2 + nz3
+            flat_c = fx.Int32(_ki) * c_block + tid
+            valid = flat_c < total_assignments
+            safe_flat_c = valid.select(flat_c, c_zero)
+            eid_c = buffer_ops.buffer_load(
+                topk_rsrc, safe_flat_c, vec_width=1, dtype=T.i32
+            )
+            iter_cnt = (valid & (eid_c == eid)).select(c_one, c_zero)
 
             new_cnt = cnt_so_far + iter_cnt
             results = yield [new_cnt]
@@ -1672,7 +1652,6 @@ def _compile_moe_sorting_multiphase(
                 weights_rsrc,
                 sorted_ids_rsrc,
                 sorted_w_rsrc,
-                mask_rsrc,
                 my_expert,
                 my_start,
                 my_end,
@@ -1680,7 +1659,6 @@ def _compile_moe_sorting_multiphase(
                 i32_scan_words_per_row,
                 c_topk,
                 K4_BLOCK,
-                has_mask,
             )
 
             # Step 5: Fill padding with sentinel for THIS expert (parallel)

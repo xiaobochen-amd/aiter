@@ -310,13 +310,29 @@ def _flydsl_moe_sorting(
     expert_mask,
     num_local_tokens,
     accumulate=True,
+    num_local_experts=None,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    # Sort-buffer bound. Only *local* experts can own sorted rows (the kernel
+    # zeroes the padded count of every masked expert), and each one is padded up
+    # to a whole block, so it wastes at most block_size - 1 rows -- never a whole
+    # block. Hence sum_e ceil(cnt_e / block) * block <= numel + E_local * (block
+    # - 1), which also bounds the block count by max_num_m_blocks. num_experts is
+    # the *global* count (it indexes topk_ids / expert_mask); using it here, or
+    # the looser + E * block - topk form, buys dead rows that every consumer
+    # keyed on sorted_ids.shape[0] then pays for: the fused quant+sort grid, the
+    # sorted activation scale buffer, and the stage1/stage2 gemm grid.y. The
+    # tight form also matters on its own, because that kernel re-derives
+    # num_experts = (sorted_ids.size(0) + topk - topk * M) / block_size and picks
+    # sub_block_m = 2 (instead of 4) only while that estimate stays under 64.
+    sizing_experts = num_experts
+    if num_local_experts is not None:
+        sizing_experts = min(int(num_local_experts), num_experts)
+    max_num_tokens_padded = int(topk_ids.numel() + sizing_experts * (block_size - 1))
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
@@ -364,6 +380,7 @@ def moe_sorting(
     accumulate=True,
     flat=False,
     output_aux=False,
+    num_local_experts=None,
 ):
     if (
         not _USE_CK_MOE_SORTING
@@ -384,6 +401,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             accumulate=accumulate,
+            num_local_experts=num_local_experts,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
@@ -991,6 +1009,10 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
+            # E is the local expert count (w1/w2 leading dim) and equals the
+            # number of set entries in expert_mask, since sorted_expert_ids
+            # carries the mask's prefix-sum index into w1.
+            num_local_experts=E,
         )
         if need_local_topk_ids:
             (
