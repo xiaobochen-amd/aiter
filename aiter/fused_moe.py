@@ -2833,17 +2833,27 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
+        # Per token tier: (tile_m, stage1 tile_n, stage1 suffix, stage2 suffix).
         if token < 2048:
-            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
+            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 32, 128, "_w2", "_bnt2"
         elif token < 4096:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
+            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 64, 128, "_w3_bnt0", ""
         elif token < 16384:
-            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
+            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 128, 128, "_w2_bnt0", ""
         else:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 64, 128, "_w4_bnt0", ""
+        # Decode-sized a4w4 stage1 is a weight-streaming GEMM: one workgroup walks
+        # a whole expert slab, so its cost is set by how many K streams it keeps in
+        # flight, not by how wide N is. At tile_n=128 all four waves sit on the
+        # same K walk. Re-splitting the same four waves as two N-waves x two
+        # K-waves (tile_n=64 + _kw2) keeps the thread count, the tile bytes and the
+        # LDS budget unchanged while doubling both the in-flight K streams per
+        # workgroup and the workgroup count. Staying at four waves is what matters:
+        # tile_n=32/_kw4 ties this, while tile_n=64/_kw4 needs eight and loses.
+        if (_a_type, _w_type) == ("fp4", "fp4") and token < 2048:
+            _s1_tn, _s1_sfx = 64, "_w3_kw2"
         _base_kn1 = flydsl_kernel_name(
-            1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+            1, _a_type, _w_type, _out_type, _tile_m, _s1_tn, 256
         )
         _base_kn2 = flydsl_kernel_name(
             2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"

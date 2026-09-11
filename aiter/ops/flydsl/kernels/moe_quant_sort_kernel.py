@@ -84,6 +84,69 @@ def _lds_store(raw_ptr, val, idx):
     fx.ptr_store(val, raw_ptr + fx.Int64(idx))
 
 
+def quantize_mxfp4_chunk(raw):
+    """One thread's ``ELEMS_PER_THREAD`` bf16 inputs -> (packed fp4, E8M0).
+
+    A 32-element MX group spans ``LANES_PER_GROUP`` consecutive lanes, so the
+    amax reduction is an xor shuffle across them. |x| >= 0, so the fp32 bit
+    pattern orders the same way as the value and the reduce can stay on the
+    (always-available) i32 shuffle path.
+    """
+    values = Vec(raw).bitcast(fx.BFloat16).to(fx.Float32)
+    local_max = fmath.absf(values).reduce(ReductionOp.MAX)
+    local_max = local_max.maximumf(fx.Float32(1e-10))
+
+    lm_i = local_max.bitcast(fx.Int32)
+    for sh in range_constexpr(LANES_PER_GROUP.bit_length() - 1):
+        peer = lm_i.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WARP_SIZE))
+        lm_i = (peer > lm_i).select(peer, lm_i)
+
+    working = (
+        lm_i.bitcast(fx.Float32)
+        * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)
+    ).bitcast(fx.Int32)
+    biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
+    e8m0 = ((working & fx.Int32(0x7FFFFF)) != fx.Int32(0)).select(
+        biased_exp + fx.Int32(1), biased_exp
+    )
+    e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
+
+    dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+    packed = fx.Int32(0)
+    for pair in range_constexpr(ELEMS_PER_THREAD // 2):
+        packed = rocdl.cvt_scalef32_pk_fp4_f32(
+            T.i32,
+            packed,
+            values[2 * pair],
+            values[2 * pair + 1],
+            dequant_scale,
+            pair,
+        )
+    return fx.Int32(packed), e8m0
+
+
+def mx_scale_col_offset(col):
+    """Column-only half of ``mx_scale_shuffle_idx``.
+
+    The swizzle separates into a row-only and a column-only term, so a lane
+    that owns one column computes this once and reuses it for every row.
+    """
+    return (
+        ((col >> fx.Int32(3)) << fx.Int32(8))
+        + ((col & fx.Int32(3)) << fx.Int32(6))
+        + (((col & fx.Int32(7)) >> fx.Int32(2)) << fx.Int32(1))
+    )
+
+
+def mx_scale_row_offset(row, tile_bytes):
+    """Row-only half of ``mx_scale_shuffle_idx``; see ``mx_scale_col_offset``."""
+    return (
+        (row >> fx.Int32(5)) * fx.Int32(tile_bytes)
+        + ((row & fx.Int32(15)) << fx.Int32(2))
+        + ((row & fx.Int32(31)) >> fx.Int32(4))
+    )
+
+
 @functools.lru_cache(maxsize=64)
 def _compile_token_major_quant_sort(
     *,
@@ -144,7 +207,6 @@ def _compile_token_major_quant_sort(
 
         c_zero = fx.Int32(0)
         c_one = fx.Int32(1)
-        c_wave = fx.Int32(WARP_SIZE)
         c_topk = fx.Int32(sort_topk)
         c_wflag = fx.Int32(ROW_INV_ZERO_WEIGHT)
 
@@ -233,66 +295,22 @@ def _compile_token_major_quant_sort(
                 slot_rows.append(row)
 
         # ---- Phase 2: quantise this token's column slice, once ----
-        values = Vec(raw).bitcast(fx.BFloat16).to(fx.Float32)
-        local_max = fmath.absf(values).reduce(ReductionOp.MAX)
-        local_max = local_max.maximumf(fx.Float32(1e-10))
-
-        # A 32-element MX group spans 4 consecutive lanes. |x| >= 0, so the
-        # fp32 bit pattern orders the same way as the value and the reduce
-        # can stay on the (always-available) i32 shuffle path.
-        lm_i = local_max.bitcast(fx.Int32)
-        for sh in range_constexpr(2):
-            peer = lm_i.shuffle_xor(fx.Int32(1 << sh), c_wave)
-            lm_i = (peer > lm_i).select(peer, lm_i)
-
-        working = (
-            lm_i.bitcast(fx.Float32)
-            * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)
-        ).bitcast(fx.Int32)
-        biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-        e8m0 = ((working & fx.Int32(0x7FFFFF)) != c_zero).select(
-            biased_exp + c_one, biased_exp
-        )
-        e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
-
-        dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-        packed = fx.Int32(0)
-        for pair in range_constexpr(ELEMS_PER_THREAD // 2):
-            packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32,
-                packed,
-                values[2 * pair],
-                values[2 * pair + 1],
-                dequant_scale,
-                pair,
-            )
+        packed, e8m0 = quantize_mxfp4_chunk(raw)
         out_dw_base = in_row * fx.Int32(cols // 8) + part * fx.Int32(block)
-        buffer_ops.buffer_store(fx.Int32(packed), out_rsrc, out_dw_base + tid)
+        buffer_ops.buffer_store(packed, out_rsrc, out_dw_base + tid)
 
         # ---- Phase 3: scatter the E8M0 bytes into the swizzled sorted rows ----
-        # mx_scale_shuffle_idx(scale_n_pad, x, y) splits into a row-only and a
-        # column-only half, so the column half is computed once per lane.
         col = part * fx.Int32(scale_n_local) + (tid >> fx.Int32(2))
-        col_addr = (
-            ((col >> fx.Int32(3)) << fx.Int32(8))
-            + ((col & fx.Int32(3)) << fx.Int32(6))
-            + (((col & fx.Int32(7)) >> fx.Int32(2)) << fx.Int32(1))
-        )
+        col_addr = mx_scale_col_offset(col)
         for pss in range_constexpr(n_passes):
             packed_row = slot_rows[pss]
             keep = ((packed_row & c_wflag) == c_zero).select(c_one, c_zero)
             row = packed_row & fx.Int32(ROW_MASK)
             if packed_row >= c_zero:
-                addr = (
-                    (row >> fx.Int32(5)) * fx.Int32(tile_bytes)
-                    + ((row & fx.Int32(15)) << fx.Int32(2))
-                    + ((row & fx.Int32(31)) >> fx.Int32(4))
-                    + col_addr
-                )
                 buffer_ops.buffer_store(
                     (e8m0 * keep).to(fx.Uint8),
                     scale_rsrc,
-                    addr,
+                    mx_scale_row_offset(row, tile_bytes) + col_addr,
                     offset_is_bytes=True,
                 )
 
