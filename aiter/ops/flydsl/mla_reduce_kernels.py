@@ -307,15 +307,15 @@ def _uniform_i32(value):
 # eight waves of one row read one 8 KB contiguous span per split and their LSE
 # columns land in the same scalar-cache lines.
 #
-# Benched standalone, one head per CTA looks 8-10% better at decode row counts
+# Benched standalone, one head per CTA is 8-10% better at decode row counts
 # (2.243 against 2.497 us at seq 48) because it turns seq*2 blocks into seq*16.
-# In situ it is not: the partials were just written by the producer, whose
-# split-major ownership leaves row `t` in one XCD's L2, and CTA `row*16 + b`
-# spreads a row's reads over all eight L2 domains where `row*2 + b` spreads them
-# over two. Measured end to end behind the producer, one head per CTA costs
-# +0.9% at seq 60 and +1.7% at seq 84. Re-time this against the producer, not
-# alone, before changing it.
-_COMBINE_HEADS_PER_CTA = 8
+# Behind the producer it used to be worse (+0.9% at seq 60, +1.7% at seq 84):
+# with the old `row * blocks_per_row + b` numbering, raising blocks_per_row from
+# 2 to 16 spread one row's reads from two L2 domains over all eight. Now that
+# the grid is row-minor the block count no longer steers which domain a CTA
+# lands in, and the standalone ordering wins in situ too, by 0.5% at seq 48 and
+# seq 60. Re-time this against the producer, not alone, before changing it.
+_COMBINE_HEADS_PER_CTA = 1
 
 # Longest split column the scalar LSE path takes. It reads the whole column with
 # wave-uniform s_loads and rebuilds each split weight in VALU, which removes two
@@ -356,9 +356,14 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
         seq: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
-        block = fx.Int32(fx.block_idx.x)
-        block_in_row = block % fx.Int32(blocks_per_row)
-        row = block // fx.Int32(blocks_per_row)
+        # Row on grid-x, the row's slot group on grid-y, so the flat workgroup
+        # index is `block_in_row * seq + row` -- the producer's own split-major
+        # owner formula. gfx950 hands workgroup `i` to XCD `i % 8`, so every CTA
+        # that reads row `r` now lands in the same L2 domain that wrote it
+        # instead of the `row * blocks_per_row + b` numbering, which spread a
+        # row's partials over `blocks_per_row` domains.
+        row = fx.Int32(fx.block_idx.x)
+        block_in_row = fx.Int32(fx.block_idx.y)
         if fx.const_expr(heads_per_cta > 1):
             lane = tid % fx.Int32(64)
             slot = block_in_row * fx.Int32(heads_per_cta) + _uniform_i32(
@@ -475,7 +480,7 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
         stream: fx.Stream,
     ):
         kernel(partial_output, partial_lse, final_output, seq).launch(
-            grid=(seq * fx.Int32(blocks_per_row), 1, 1),
+            grid=(seq, blocks_per_row, 1),
             block=(threads, 1, 1),
             stream=stream,
             value_attrs={"rocdl.waves_per_eu": 4},

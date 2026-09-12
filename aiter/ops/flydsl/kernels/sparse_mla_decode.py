@@ -48,6 +48,7 @@ def _exp2(value):
     return fx.Float32(fx.rocdl.exp2(T.f32, fx.Float32(value).ir_value()))
 
 
+
 def _pack_i32x2(lo, hi):
     return fx.Vector.from_elements([lo, hi], fx.Int32).bitcast(fx.Int64)[0]
 
@@ -75,6 +76,7 @@ def compile_sparse_mla_partial(
     waves_per_eu: int = 1,
     split_major: bool = False,
     use_buffer: bool = True,
+    xpf_prime: int = 1,
 ):
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
@@ -84,6 +86,9 @@ def compile_sparse_mla_partial(
             f"inner_iter={inner_iter} must be a power-of-two divisor of ng={ng}"
         )
     n_groups = ng // inner_iter
+    # Fold the online-softmax rescale into the PV MFMA. See the loop body. A
+    # single tile has nothing to rescale, so it keeps the plain form.
+    seeded = inner_iter > 1
 
     @fx.struct
     class PartialStorage:
@@ -100,8 +105,10 @@ def compile_sparse_mla_partial(
         name=(
             f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}_xor_partner_w128"
             + f"_pf{_XPF_DEPTH}_primed_qflat"
+            + ("_fusedrescale" if seeded else "")
             + ("_split_major" if split_major else "")
             + ("_buf" if use_buffer else "")
+            + (f"_prime{xpf_prime}" if xpf_prime > _XPF_DEPTH else "")
         ),
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
@@ -274,8 +281,14 @@ def compile_sparse_mla_partial(
                     tid + fx.Int32(c * PARTIAL_THREADS) for c in fx.range_constexpr(2)
                 ]
             ]
+            # The prologue may run deeper than the steady state: the first two
+            # tiles have nothing to hide behind, so issuing both before the Q
+            # publish folds their two serial index->KV chases into one burst.
             pipeline = [
-                issue_gather(k) for k in fx.range_constexpr(min(_XPF_DEPTH, inner_iter))
+                issue_gather(k)
+                for k in fx.range_constexpr(
+                    min(max(xpf_prime, _XPF_DEPTH), inner_iter)
+                )
             ]
             for q_data, q_dst in q_held:
                 fx.ptr_store(q_data.bitcast(fx.Uint8), q_dst)
@@ -327,8 +340,20 @@ def compile_sparse_mla_partial(
                 # The next tile's rows are independent of everything below, and
                 # the registers just published to LDS are free, so issue that
                 # gather now and let the softmax and PV work hide its latency.
-                if fx.const_expr(k_i + _XPF_DEPTH < inner_iter):
-                    pipeline.append(issue_gather(k_i + _XPF_DEPTH))
+                if fx.const_expr(
+                    len(pipeline) < inner_iter
+                    and len(pipeline) - (k_i + 1) < _XPF_DEPTH
+                ):
+                    pipeline.append(issue_gather(len(pipeline)))
+
+                def key_operand(cc):
+                    klo = fx.ptr_load(
+                        key_base + fx.Int32(cc * 128), result_type=v4u8_t
+                    ).bitcast(fx.Int32)
+                    khi = fx.ptr_load(
+                        key_base + fx.Int32(cc * 128 + 64), result_type=v4u8_t
+                    ).bitcast(fx.Int32)
+                    return join8(klo, khi)
 
                 score = _mfma128(
                     fx.Vector.from_elements(
@@ -339,13 +364,7 @@ def compile_sparse_mla_partial(
                     fx.Vector.filled(4, 0.0, fx.Float32),
                 )
                 for cc in fx.range_constexpr(4):
-                    klo = fx.ptr_load(
-                        key_base + fx.Int32(cc * 128), result_type=v4u8_t
-                    ).bitcast(fx.Int32)
-                    khi = fx.ptr_load(
-                        key_base + fx.Int32(cc * 128 + 64), result_type=v4u8_t
-                    ).bitcast(fx.Int32)
-                    score = _mfma128(join8(klo, khi), bq[cc], score)
+                    score = _mfma128(key_operand(cc), bq[cc], score)
 
                 ids = fx.ptr_load(
                     lds.ilds.ptr
@@ -384,8 +403,26 @@ def compile_sparse_mla_partial(
                 tile_max = fx.Float32(float("-inf"))
                 for ww in fx.range_constexpr(PARTIAL_WAVES):
                     tile_max = tile_max.maximumf(fx.Float32(lds.rmax[ww * H + head]))
-                max_safe = (tile_max == fx.Float32(float("-inf"))).select(
-                    fx.Float32(0.0), tile_max
+                # Rescaling P by `beta` before the fp8 pack instead of rescaling
+                # the PV result after it: both put the tile's contribution on the
+                # running maximum's scale, but this way the factor rides along in
+                # the exponent that is computed anyway. The fp8 grid then covers
+                # `beta * P` rather than `P`, so a tile below the running maximum
+                # keeps fewer mantissa bits, in proportion to how little it
+                # contributes; measured end to end this lowers the sparse-MLA
+                # relative L2 against the fp32 reference from 0.0262 to 0.0249.
+                if fx.const_expr(seeded):
+                    scale_max = running_max.maximumf(tile_max)
+                    # Folding beta into P left alpha depending only on
+                    # loop-carried state, so it no longer has to wait for the
+                    # rsum rendezvous below and can issue alongside it.
+                    alpha = (running_denom == fx.Float32(0.0)).select(
+                        fx.Float32(0.0), _exp2(running_max - scale_max)
+                    )
+                else:
+                    scale_max = tile_max
+                max_safe = (scale_max == fx.Float32(float("-inf"))).select(
+                    fx.Float32(0.0), scale_max
                 )
                 probs = [None] * 4
                 prob_sum = fx.Float32(0.0)
@@ -426,7 +463,7 @@ def compile_sparse_mla_partial(
 
                 # The four per-wave sums are folded here, once per tile, rather
                 # than carried per wave and folded in the last tile. Deferring
-                # them is exact -- the fold is linear in alpha/beta and the
+                # them is exact -- the fold is linear in the rescale and the
                 # `denom == 0` sentinels equal the wave-uniform `max == -inf` --
                 # but it is slower: the four ds_read_b32 below are the first LDS
                 # traffic after the barrier and they cover the latency of the
@@ -446,19 +483,18 @@ def compile_sparse_mla_partial(
                         ),
                     )
                 else:
-                    next_max = running_max.maximumf(tile_max)
-                    alpha = (running_denom == fx.Float32(0.0)).select(
-                        fx.Float32(0.0), _exp2(running_max - next_max)
-                    )
-                    beta = (tile_denom == fx.Float32(0.0)).select(
-                        fx.Float32(0.0), _exp2(tile_max - next_max)
-                    )
-                    next_denom = running_denom * alpha + tile_denom * beta
-                    output_scale = beta * fx.Float32(1.0 / FP8_MAX)
+                    # `probs` already carry beta, so `tile_denom` does too and the
+                    # accumulator stays in units of FP8_MAX until the epilogue.
+                    next_denom = running_denom * alpha + tile_denom
                     if fx.const_expr(k_i + 1 == inner_iter):
                         final_inv_denom = (next_denom == fx.Float32(0.0)).select(
                             fx.Float32(0.0),
-                            fx.Float32(fx.rocdl.rcp(T.f32, next_denom.ir_value())),
+                            fx.Float32(
+                                fx.rocdl.rcp(
+                                    T.f32,
+                                    (next_denom * fx.Float32(FP8_MAX)).ir_value(),
+                                )
+                            ),
                         )
 
                 p4 = fx.ptr_load(
@@ -474,7 +510,16 @@ def compile_sparse_mla_partial(
                 ) * (head % fx.Int32(2))
                 for j in fx.range_constexpr(8):
                     dv_base = (wave * fx.Int32(8) + fx.Int32(j)) * 16
-                    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    # Seeding the MFMA's C operand with the rescaled running
+                    # accumulator makes the online-softmax update the same
+                    # instruction as the product: the 16 `v_pk_mul_f32` that
+                    # scaled this tile's PV result and the 16 `v_pk_add_f32`
+                    # that merged it are gone, leaving only alpha's 16 per tile
+                    # per wave. That block was the kernel's largest.
+                    if fx.const_expr(seeded):
+                        acc = fx.Vector(running_acc[j]) * alpha
+                    else:
+                        acc = fx.Vector.filled(4, 0.0, fx.Float32)
                     for half in fx.range_constexpr(2):
                         vptr = (
                             lds.vlds.ptr
@@ -500,21 +545,17 @@ def compile_sparse_mla_partial(
                             partial_ptr + out_record * DV + fx.Int64(out_col),
                         )
                     else:
-                        next_acc = (
-                            fx.Vector(running_acc[j]) * alpha
-                            + fx.Vector(acc) * output_scale
-                        )
                         if fx.const_expr(k_i + 1 == inner_iter):
                             out_col = dv_base + fx.Int32(4) * group
                             fx.ptr_store(
-                                (fx.Vector(next_acc) * final_inv_denom).to(fx.BFloat16),
+                                (fx.Vector(acc) * final_inv_denom).to(fx.BFloat16),
                                 partial_ptr + out_record * DV + fx.Int64(out_col),
                             )
                         else:
-                            running_acc[j] = next_acc
+                            running_acc[j] = fx.Vector(acc)
 
                 if fx.const_expr(inner_iter > 1):
-                    running_max = next_max
+                    running_max = scale_max
                     running_denom = next_denom
                     if fx.const_expr(k_i + 1 < inner_iter):
                         fx.gpu.barrier()

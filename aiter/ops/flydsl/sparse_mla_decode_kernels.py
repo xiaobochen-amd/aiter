@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 
@@ -43,6 +44,11 @@ def _note_config(seq, ng, inner_iter, n_groups, split_major, use_buffer, kv_byte
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _num_cu(device_index: int) -> int:
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
 
@@ -79,6 +85,77 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
             break
         inner_iter = candidate
     return inner_iter
+
+
+def _decode_inner_iter(seq: int, ng_total: int, num_cu: int) -> int:
+    """Return the producer grouping the decode launcher dispatches.
+
+    `_pick_inner_iter` stops at 4 because grouping 8 collapses from seq 72 up.
+    It is not the grouping itself that fails there but the CTA count: its CTAs
+    are four times as fat, so the grid crosses one CTA per CU at seq 72 and
+    every straggler costs eight tiles of tail. Inside the window where the grid
+    still covers the CU array without doubling up, grouping 8 keeps the
+    producer's bandwidth and halves the combine's partial traffic. Measured on
+    the full producer+combine
+    call (same process, ABBA, min of 5 palindromic passes, relative to grouping
+    4 with the same prologue depth), with `_pick_xpf_prime`'s deeper prologue in
+    the right-hand column:
+
+        seq   ctas   inner_iter=8   + deeper prologue
+         32    128        +32.0%              +22.9%
+         40    160         +6.9%               -3.3%
+         48    192         -4.2%               -6.3%
+         60    240         -3.6%               -5.4%
+         64    256         -4.7%               -4.6%
+         72    288         +5.9%               +4.9%
+         84    336         +3.7%               +2.0%
+
+    Both walls are sharp: below about five eighths of a CTA per CU the producer
+    can no longer keep enough gathers in flight to saturate HBM, and above one
+    CTA per CU the fat-CTA tail dominates. Only shapes that already earn
+    grouping 4 are offered the wider one, which keeps the window at seq 48..64
+    -- exactly the range measured above.
+    """
+    inner_iter = _pick_inner_iter(seq, ng_total)
+    if inner_iter == 4 and ng_total % 8 == 0:
+        wide_ctas = seq * (ng_total // 8)
+        if num_cu * 5 // 8 <= wide_ctas <= num_cu:
+            inner_iter = 8
+    return inner_iter
+
+
+def _pick_xpf_prime(inner_iter: int, producer_ctas: int, num_cu: int) -> int:
+    """Return how many tiles the producer's prologue issues before the Q publish.
+
+    The steady-state pipeline keeps one tile's gather in flight, issued from the
+    body of the tile before it. The first two tiles have no earlier body to be
+    issued from, so their two index->KV chases run back to back while the CU has
+    nothing else to do. Issuing both before the Q publish folds them into one
+    burst, which is free in registers (VGPR 162 -> 166, still three CTAs per CU)
+    and bit-exact.
+
+    It only pays while the CU has spare gather capacity. Measured on the full
+    producer+combine call (same process, ABBA, min of 5 palindromic passes):
+
+        ctas/CU   inner_iter=4   inner_iter=8
+            0.63              -          -9.5%
+           0.75-1.0           -       -2.2% .. -1.9%
+            1.25          -0.0%              -
+            1.5           -2.2%              -
+           1.75-2.0    -1.7% .. -2.7%        -
+            2.25          +2.0%              -
+            2.6           +0.8%              -
+            3.0           +0.6%              -
+
+    Past two CTAs per CU the third co-resident CTA already has the outstanding
+    misses the deeper burst was meant to add, and the extra queueing shows up as
+    wall time. Groupings below 4 own too few tiles to prefetch at all: issuing
+    two of an inner_iter=2 CTA's tiles up front is the whole CTA at once, which
+    is the `_XPF_DEPTH=2` schedule measured at +1.6% on seq 14.
+    """
+    if inner_iter < 4:
+        return 1
+    return 2 if producer_ctas <= 2 * num_cu else 1
 
 
 def _partial_groups(ng_total: int, inner_iter: int) -> int:
@@ -124,7 +201,9 @@ def sparse_mla_decode_workspace_shape(
     ng = width // BLOCK_I
     if not 1 <= ng <= 33:
         raise ValueError(f"supported split count is 1..33, got {ng}")
-    ng_partial = _partial_groups(ng, _pick_inner_iter(seq, ng))
+    ng_partial = _partial_groups(
+        ng, _decode_inner_iter(seq, ng, _num_cu(torch.cuda.current_device()))
+    )
     return (seq, ng_partial, H, DV), (seq, ng_partial, H)
 
 
@@ -231,7 +310,7 @@ def _launch_partial(
 ) -> None:
     n_groups = _partial_groups(ng, inner_iter)
     seq = int(q.shape[0])
-    num_cu = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
+    num_cu = _num_cu(q.device.index)
     split_major = _split_major_folds_q(seq, n_groups) or _use_split_major(
         seq, n_groups, num_cu
     )
@@ -247,6 +326,7 @@ def _launch_partial(
         inner_iter=inner_iter,
         split_major=split_major,
         use_buffer=use_buffer,
+        xpf_prime=_pick_xpf_prime(inner_iter, seq * n_groups, num_cu),
     )
     _run_compiled(
         launch,
@@ -278,7 +358,7 @@ def flydsl_sparse_mla_decode(
     allocated eagerly for convenience.
     """
     seq, ng = _validate_sparse_decode_inputs(q, kv, indices, out)
-    inner_iter = _pick_inner_iter(seq, ng)
+    inner_iter = _decode_inner_iter(seq, ng, _num_cu(q.device.index))
     ng_partial = _partial_groups(ng, inner_iter)
     if (partial_output is None) != (partial_lse is None):
         raise ValueError(
