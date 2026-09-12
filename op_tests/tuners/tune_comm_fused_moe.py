@@ -485,6 +485,7 @@ def candidate_configs(
     *,
     shape: Shape | None = None,
     m: int | None = None,
+    a_dtype: str | None = None,
 ):
     if current is None and family == "current":
         raise ValueError("family='current' requires a production config")
@@ -497,6 +498,11 @@ def candidate_configs(
     axes = {}
     if current is not None and type(current) is config_type:
         axes = {name: (getattr(current, name),) for name in config_fields}
+    # The activation precision must agree with the case the candidates are
+    # scored against, so it follows --a-dtype rather than the field default.
+    # An explicit --axis a_dtype=... below still wins.
+    if a_dtype is not None and "a_dtype" in config_fields:
+        axes["a_dtype"] = (a_dtype,)
     for spec in axis_specs:
         name, separator, raw_values = spec.partition("=")
         if not separator or name not in config_fields:
@@ -613,6 +619,11 @@ def _parse_args():
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--route", choices=("uniform", "skew"), default="uniform")
+    parser.add_argument(
+        "--a-dtype", choices=("fp4", "fp8"), default="fp8", dest="a_dtype",
+        help="Stage2 activation precision. GLM-5.2 dispatches fp4; fp8 is the "
+             "original a8w4 pipeline and stays the default.",
+    )
     parser.add_argument("--seed", type=int, default=20260819)
     parser.add_argument(
         "--family",
@@ -696,6 +707,11 @@ def main():
             )
         if args.ordinary_only:
             return
+        # q_dtype_a is part of the table key, so it has to record the
+        # precision actually tuned. Leaving it at the fp8 default would write
+        # an a4w4 row under the a8w4 key: deployment (which looks it up as
+        # float4_e2m1fn_x2) would never find it, and the a8w4 row it collides
+        # with would be silently replaced.
         shape = ShapeKey(
             get_gfx_runtime(),
             args.model_dim,
@@ -704,11 +720,21 @@ def main():
             args.topk,
             args.tp,
             get_cu_num(),
+            q_dtype_a=(
+                "torch.float4_e2m1fn_x2"
+                if args.a_dtype == "fp4"
+                else "torch.float8_e4m3fn"
+            ),
         )
         from aiter.ops.flydsl.comm_fused_moe_host import winners_for
 
         try:
             current = winners_for(shape).get(args.token)
+        except (PermissionError, FileNotFoundError):
+            # The tuned table lives in the repo, which is a root-squashed NFS
+            # mount inside the container -- unreadable here. An explicit
+            # --family does not need a production winner anyway.
+            current = None
         except KeyError:
             # Dispatch treats a shape with no tuned rows as an error, but that
             # is the normal starting state here: a shape has no rows until this
@@ -725,6 +751,7 @@ def main():
             tuple(args.axis),
             shape=shape.kernel_shape(),
             m=args.token,
+            a_dtype=args.a_dtype,
         )
         if rank == 0:
             print(
