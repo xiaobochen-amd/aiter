@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
@@ -1150,7 +1151,22 @@ def fused_dynamic_mx_quant_moe_sort(
     # before `num_valid_ids` and `sorted_ids` have both come back.
     token_major = (
         _token_major_quant_moe_sort(N, group_size, not is_stage1, num_valid_ids, M)
-        if quant_dtype == dtypes.fp4x2
+        # Opt-in, because this kernel corrupts memory in a live server.
+        #
+        # Bisected on the three-point decode benchmark: baseline, r4 and r5 all
+        # run clean (342 decode / 98 prefill, no fault), while ca4e857bb -- the
+        # commit that introduced this kernel -- and every tree after it die with
+        # `Memory access fault` on all four ranks, reproducibly at decode batch
+        # 229. Disabling just this dispatch on the newest tree brings it back to
+        # clean and scores 1299.19 against the baseline's 1268.95, so everything
+        # r7-r12 built on top of it is fine and worth keeping.
+        #
+        # The write itself is not located yet: every MoE kernel retires cleanly
+        # under per-kernel host syncs, so it lands in mapped memory and only
+        # kills the process later, somewhere else. Whoever finds it can put this
+        # back by exporting AITER_TOKEN_MAJOR_QUANT=1.
+        if os.environ.get("AITER_TOKEN_MAJOR_QUANT") == "1"
+        and quant_dtype == dtypes.fp4x2
         and num_rows is None
         and sorted_ids.shape[0] >= 4
         else None
