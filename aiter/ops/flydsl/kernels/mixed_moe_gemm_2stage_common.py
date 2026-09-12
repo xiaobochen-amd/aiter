@@ -252,7 +252,10 @@ def compile_mixed_moe_gemm1_common(
     else:
         klen = k_dim
 
-    bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
+    # tile_k counts A elements; an fp4 A tile is half that many bytes.
+    bytes_x_per_tile = (
+        int(tile_m) * int(tile_k) * int(a_elem_bytes) // int(a_elem_vec_pack)
+    )
     # For k_wave=1 this equals total_threads (unchanged behaviour).
     if bytes_x_per_tile % a_load_threads != 0:
         raise ValueError(
@@ -3446,6 +3449,7 @@ def compile_mixed_moe_gemm2_common(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     shared_expert_id: int | None = None,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
@@ -3490,8 +3494,41 @@ def compile_mixed_moe_gemm2_common(
     scale_pack_m = 2
     scale_pack_n = 2
     scale_pack_k = 2
+
+    # Intra-block slice-K: the 4 waves are repartitioned as num_n_waves along N
+    # times k_wave along K. Each K-wave walks its own klen-long slice of the
+    # reduction and the partials are summed through LDS before the epilogue.
+    if const_expr(int(k_wave) not in (1, 2, 4)):
+        raise ValueError(f"k_wave must be 1, 2 or 4, got {k_wave}")
+    k_wave = int(k_wave)
+    num_waves_total = 4
+    num_n_waves = num_waves_total // k_wave
+    a_load_threads = num_n_waves * 64
+    klen = int(inter_dim) // k_wave
+    num_acc_n = (int(tile_n) // num_n_waves) // 16
+    if const_expr(num_acc_n < 1):
+        raise ValueError(
+            f"tile_n={tile_n} is too small for k_wave={k_wave}: each of the "
+            f"{num_n_waves} N-waves needs at least 16 columns"
+        )
+    if const_expr(k_wave > 1):
+        if const_expr(heterogeneous_b):
+            raise ValueError("k_wave > 1 is not supported with heterogeneous B")
+        if const_expr(int(inter_dim) % (k_wave * int(tile_k)) != 0):
+            raise ValueError(
+                f"inter_dim={inter_dim} must be divisible by k_wave*tile_k="
+                f"{k_wave * int(tile_k)}"
+            )
+        if const_expr(klen % (scale_pack_k * 128) != 0):
+            raise ValueError(
+                f"k_wave slice klen={klen} must be divisible by "
+                f"{scale_pack_k * 128} so the scale k0 offset stays integral"
+            )
+        if const_expr(int(inter_dim_pad) != 0):
+            raise ValueError("k_wave > 1 does not support a padded inter_dim")
+
     pack_M = min(scale_pack_m, tile_m // 16)
-    pack_N = min(scale_pack_n, tile_n // 64)
+    pack_N = min(scale_pack_n, num_acc_n)
     k_unroll_raw = int(tile_k) // 128
     pack_K = min(scale_pack_k, k_unroll_raw)
 
@@ -3579,15 +3616,27 @@ def compile_mixed_moe_gemm2_common(
         return T.i32
 
     total_threads = 256
-    bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
-    if const_expr(bytes_x_per_tile % total_threads != 0):
+    # tile_k counts A elements, so an fp4 A tile occupies half that many bytes
+    # (a_elem_vec_pack=2). Sizing the cooperative load by element count instead
+    # of byte count asks for twice the chunks the tile has; the surplus chunks
+    # wrap back onto chunk 0 and re-load/re-store bytes already staged.
+    bytes_x_per_tile = (
+        int(tile_m) * int(tile_k) * int(a_elem_bytes) // int(a_elem_vec_pack)
+    )
+    # Only the num_n_waves lanes of one K-group stage a given A tile; for
+    # k_wave=1 this is the whole block, exactly as before.
+    if const_expr(bytes_x_per_tile % a_load_threads != 0):
         raise ValueError(
             "tile_m*tile_k*elem_bytes must be divisible by "
-            f"{total_threads}: tile_m={tile_m}, tile_k={tile_k}, elem_bytes={a_elem_bytes}"
+            f"{a_load_threads}: tile_m={tile_m}, tile_k={tile_k}, elem_bytes={a_elem_bytes}"
         )
-    bytes_per_thread_x = bytes_x_per_tile // total_threads
+    bytes_per_thread_x = bytes_x_per_tile // a_load_threads
 
     lds_stride = tile_k
+    # LDS row pitch in bytes. fp4 A packs two elements per byte, so a tile_k row
+    # is tile_k/2 bytes wide and the xor16 swizzle only needs that many 16B
+    # slots; the async path already staged it this way.
+    eff_lds_stride_py = lds_stride // a_elem_vec_pack
 
     if const_expr(out_is_f32):
         _use_cshuffle_epilog = bool(use_cshuffle_epilog)
@@ -3619,7 +3668,8 @@ def compile_mixed_moe_gemm2_common(
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu is not None else ""
     if const_expr(waves_per_eu is not None and not (1 <= int(waves_per_eu) <= 10)):
         raise ValueError(f"waves_per_eu must be in [1, 10] or None, got {waves_per_eu}")
-    num_k_tiles_per_batch = int(inter_dim) // int(tile_k)
+    num_k_tiles_per_batch = klen // int(tile_k)
+    kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     async_tag = "_async" if use_async_copy else ""
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
@@ -3634,17 +3684,28 @@ def compile_mixed_moe_gemm2_common(
     else:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
-            f"{cumul_tag}{xcd_tag}{acc_tag}"
+            f"{cumul_tag}{xcd_tag}{acc_tag}{kw_tag}"
         )
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
     ).replace("-", "_")
-    lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+    # Each K-group owns its own double-buffered A tile.
+    lds_x_bytes = k_wave * 2 * int(tile_m) * int(eff_lds_stride_py) * int(a_elem_bytes)
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    # Cross-wave partial reduction scratch, overlaid on the (dead) A staging
+    # area once the K loop is done: one vec4-f32 slot per lane per accumulator.
+    if const_expr(k_wave > 1):
+        lds_reduce_bytes = (
+            num_waves_total * 64 * (num_acc_n * (int(tile_m) // 16)) * 4 * 4
+        )
+    else:
+        lds_reduce_bytes = 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
-    lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes + lds_tw_bytes
+    lds_total_bytes = (
+        max(lds_x_bytes, lds_out_bytes, lds_reduce_bytes) + lds_tid_bytes + lds_tw_bytes
+    )
     lds_total_elems = lds_total_bytes if a_elem_bytes == 1 else (lds_total_bytes // 2)
 
     def x_lds_elem():
@@ -3721,12 +3782,8 @@ def compile_mixed_moe_gemm2_common(
                 arith, c_mn=c_n_total, c_k=c_k_orig
             )
 
-            if const_expr(use_async_copy and a_elem_vec_pack > 1):
-                eff_lds_stride = lds_stride // a_elem_vec_pack
-                eff_tile_k_bytes = tile_k_bytes // a_elem_vec_pack
-            else:
-                eff_lds_stride = lds_stride
-                eff_tile_k_bytes = tile_k_bytes
+            eff_lds_stride = eff_lds_stride_py
+            eff_tile_k_bytes = tile_k_bytes // a_elem_vec_pack
 
             shape_lds = fx.make_shape(tile_m, eff_lds_stride)
             stride_lds = fx.make_stride(eff_lds_stride, 1)
@@ -3793,9 +3850,11 @@ def compile_mixed_moe_gemm2_common(
                 else None
             )
 
-            lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+            lds_x_b = (
+                k_wave * 2 * int(tile_m) * int(eff_lds_stride_py) * int(a_elem_bytes)
+            )
             lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
-            lds_tid_off = max(lds_x_b, lds_out_b)
+            lds_tid_off = max(lds_x_b, lds_out_b, lds_reduce_bytes)
             lds_tid = SmemPtr(
                 base_ptr, lds_x_ptr.byte_offset + lds_tid_off, T.i32, shape=(tile_m,)
             ).get()
@@ -4069,7 +4128,27 @@ def compile_mixed_moe_gemm2_common(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
                 )
                 c_chunk_i32 = arith.constant(chunk_i32, index=True)
-                tx_i32_base = tx * c_chunk_i32
+                # Waves [g*num_n_waves, (g+1)*num_n_waves) form K-group g, so the
+                # group id and the within-group tid come straight off tx.
+                if const_expr(k_wave > 1):
+                    wave_k_id = _div_pow2(tx, a_load_threads)
+                    x_load_tid = _mod_pow2(tx, a_load_threads)
+                    # Start of this K-group's slice, in A elements / B bytes /
+                    # packed-scale k0 cells respectively.
+                    kw_k_off = wave_k_id * arith.constant(klen, index=True)
+                    kw_k_off_bk = wave_k_id * arith.constant(
+                        klen // b_byte_div, index=True
+                    )
+                    kw_scale_k0 = wave_k_id * arith.constant(
+                        klen // (scale_pack_k * 128), index=True
+                    )
+                    kw_lds_off = wave_k_id * arith.constant(
+                        2 * int(tile_m) * int(eff_lds_stride_py), index=True
+                    )
+                else:
+                    wave_k_id = None
+                    x_load_tid = tx
+                tx_i32_base = x_load_tid * c_chunk_i32
 
                 topk_i32 = arith.constant(topk)
                 mask24 = arith.constant(0xFFFFFF)
@@ -4080,7 +4159,7 @@ def compile_mixed_moe_gemm2_common(
                         arith,
                         tx_i32_base=tx_i32_base,
                         i=i,
-                        total_threads=total_threads,
+                        total_threads=a_load_threads,
                         layout_tile_div4=layout_x_tile_div4,
                         chunk_i32=chunk_i32,
                     )
@@ -4126,7 +4205,7 @@ def compile_mixed_moe_gemm2_common(
                         int(tile_m) * int(eff_lds_stride) * int(a_elem_bytes)
                     )
                     num_x_addr_loads = max(
-                        1, eff_bytes_pre // (total_threads * dma_bytes_pre)
+                        1, eff_bytes_pre // (a_load_threads * dma_bytes_pre)
                     )
                 else:
                     num_x_addr_loads = num_x_loads
@@ -4188,12 +4267,11 @@ def compile_mixed_moe_gemm2_common(
 
                 col_offset_base = lane_div_16 * arith.constant(16, index=True)
 
-                num_waves = 4
-                body_n_per_wave = body_tile_n // num_waves
+                body_n_per_wave = body_tile_n // num_n_waves
                 body_num_acc_n = body_n_per_wave // 16
                 c_n_per_wave = arith.constant(body_n_per_wave, index=True)
-                wave_mod_4 = _mod_pow2(wave_id, 4)
-                n_tile_base = wave_mod_4 * c_n_per_wave
+                wave_n_id = _mod_pow2(wave_id, num_n_waves)
+                n_tile_base = wave_n_id * c_n_per_wave
 
                 body_by_n = by * arith.constant(tile_n, index=True) + arith.constant(
                     body_n_offset, index=True
@@ -4369,6 +4447,8 @@ def compile_mixed_moe_gemm2_common(
                         + k_lane * scale_info.stride_klane
                         + n_lane
                     )
+                    if const_expr(k_wave > 1):
+                        idx_pack = idx_pack + kw_scale_k0 * scale_info.stride_k0
                     s = buffer_ops.buffer_load(rsrc, idx_pack, vec_width=1, dtype=T.i32)
                     return vector.from_elements(T.vec(1, T.i32), [s])
 
@@ -4784,9 +4864,9 @@ def compile_mixed_moe_gemm2_common(
 
                     return acc_list, epilogue_pf
 
-                lds_tile_elems = arith.constant(tile_m * lds_stride, index=True)
-                lds_base_cur = arith.index(0)
-                lds_base_nxt = lds_tile_elems
+                lds_tile_elems = arith.constant(tile_m * eff_lds_stride_py, index=True)
+                lds_base_cur = kw_lds_off if const_expr(k_wave > 1) else arith.index(0)
+                lds_base_nxt = lds_base_cur + lds_tile_elems
 
                 rocdl.sched_barrier(0)
 
@@ -4908,8 +4988,12 @@ def compile_mixed_moe_gemm2_common(
                 if const_expr(not r216_defer_tid):
                     emit_tid_lds_prologue()
 
-                k0 = arith.index(0)
-                k0_bk = k0
+                if const_expr(k_wave > 1):
+                    k0 = kw_k_off
+                    k0_bk = kw_k_off_bk
+                else:
+                    k0 = arith.index(0)
+                    k0_bk = k0
                 if const_expr(r139_xdma_first):
                     prefetch_x_to_lds(k0, lds_base_cur)
                     rocdl.sched_barrier(0)
@@ -4976,7 +5060,11 @@ def compile_mixed_moe_gemm2_common(
 
                 if const_expr(k_main2_py > 0):
                     for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
-                        k_iv = arith.index(k_iv_py)
+                        k_iv = (
+                            (kw_k_off + arith.constant(k_iv_py, index=True))
+                            if const_expr(k_wave > 1)
+                            else arith.index(k_iv_py)
+                        )
                         next_k1 = k_iv + tile_k
                         next_k1_py = k_iv_py + tile_k
                         next_k1_bk = next_k1 // b_byte_div
@@ -5081,10 +5169,14 @@ def compile_mixed_moe_gemm2_common(
                     )
 
                 else:
-                    k_tail1 = (k_in + tile_k - 1) // tile_k * tile_k - tile_k
-                    k_tail1_py = (
-                        int(inter_dim) + tile_k - 1
-                    ) // tile_k * tile_k - tile_k
+                    if const_expr(k_wave > 1):
+                        k_tail1_py = (num_k_tiles_py - 1) * int(tile_k)
+                        k_tail1 = kw_k_off + arith.constant(k_tail1_py, index=True)
+                    else:
+                        k_tail1 = (k_in + tile_k - 1) // tile_k * tile_k - tile_k
+                        k_tail1_py = (
+                            int(inter_dim) + tile_k - 1
+                        ) // tile_k * tile_k - tile_k
                     k_tail1_bk = k_tail1 // b_byte_div
                     if const_expr(use_async_copy):
                         prefetch_x_to_lds(k_tail1, lds_base_ping)
@@ -5372,6 +5464,50 @@ def compile_mixed_moe_gemm2_common(
                             alignment=e_vec * out_elem_bytes,
                         )
 
+                if const_expr(k_wave > 1):
+                    # Sum the k_wave partials of every N-wave through the (now
+                    # dead) A staging area; peers end up with identical accs and
+                    # write identical values in the epilogue.
+                    nm = body_num_acc_n * m_repeat
+                    grp_stride = 64 * nm
+                    scr_ty = _mT.memref(
+                        num_waves_total * grp_stride * 4, f32, memory_space=_lds_space()
+                    )
+                    scr = memref.view(
+                        scr_ty,
+                        base_ptr,
+                        arith.constant(lds_alloc_offset, index=True),
+                        sizes=[],
+                    )
+                    c_gs = arith.constant(grp_stride, index=True)
+                    c_sv4 = arith.constant(4, index=True)
+                    c_sv64 = arith.constant(64, index=True)
+                    my_base = wave_id * c_gs + lane_id
+                    gpu.barrier()
+                    for ai in range_constexpr(nm):
+                        sidx = (
+                            my_base + arith.constant(ai, index=True) * c_sv64
+                        ) * c_sv4
+                        vector.store(acc[ai], scr, [sidx], alignment=16)
+                    gpu.barrier()
+                    for ai in range_constexpr(nm):
+                        ai_off = arith.constant(ai, index=True) * c_sv64 + lane_id
+                        vs = []
+                        for g in range_constexpr(k_wave):
+                            peer = (
+                                arith.constant(g * num_n_waves, index=True) + wave_n_id
+                            )
+                            vs.append(
+                                vector.load_op(
+                                    vec4_f32, scr, [(peer * c_gs + ai_off) * c_sv4]
+                                )
+                            )
+                        sv = vs[0]
+                        for g in range_constexpr(1, k_wave):
+                            sv = arith.addf(sv, vs[g])
+                        acc[ai] = sv
+                    # No trailing barrier: CShuffle's leading barrier already gates
+
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
@@ -5383,6 +5519,8 @@ def compile_mixed_moe_gemm2_common(
                     tile_m=tile_m,
                     tile_n=body_tile_n,
                     e_vec=e_vec,
+                    # A 32-wide tile only spans 16 e_vec-sized lanes.
+                    cshuffle_nlane=min(32, body_tile_n // e_vec),
                     m_repeat=m_repeat,
                     num_acc_n=body_num_acc_n,
                     tx=tx,

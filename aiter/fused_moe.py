@@ -1595,6 +1595,7 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        k_wave=parsed.get("k_wave", 1),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
     )
@@ -2850,13 +2851,22 @@ def get_2stage_cfgs(
         # LDS budget unchanged while doubling both the in-flight K streams per
         # workgroup and the workgroup count. Staying at four waves is what matters:
         # tile_n=32/_kw4 ties this, while tile_n=64/_kw4 needs eight and loses.
+        _s2_tn = 128
         if (_a_type, _w_type) == ("fp4", "fp4") and token < 2048:
             _s1_tn, _s1_sfx = 64, "_w3_kw2"
+            # Stage2 streams weights the same way, but its reduction is fixed at
+            # inter_dim, so the K axis has nothing left to give: splitting it
+            # (_kw2/_kw4) measures neutral-to-worse. What it does have is a wide
+            # N (model_dim), and at tile_n=128 the 32-row M tile leaves most CUs
+            # idle at decode sizes. tile_n=64 doubles the workgroup count over
+            # model_dim while each of the four waves still owns a full 16-column
+            # MFMA block, so the added blocks land on otherwise idle CUs.
+            _s2_tn = 64
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, _s1_tn, 256
         )
         _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            2, _a_type, _w_type, _out_type, _tile_m, _s2_tn, _s2_tk, "atomic"
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"

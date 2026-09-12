@@ -291,7 +291,8 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     is_fp8 = b_dtype == "fp8"
-    tile_ns = [128, 256] if is_fp4 else [128]
+    # tile_n=32 only tiles with k_wave>1 (each N-wave needs >=16 columns).
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [128]
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
@@ -329,11 +330,27 @@ def get_flydsl_stage2_kernels(
                                 "b_nt": bnt,
                                 "xcd_swizzle": xcd,
                             }
-                            kernels[base_name] = base_params
-                            kernels[base_name + "_persist"] = {
-                                **base_params,
-                                "persist": True,
-                            }
+                            if tn >= 64:
+                                kernels[base_name] = base_params
+                                kernels[base_name + "_persist"] = {
+                                    **base_params,
+                                    "persist": True,
+                                }
+                            # k_wave (intra-block K-slice): the 4 waves are
+                            # repartitioned as (4/kw) N-waves x kw K-waves, so
+                            # each N-wave still needs >=16 columns and the K
+                            # slice must stay tile_k-aligned.
+                            # bf16 A routes to the a16w-mix port, which has no
+                            # k_wave axis; don't register names it would ignore.
+                            if not is_fp4 or mode != "atomic" or a_dtype == "bf16":
+                                continue
+                            for kw in (2, 4):
+                                if tn // (4 // kw) < 16:
+                                    continue
+                                kernels[f"{base_name}_kw{kw}"] = {
+                                    **base_params,
+                                    "k_wave": kw,
+                                }
     _register_production_variants_stage2(kernels, a_dtype, b_dtype, out_dtype)
     return kernels
 
@@ -719,6 +736,7 @@ def compile_flydsl_moe_stage2(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
@@ -769,6 +787,7 @@ def compile_flydsl_moe_stage2(
             # (`_bnt{N}` / `_xcd{N}` registry suffixes).
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
+            k_wave=k_wave,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
@@ -2003,6 +2022,7 @@ def _flydsl_moe_stage2_impl(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     bias: torch.Tensor | None = None,
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
@@ -2245,6 +2265,7 @@ def _flydsl_moe_stage2_impl(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
+        k_wave=k_wave,
         enable_bias=(bias is not None),
     )
     _run_compiled(exe, args)
@@ -2299,6 +2320,7 @@ def flydsl_moe_stage2(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     bias: torch.Tensor | None = None,
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
@@ -2352,6 +2374,7 @@ def flydsl_moe_stage2(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
+        k_wave=k_wave,
         bias=bias,
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
