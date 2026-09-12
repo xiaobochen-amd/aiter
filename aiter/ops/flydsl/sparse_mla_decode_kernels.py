@@ -14,35 +14,37 @@ from .kernels.sparse_mla_decode import BLOCK_I, DIM, DV, H, compile_sparse_mla_p
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
-
-# gfx950 (MI355X); _validate_sparse_decode_inputs already gates the arch, and
-# sparse_mla_decode_workspace_shape is a pure sizing helper with no device to
-# query, so the CU count has to be a constant here.
-_NUM_CU = 256
+# Largest KV pool the producer can address with 32-bit byte offsets.
+_BUFFER_MAX_BYTES = 1 << 31
+# L2 domains the dispatcher rotates workgroups through on gfx950.
+_XCDS = 8
 
 
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
 
     Each producer CTA is one wavefront handling `inner_iter` 64-key tiles, so
-    the grid is `seq * (ng_total // inner_iter)` CTAs and its cost is dominated
-    by how the *last* scheduling wave quantises onto the CU array -- a tail
-    effect, not the monotonic "more CTAs is better" the previous threshold
-    assumed. Measured at topk=2048 on MI355X, inner_iter 2 vs 4 swings either
-    way purely on where that tail lands:
+    the grid is `seq * (ng_total // inner_iter)` CTAs. Two effects compete: a
+    larger grouping shortens the grid (and the combine, which sees one partial
+    row per group) while a smaller one gives the CU array more independent
+    tiles to overlap.
 
-        seq  ctas(ii4)  util ii4 -> ii2   measured ii2 vs ii4
-         48        384   0.75 -> 1.00           -2.94%
-         60        480   0.94 -> 0.94           +9.33%
-         72        576   0.75 -> 0.90           -7.15%
-         84        672   0.88 -> 0.88           +7.31%
-         96        768   1.00 -> 1.00           +3.23%
+    The producer now prefetches tile k+1's gather while tile k's softmax and PV
+    run, so a CTA covers its own memory latency as long as it owns more than one
+    tile, and the balance moved decisively toward the larger grouping. Measured
+    on the ruler at topk=2048 (ng_total 32), speedup per decode shape:
 
-    Picking the best tail utilisation and breaking ties toward the *larger*
-    grouping -- fewer partials also means a cheaper combine, measured at
-    +0.32 us per doubling of the split count -- reproduces all five. The old
-    `min_producer_ctas` threshold picked inner_iter 4 for every seq >= 48 and so
-    got seq 48 and 72 wrong.
+        seq   ii=2    ii=4    ii=8
+         48  1.028   1.096   1.086
+         60  1.082   1.070   1.099
+         72  1.082   1.085   0.837
+         84      -   1.153   0.938
+         96      -   1.139   0.993
+
+    inner_iter 4 wins or ties everywhere -- seq 48 by 6.6% over the tail-utilisation
+    tie-break this function used to apply -- while 8 collapses as soon as the grid
+    drops near one CTA per CU (seq 72 and up). So take the largest grouping the
+    CTA-count floors allow and stop at 4.
     """
     inner_iter = 1
     while inner_iter < 4:
@@ -53,19 +55,6 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
         if seq * (ng_total // candidate) < min_producer_ctas:
             break
         inner_iter = candidate
-
-    # Only refine the fully-merged case. Below it the grid is still short enough
-    # that raw CTA count dominates and the threshold above is right; here the
-    # grid is several waves deep, so the tail decides. Splitting further is not
-    # free (one more partial per token for the combine), so only take it when
-    # the tail strictly improves -- ties keep the coarser, cheaper grouping.
-    if inner_iter == 4:
-        def _tail_util(groups: int) -> float:
-            ctas = seq * groups
-            return ctas / (-(-ctas // _NUM_CU) * _NUM_CU)
-
-        if _tail_util(ng_total // 2) > _tail_util(ng_total // 4):
-            inner_iter = 2
     return inner_iter
 
 
@@ -78,8 +67,27 @@ def _partial_groups(ng_total: int, inner_iter: int) -> int:
 
 
 def _use_split_major(seq: int, n_groups: int, num_cu: int) -> bool:
-    """Use split-major ownership only once the producer grid is saturated."""
+    """Use split-major ownership once the producer grid is saturated."""
     return seq * n_groups >= 2 * num_cu
+
+
+def _split_major_folds_q(seq: int, n_groups: int) -> bool:
+    """Report whether split-major ownership shrinks the Q fetch fan-out.
+
+    Workgroups go round robin over the device's `_XCDS` L2 domains, so with
+    token-major ownership (`owner = tok * n_groups + split`) a token's CTAs land
+    on `min(n_groups, _XCDS)` different domains and every one of them pulls the
+    token's whole 9 KB Q block off chip. Split-major (`owner = split * seq +
+    tok`) steps `owner` by `seq`, so the fan-out drops to
+    `_XCDS // gcd(seq, _XCDS)` -- one domain whenever seq is a multiple of
+    `_XCDS`, two for the odd multiples of four.
+
+    Measured on the producer alone (same process, ABBA, min of 12): switching
+    seq 48 and 60 over is -3.4% and -5.2%, and a constant-Q ablation prices the
+    whole off-chip Q fetch at 4.2% and 3.5% there, so nearly all of it is this
+    fan-out. The saturation rule above left both shapes token-major.
+    """
+    return _XCDS // math.gcd(seq, _XCDS) < min(n_groups, _XCDS)
 
 
 def sparse_mla_decode_workspace_shape(
@@ -199,10 +207,20 @@ def _launch_partial(
     inner_iter: int,
 ) -> None:
     n_groups = _partial_groups(ng, inner_iter)
+    seq = int(q.shape[0])
     num_cu = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
-    split_major = _use_split_major(int(q.shape[0]), n_groups, num_cu)
+    split_major = _split_major_folds_q(seq, n_groups) or _use_split_major(
+        seq, n_groups, num_cu
+    )
+    # The gather addresses the pool with 32-bit buffer offsets, which is one
+    # VGPR per address instead of a 64-bit pair. Pools that cannot be reached
+    # that way fall back to 64-bit pointer arithmetic.
+    use_buffer = kv.numel() * kv.element_size() < _BUFFER_MAX_BYTES
     launch = compile_sparse_mla_partial(
-        ng, inner_iter=inner_iter, split_major=split_major
+        ng,
+        inner_iter=inner_iter,
+        split_major=split_major,
+        use_buffer=use_buffer,
     )
     _run_compiled(
         launch,

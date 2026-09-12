@@ -16,6 +16,8 @@ from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
+from . import buffer_ops
+
 H = 16
 DV = 512
 DT = 64
@@ -25,6 +27,8 @@ FP8_MAX = 448.0
 PARTIAL_THREADS = 256
 PARTIAL_WAVES = 4
 PITCH = DV + 16
+# Tiles whose gather is in flight at once inside a producer CTA.
+_XPF_DEPTH = 1
 
 
 @contextmanager
@@ -70,6 +74,7 @@ def compile_sparse_mla_partial(
     inner_iter: int = 1,
     waves_per_eu: int = 1,
     split_major: bool = False,
+    use_buffer: bool = True,
 ):
     """Compile the 64-key BF16-partial, log2-LSE producer."""
     if not 1 <= ng <= 33:
@@ -93,8 +98,10 @@ def compile_sparse_mla_partial(
 
     @flyc.kernel(
         name=(
-            f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}_xor_partner"
+            f"flydsl_sparse_mla_partial_ng{ng}_ii{inner_iter}_xor_partner_w128"
+            + f"_pf{_XPF_DEPTH}_primed_qflat"
             + ("_split_major" if split_major else "")
+            + ("_buf" if use_buffer else "")
         ),
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
@@ -128,6 +135,28 @@ def compile_sparse_mla_partial(
                 fx.Int32
             )
 
+        if fx.const_expr(use_buffer):
+            # 32-bit buffer offsets: one VGPR per address instead of a 64-bit
+            # pair, so the gather drops its per-lane v_add_co/v_addc chain.
+            kv_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(fx.ptrtoint(kv_ptr))
+            )
+
+            def kvload16(row, dword):
+                return fx.Vector(
+                    buffer_ops.buffer_load(
+                        kv_rsrc,
+                        row * fx.Int32(DIM // 4) + dword,
+                        vec_width=4,
+                        dtype=fx.Int32,
+                    )
+                )
+
+        else:
+
+            def kvload16(row, dword):
+                return load16(kv_ptr, fx.Int64(row) * DIM + fx.Int64(dword) * 4)
+
         def join8(lo, hi):
             return fx.Vector.from_elements(
                 [lo[i] for i in fx.range_constexpr(4)]
@@ -138,36 +167,6 @@ def compile_sparse_mla_partial(
         # Keep this as a compile-time region. A runtime guard here makes the
         # FlyDSL rewriter capture LDS handles as branch state.
         if fx.const_expr(True):
-            # Wave zero publishes Q once; every wave reuses its lane-major LDS view.
-            q_base = (fx.Int64(tok) * H + fx.Int64(head)) * DIM
-            qlane = lds.qlds.ptr + lane * fx.Int32(144)
-            if wave == fx.Int32(0):
-                for cc in fx.range_constexpr(4):
-                    lo = load16(q_ptr, q_base + cc * 128 + fx.Int64(group) * 16)
-                    hi = load16(q_ptr, q_base + cc * 128 + 64 + fx.Int64(group) * 16)
-                    fx.ptr_store(lo.bitcast(fx.Uint8), qlane + fx.Int32(cc * 32))
-                    fx.ptr_store(hi.bitcast(fx.Uint8), qlane + fx.Int32(cc * 32 + 16))
-                tail = load16(q_ptr, q_base + DV + fx.Int64(group) * 16)
-                fx.ptr_store(tail.bitcast(fx.Uint8), qlane + fx.Int32(128))
-            fx.gpu.barrier()
-
-            bq = [None] * 5
-            for cc in fx.range_constexpr(4):
-                lo = fx.ptr_load(qlane + fx.Int32(cc * 32), result_type=v4u8_t).bitcast(
-                    fx.Int32
-                )
-                hi = fx.ptr_load(
-                    qlane + fx.Int32(cc * 32 + 16), result_type=v4u8_t
-                ).bitcast(fx.Int32)
-                bq[cc] = join8(lo, hi)
-            tail = fx.ptr_load(qlane + fx.Int32(128), result_type=v4u8_t).bitcast(
-                fx.Int32
-            )
-            bq[4] = fx.Vector.from_elements(
-                [tail[i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
-                fx.Int32,
-            )
-
             # QK-to-PV lane permutation for one 64-key tile.
             slot = (
                 fx.Int32(32) * (wave // fx.Int32(2))
@@ -175,6 +174,27 @@ def compile_sparse_mla_partial(
                 + fx.Int32(4) * (wave % fx.Int32(2))
                 + head % fx.Int32(4)
             )
+            # Gather view of the same 16 rows: eight lanes share one row and
+            # cover 128 contiguous bytes of it, so a request spans a full pair
+            # of cache lines instead of 64 B. Lanes 0..7 of every group serve
+            # the wave's rows `head` 0..7 and lanes 8..15 serve `head` 8..15,
+            # whose slots sit exactly 16 apart.
+            wide_slot = (
+                fx.Int32(32) * (wave // fx.Int32(2))
+                + fx.Int32(8) * (lane // fx.Int32(32))
+                + fx.Int32(4) * (wave % fx.Int32(2))
+                + (lane // fx.Int32(8)) % fx.Int32(4)
+            )
+            wide_dword = (lane % fx.Int32(8)) * fx.Int32(4)
+            wide_low_base = (
+                lds.vlds.ptr + wide_slot * fx.Int32(PITCH) + wide_dword * fx.Int32(4)
+            )
+            wide_high_base = wide_low_base + fx.Int32(16 * PITCH)
+            # QK wants row `head` in lane `head`, which no wide gather can
+            # produce, so the operand is read back from the LDS copy the PV
+            # stage needs anyway. Writer and reader are the same wave, so this
+            # adds no barrier.
+            key_base = lds.vlds.ptr + slot * fx.Int32(PITCH) + group * fx.Int32(16)
             out_record = (fx.Int64(tok) * n_groups + fx.Int64(split)) * H + fx.Int64(
                 head
             )
@@ -184,52 +204,148 @@ def compile_sparse_mla_partial(
                 fx.Vector.filled(4, 0.0, fx.Float32) for _ in fx.range_constexpr(8)
             ]
 
-            for k_i in fx.range_constexpr(inner_iter):
+            def issue_gather(k_i):
+                """Issue one tile's gather; nothing here touches LDS."""
                 # Preserve the direct reducer's XOR tree: for ng=32 and
                 # inner_iter=2, merge (0,16), (1,17), ... rather than adjacent
                 # rows.  This removes one real partial row per pair while
                 # matching the reducer's first active shuffle level.
                 tile = split + fx.Int32(k_i * n_groups)
-                index_offset = (
-                    fx.Int64(tok) * (ng * BLOCK_I)
-                    + fx.Int64(tile * fx.Int32(BLOCK_I))
-                    + fx.Int64(slot)
+                index_base = fx.Int64(tok) * (ng * BLOCK_I) + fx.Int64(
+                    tile * fx.Int32(BLOCK_I)
                 )
-                row = fx.Int32(fx.ptr_load(index_ptr + index_offset))
-                lds.ilds[slot] = row
-                safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
-                kv_base = fx.Int64(safe_row) * DIM
 
-                alo = [None] * 5
-                ahi = [None] * 4
-                for cc in fx.range_constexpr(4):
-                    alo[cc] = load16(kv_ptr, kv_base + cc * 128 + fx.Int64(group) * 16)
-                    ahi[cc] = load16(
-                        kv_ptr, kv_base + cc * 128 + 64 + fx.Int64(group) * 16
+                def gather_row(gather_slot):
+                    raw = fx.Int32(
+                        fx.ptr_load(index_ptr + index_base + fx.Int64(gather_slot))
                     )
-                alo[4] = load16(kv_ptr, kv_base + DV + fx.Int64(group) * 16)
+                    return (raw >= fx.Int32(0)).select(raw, fx.Int32(0))
 
-                score = fx.Vector.filled(4, 0.0, fx.Float32)
+                row = fx.Int32(fx.ptr_load(index_ptr + index_base + fx.Int64(slot)))
+                low_row = gather_row(wide_slot)
+                high_row = gather_row(wide_slot + fx.Int32(16))
+                low = [
+                    kvload16(low_row, wide_dword + fx.Int32(cc * 32))
+                    for cc in fx.range_constexpr(4)
+                ]
+                high = [
+                    kvload16(high_row, wide_dword + fx.Int32(cc * 32))
+                    for cc in fx.range_constexpr(4)
+                ]
+                # The 64 B rope tail is one line per row either way, so it keeps
+                # the narrow mapping and stays a register operand.
+                safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
+                rope = kvload16(safe_row, fx.Int32(DV // 4) + group * fx.Int32(4))
+                return row, low, high, rope
+
+            # Gathers in flight at once. The prologue issues the first ones
+            # and every loop body issues the one it will consume `_XPF_DEPTH`
+            # tiles later, so the fetch latency hides behind softmax and PV.
+            #
+            # Ordering below is load-bearing. A tile's rows come from the index
+            # array alone, so the gather can be in flight during the Q publish
+            # and its barrier, which every wave would otherwise wait out with no
+            # traffic of its own. The Q loads are still issued first because
+            # vmcnt retires in order: the publishing stores then drain just
+            # those loads instead of the whole primed tile.
+            #
+            # The 16x576 B Q block is published once per CTA as 576 sixteen-byte
+            # chunks spread over the 256 threads. Consecutive threads take
+            # consecutive chunks, so a load is one contiguous 4 KB run (32 line
+            # requests) instead of 16 rows x 64 B, and the block base stays
+            # 128 B aligned: 72 requests for the block against 144 for the
+            # per-head mapping.
+            q_block = fx.Int64(tok) * (H * DIM)
+            qlane = lds.qlds.ptr + lane * fx.Int32(144)
+
+            def q_chunk_dst(chunk):
+                """LDS address of a flat 16 B chunk of the Q block."""
+                row = chunk // fx.Int32(DIM // 16)
+                col = chunk % fx.Int32(DIM // 16)
+                return (
+                    lds.qlds.ptr
+                    + ((col % fx.Int32(4)) * fx.Int32(H) + row) * fx.Int32(144)
+                    + (col // fx.Int32(4)) * fx.Int32(16)
+                )
+
+            q_held = [
+                (load16(q_ptr, q_block + fx.Int64(chunk) * 16), q_chunk_dst(chunk))
+                for chunk in [
+                    tid + fx.Int32(c * PARTIAL_THREADS) for c in fx.range_constexpr(2)
+                ]
+            ]
+            pipeline = [
+                issue_gather(k) for k in fx.range_constexpr(min(_XPF_DEPTH, inner_iter))
+            ]
+            for q_data, q_dst in q_held:
+                fx.ptr_store(q_data.bitcast(fx.Uint8), q_dst)
+            # 576 = 2 x 256 + 64, so one wave publishes the remainder.
+            q_tail_chunk = tid + fx.Int32(2 * PARTIAL_THREADS)
+            with _if_then(
+                scf.IfOp(
+                    arith.cmpi(
+                        CmpIPredicate.eq, _raw(wave), arith.constant(0, type=T.i32)
+                    )
+                )
+            ):
+                fx.ptr_store(
+                    load16(q_ptr, q_block + fx.Int64(q_tail_chunk) * 16).bitcast(
+                        fx.Uint8
+                    ),
+                    q_chunk_dst(q_tail_chunk),
+                )
+
+            # Every wave reads the whole published block back, one head per lane.
+            fx.gpu.barrier()
+            bq = [None] * 5
+            for cc in fx.range_constexpr(4):
+                lo = fx.ptr_load(qlane + fx.Int32(cc * 32), result_type=v4u8_t).bitcast(
+                    fx.Int32
+                )
+                hi = fx.ptr_load(
+                    qlane + fx.Int32(cc * 32 + 16), result_type=v4u8_t
+                ).bitcast(fx.Int32)
+                bq[cc] = join8(lo, hi)
+            q_tail = fx.ptr_load(qlane + fx.Int32(128), result_type=v4u8_t).bitcast(
+                fx.Int32
+            )
+            bq[4] = fx.Vector.from_elements(
+                [q_tail[i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
+                fx.Int32,
+            )
+
+            for k_i in fx.range_constexpr(inner_iter):
+                row, low, high, rope = pipeline[k_i]
+                lds.ilds[slot] = row
                 for cc in fx.range_constexpr(4):
-                    score = _mfma128(join8(alo[cc], ahi[cc]), bq[cc], score)
+                    fx.ptr_store(
+                        low[cc].bitcast(fx.Uint8), wide_low_base + fx.Int32(cc * 128)
+                    )
+                    fx.ptr_store(
+                        high[cc].bitcast(fx.Uint8), wide_high_base + fx.Int32(cc * 128)
+                    )
+                # The next tile's rows are independent of everything below, and
+                # the registers just published to LDS are free, so issue that
+                # gather now and let the softmax and PV work hide its latency.
+                if fx.const_expr(k_i + _XPF_DEPTH < inner_iter):
+                    pipeline.append(issue_gather(k_i + _XPF_DEPTH))
+
                 score = _mfma128(
                     fx.Vector.from_elements(
-                        [alo[4][i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
+                        [rope[i] for i in fx.range_constexpr(4)] + [fx.Int32(0)] * 4,
                         fx.Int32,
                     ),
                     bq[4],
-                    score,
+                    fx.Vector.filled(4, 0.0, fx.Float32),
                 )
-
                 for cc in fx.range_constexpr(4):
-                    vbase = (
-                        lds.vlds.ptr
-                        + slot * fx.Int32(PITCH)
-                        + fx.Int32(cc * 128)
-                        + group * fx.Int32(16)
-                    )
-                    fx.ptr_store(alo[cc].bitcast(fx.Uint8), vbase)
-                    fx.ptr_store(ahi[cc].bitcast(fx.Uint8), vbase + fx.Int32(64))
+                    klo = fx.ptr_load(
+                        key_base + fx.Int32(cc * 128), result_type=v4u8_t
+                    ).bitcast(fx.Int32)
+                    khi = fx.ptr_load(
+                        key_base + fx.Int32(cc * 128 + 64), result_type=v4u8_t
+                    ).bitcast(fx.Int32)
+                    score = _mfma128(join8(klo, khi), bq[cc], score)
 
                 ids = fx.ptr_load(
                     lds.ilds.ptr
