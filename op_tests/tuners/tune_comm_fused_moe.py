@@ -173,7 +173,10 @@ def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
             scale_type=dtypes.fp8_e8m0,
         )
     del activations
-    inter_states = inter_states.view(args.token, args.topk, args.inter_dim)
+    # fp4 packs two values per byte, so the quantised tensor holds half as many
+    # elements as it has logical columns.
+    _cols = args.inter_dim // 2 if getattr(args, "a_dtype", "fp8") == "fp4" else args.inter_dim
+    inter_states = inter_states.view(args.token, args.topk, _cols)
     a2_scale = mxfp4_moe_sort_fwd(
         a2_scale_unsorted.view(args.token * args.topk, -1),
         sorted_ids=sorted_ids,
