@@ -173,6 +173,9 @@ def _compile_token_major_quant_sort(
         (sort_topk + LANES_PER_GROUP - 1) // LANES_PER_GROUP
     )
     tile_bytes = scale_n_pad * GROUP  # bytes of one 32-row swizzle tile
+    # Rows the caller allocates: pad32(sorted_len), the shape the swizzled
+    # layout is defined on. Used as the scale descriptor's extent below.
+    scale_valid_bytes = ((sorted_len + 31) // 32 * 32) * scale_n_pad
     # Fallback scan: a static dwordx4 sweep of the whole `sorted_ids`
     # allocation. A dynamic `num_valid`-bounded loop serialises one global load
     # per trip; unrolling lets every load issue up front. Clamping the tail
@@ -202,7 +205,20 @@ def _compile_token_major_quant_sort(
         part = bid % fx.Int32(nsplit) if nsplit > 1 else fx.Int32(0)
 
         out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
-        scale_rsrc = buffer_ops.create_buffer_resource(scale, max_size=True)
+        # Real extent, not max_size. Phase 3 below scatters into this buffer at
+        # a row read out of the sorting kernel's inverse table, and that table
+        # can hand back a row outside the allocation. Under max_size the
+        # descriptor spans the whole address space, so such a store lands
+        # wherever the address arithmetic points: silent corruption of whatever
+        # else is mapped there, or a GPU page fault when nothing is. That was
+        # the deployment crash -- every MoE kernel retired cleanly under
+        # per-kernel host syncs while the server died downstream, and disabling
+        # just this table made it stop. Seeding the table to -1 did not help, so
+        # the bad rows are produced, not left over, and the consumer has to
+        # bound them. Doing it in the descriptor is free; the same check written
+        # as a predicate in the store loop cost 2.8% of the operator score.
+        scale_rsrc = buffer_ops.create_buffer_resource(
+            scale, num_records_bytes=scale_valid_bytes)
         in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
 
         c_zero = fx.Int32(0)
