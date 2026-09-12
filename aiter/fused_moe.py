@@ -2870,7 +2870,6 @@ def get_2stage_cfgs(
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
-
         # fp8 stage1 kernel names always carry a "_gui" suffix
         # (moe_kernels.py:114-115). Append it before the lookup so the fp8
         # variants resolve; fp4 names are unchanged.
