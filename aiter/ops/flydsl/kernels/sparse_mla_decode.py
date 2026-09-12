@@ -27,7 +27,11 @@ FP8_MAX = 448.0
 PARTIAL_THREADS = 256
 PARTIAL_WAVES = 4
 PITCH = DV + 16
-# Tiles whose gather is in flight at once inside a producer CTA.
+# Tiles whose gather is in flight at once inside a producer CTA. Two is slower
+# everywhere it has been measured, and not because of occupancy: at grouping 8
+# the grid is 0.75 CTAs per CU, so the second tile's 36 live gather registers
+# cost nothing, and it is still +0.4% at seq 48 and +9.2% at seq 84. The
+# prologue is the one place a deeper burst pays -- see `_pick_xpf_prime`.
 _XPF_DEPTH = 1
 
 
@@ -77,15 +81,33 @@ def compile_sparse_mla_partial(
     split_major: bool = False,
     use_buffer: bool = True,
     xpf_prime: int = 1,
+    n_groups: int | None = None,
 ):
-    """Compile the 64-key BF16-partial, log2-LSE producer."""
+    """Compile the 64-key BF16-partial, log2-LSE producer.
+
+    `n_groups` is the number of partial records a token is split into, so the
+    grid is `seq * n_groups` CTAs and each owns `inner_iter` tiles. Passing it
+    explicitly lifts the requirement that it divide `ng`: group `g` owns tiles
+    `g, g + n_groups, ...`, and when `ng` is not a multiple the last round has
+    `ng % n_groups` real tiles. The short groups run their final tile with the
+    index row forced negative, which the existing padding mask already turns
+    into an all `-inf` score -- an exactly neutral tile, no separate epilogue.
+    """
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
-    if inner_iter < 1 or inner_iter & (inner_iter - 1) or ng % inner_iter != 0:
+    if n_groups is None:
+        if inner_iter < 1 or inner_iter & (inner_iter - 1) or ng % inner_iter != 0:
+            raise ValueError(
+                f"inner_iter={inner_iter} must be a power-of-two divisor of ng={ng}"
+            )
+        n_groups = ng // inner_iter
+    elif not 1 <= n_groups <= ng or inner_iter != -(-ng // n_groups):
         raise ValueError(
-            f"inner_iter={inner_iter} must be a power-of-two divisor of ng={ng}"
+            f"n_groups={n_groups} must be in 1..{ng} and inner_iter={inner_iter} "
+            f"must be ceil(ng/n_groups)={-(-ng // n_groups)}"
         )
-    n_groups = ng // inner_iter
+    # Only the last round can run off the end, and only when the split is ragged.
+    ragged = n_groups * inner_iter != ng
     # Fold the online-softmax rescale into the PV MFMA. See the loop body. A
     # single tile has nothing to rescale, so it keeps the plain form.
     seeded = inner_iter > 1
@@ -109,6 +131,7 @@ def compile_sparse_mla_partial(
             + ("_split_major" if split_major else "")
             + ("_buf" if use_buffer else "")
             + (f"_prime{xpf_prime}" if xpf_prime > _XPF_DEPTH else "")
+            + (f"_ng{n_groups}" if ragged else "")
         ),
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
@@ -218,6 +241,15 @@ def compile_sparse_mla_partial(
                 # rows.  This removes one real partial row per pair while
                 # matching the reducer's first active shuffle level.
                 tile = split + fx.Int32(k_i * n_groups)
+                # A ragged split leaves the last round short. Rather than a
+                # second kernel body, the short groups re-read tile `split` and
+                # publish a negative index row, which the padding mask below
+                # scores as `-inf`: probabilities and denominator come out zero,
+                # alpha comes out one, so the tile leaves the accumulator, the
+                # running maximum and the LSE bit for bit unchanged.
+                if fx.const_expr(ragged and k_i + 1 == inner_iter):
+                    in_range = tile < fx.Int32(ng)
+                    tile = in_range.select(tile, split)
                 index_base = fx.Int64(tok) * (ng * BLOCK_I) + fx.Int64(
                     tile * fx.Int32(BLOCK_I)
                 )
@@ -229,6 +261,8 @@ def compile_sparse_mla_partial(
                     return (raw >= fx.Int32(0)).select(raw, fx.Int32(0))
 
                 row = fx.Int32(fx.ptr_load(index_ptr + index_base + fx.Int64(slot)))
+                if fx.const_expr(ragged and k_i + 1 == inner_iter):
+                    row = in_range.select(row, fx.Int32(-1))
                 low_row = gather_row(wide_slot)
                 high_row = gather_row(wide_slot + fx.Int32(16))
                 low = [
@@ -292,7 +326,12 @@ def compile_sparse_mla_partial(
             ]
             for q_data, q_dst in q_held:
                 fx.ptr_store(q_data.bitcast(fx.Uint8), q_dst)
-            # 576 = 2 x 256 + 64, so one wave publishes the remainder.
+            # 576 = 2 x 256 + 64, so one wave publishes the remainder. Its load
+            # stays here even though it forces the publish onto `vmcnt(0)`:
+            # issuing it with the other two only saves a wait the CTA has to do
+            # a few instructions later anyway, and the out-of-range chunks the
+            # other three waves would then have to clamp cost more than that
+            # (measured +0.0 to +0.4% on the producer at seq 8, 48, 60 and 84).
             q_tail_chunk = tid + fx.Int32(2 * PARTIAL_THREADS)
             with _if_then(
                 scf.IfOp(

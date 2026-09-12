@@ -50,9 +50,12 @@ def _num_cu(device_index: int) -> int:
 
 
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
-    """Return the producer grouping factor for this shape.
+    """Return the power-of-two producer grouping factor for this shape.
 
-    Each producer CTA is one wavefront handling `inner_iter` 64-key tiles, so
+    `_decode_partial_groups` places the grid directly and only falls back here
+    for the shapes where no placement fits the CU array once -- see its
+    docstring. Each producer CTA is one wavefront handling `inner_iter` 64-key
+    tiles, so
     the grid is `seq * (ng_total // inner_iter)` CTAs. Two effects compete: a
     larger grouping shortens the grid (and the combine, which sees one partial
     row per group) while a smaller one gives the CU array more independent
@@ -87,41 +90,65 @@ def _pick_inner_iter(seq: int, ng_total: int) -> int:
     return inner_iter
 
 
-def _decode_inner_iter(seq: int, ng_total: int, num_cu: int) -> int:
-    """Return the producer grouping the decode launcher dispatches.
+# Most 64-key tiles one producer CTA is allowed to own. Fatter CTAs are a win
+# while the grid still fits the CU array once, but the fattest split ng=32
+# admits -- two groups of sixteen tiles -- is +20.2% at seq 84 and +1.9% at
+# seq 96 against the shipped grouping, so the search stops one step short.
+_DECODE_MAX_TILES = 11
 
-    `_pick_inner_iter` stops at 4 because grouping 8 collapses from seq 72 up.
-    It is not the grouping itself that fails there but the CTA count: its CTAs
-    are four times as fat, so the grid crosses one CTA per CU at seq 72 and
-    every straggler costs eight tiles of tail. Inside the window where the grid
-    still covers the CU array without doubling up, grouping 8 keeps the
-    producer's bandwidth and halves the combine's partial traffic. Measured on
-    the full producer+combine
-    call (same process, ABBA, min of 5 palindromic passes, relative to grouping
-    4 with the same prologue depth), with `_pick_xpf_prime`'s deeper prologue in
-    the right-hand column:
 
-        seq   ctas   inner_iter=8   + deeper prologue
-         32    128        +32.0%              +22.9%
-         40    160         +6.9%               -3.3%
-         48    192         -4.2%               -6.3%
-         60    240         -3.6%               -5.4%
-         64    256         -4.7%               -4.6%
-         72    288         +5.9%               +4.9%
-         84    336         +3.7%               +2.0%
+def _decode_partial_groups(seq: int, ng_total: int, num_cu: int) -> int:
+    """Return how many partial records the producer splits one token into.
 
-    Both walls are sharp: below about five eighths of a CTA per CU the producer
-    can no longer keep enough gathers in flight to saturate HBM, and above one
-    CTA per CU the fat-CTA tail dominates. Only shapes that already earn
-    grouping 4 are offered the wider one, which keeps the window at seq 48..64
-    -- exactly the range measured above.
+    A CTA owns `ceil(ng_total / n_groups)` of the token's 64-key tiles and the
+    grid is `seq * n_groups` CTAs, so this one number fixes both the grid and
+    the combine's input length. It used to be `ng_total // inner_iter` with
+    `inner_iter` a power of two, which left the grid quantised in factor-of-two
+    steps. The producer now takes a ragged split, so every count in
+    `1..ng_total` is reachable and the grid can be placed exactly.
+
+    Where to place it is sharp. Measured on the full producer+combine call
+    (same process, ABBA, min of 5-6 palindromic passes, against the shipped
+    grouping, with a duplicate shipped arm at the tail pricing position bias at
+    0.03-1.6%):
+
+        seq   n_groups   ctas   ctas/CU   tiles/CTA    delta
+         24       8       192      0.75       4        -3.4%
+         24      10       240      0.94       4        -1.1%
+         32       8       256      1.00       4        -9.2%
+         32       9       288      1.13       4        +9.7%
+         40       6       240      0.94       6       -14.9%
+         40       7       280      1.09       5        +2.7%
+         48       5       240      0.94       7        -3.4%
+         48       6       288      1.13       6       +18.7%
+         60       5       300      1.17       7       +21.6%
+         72       3       216      0.84      11       -11.1%
+         72       4       288      1.13       8        +4.6%
+         84       3       252      0.98      11        -8.1%
+         84       4       336      1.31       8        +2.5%
+
+    One CTA per CU is a cliff, not a slope: every count that stays under it
+    wins by 3-15% and the first one over it loses by 2-22%, because a CU handed
+    a second producer CTA serialises a whole fat CTA behind the first. So take
+    the shortest CTA -- the largest `n_groups` -- that still fits the array
+    once. Among equally short CTAs take the smallest count, because a ragged
+    split pays for its padding tile in gather traffic: at seq 24 counts 8 and
+    10 both own four tiles and 10 spends a quarter of them on padding, which is
+    the whole 2.3% between those two rows.
+
+    When no count fits the array once inside `_DECODE_MAX_TILES` -- which needs
+    `seq` past eight times that -- keep the power-of-two grouping.
     """
-    inner_iter = _pick_inner_iter(seq, ng_total)
-    if inner_iter == 4 and ng_total % 8 == 0:
-        wide_ctas = seq * (ng_total // 8)
-        if num_cu * 5 // 8 <= wide_ctas <= num_cu:
-            inner_iter = 8
-    return inner_iter
+    best = None
+    for n_groups in range(1, ng_total + 1):
+        if seq * n_groups > num_cu:
+            break
+        tiles = -(-ng_total // n_groups)
+        if tiles <= _DECODE_MAX_TILES and (best is None or tiles < best[0]):
+            best = (tiles, n_groups)
+    if best is None:
+        return ng_total // _pick_inner_iter(seq, ng_total)
+    return best[1]
 
 
 def _pick_xpf_prime(inner_iter: int, producer_ctas: int, num_cu: int) -> int:
@@ -156,14 +183,6 @@ def _pick_xpf_prime(inner_iter: int, producer_ctas: int, num_cu: int) -> int:
     if inner_iter < 4:
         return 1
     return 2 if producer_ctas <= 2 * num_cu else 1
-
-
-def _partial_groups(ng_total: int, inner_iter: int) -> int:
-    if inner_iter < 1 or ng_total % inner_iter != 0:
-        raise ValueError(
-            f"ng_total={ng_total} must be divisible by inner_iter={inner_iter}"
-        )
-    return ng_total // inner_iter
 
 
 def _use_split_major(seq: int, n_groups: int, num_cu: int) -> bool:
@@ -201,8 +220,8 @@ def sparse_mla_decode_workspace_shape(
     ng = width // BLOCK_I
     if not 1 <= ng <= 33:
         raise ValueError(f"supported split count is 1..33, got {ng}")
-    ng_partial = _partial_groups(
-        ng, _decode_inner_iter(seq, ng, _num_cu(torch.cuda.current_device()))
+    ng_partial = _decode_partial_groups(
+        seq, ng, _num_cu(torch.cuda.current_device())
     )
     return (seq, ng_partial, H, DV), (seq, ng_partial, H)
 
@@ -306,9 +325,9 @@ def _launch_partial(
     sm_scale: float,
     *,
     ng: int,
-    inner_iter: int,
+    n_groups: int,
 ) -> None:
-    n_groups = _partial_groups(ng, inner_iter)
+    inner_iter = -(-ng // n_groups)
     seq = int(q.shape[0])
     num_cu = _num_cu(q.device.index)
     split_major = _split_major_folds_q(seq, n_groups) or _use_split_major(
@@ -327,6 +346,7 @@ def _launch_partial(
         split_major=split_major,
         use_buffer=use_buffer,
         xpf_prime=_pick_xpf_prime(inner_iter, seq * n_groups, num_cu),
+        n_groups=n_groups,
     )
     _run_compiled(
         launch,
@@ -358,8 +378,7 @@ def flydsl_sparse_mla_decode(
     allocated eagerly for convenience.
     """
     seq, ng = _validate_sparse_decode_inputs(q, kv, indices, out)
-    inner_iter = _decode_inner_iter(seq, ng, _num_cu(q.device.index))
-    ng_partial = _partial_groups(ng, inner_iter)
+    ng_partial = _decode_partial_groups(seq, ng, _num_cu(q.device.index))
     if (partial_output is None) != (partial_lse is None):
         raise ValueError(
             "partial_output and partial_lse must be provided together for "
@@ -389,7 +408,7 @@ def flydsl_sparse_mla_decode(
         partial_lse,
         sm_scale,
         ng=ng,
-        inner_iter=inner_iter,
+        n_groups=ng_partial,
     )
     _flydsl_sparse_mla_decode_combine(
         partial_output.unsqueeze(0),
