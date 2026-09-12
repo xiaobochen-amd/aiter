@@ -159,11 +159,19 @@ def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
         device=device,
         generator=generator,
     ).mul_(args.inter_dim**-0.25)
-    inter_states, a2_scale_unsorted = per_1x32_f8_scale_f8_quant(
-        activations,
-        quant_dtype=dtypes.fp8,
-        scale_type=dtypes.fp8_e8m0,
-    )
+    # Stage2's activation precision. a8w4 (the original target) feeds fp8;
+    # GLM-5.2 dispatches a4w4 and feeds fp4. The weight side is mxfp4 either
+    # way, and both produce an e8m0 scale, so only the quantiser differs.
+    if getattr(args, "a_dtype", "fp8") == "fp4":
+        inter_states, a2_scale_unsorted = per_1x32_f4_quant(
+            activations, quant_dtype=dtypes.fp4x2
+        )
+    else:
+        inter_states, a2_scale_unsorted = per_1x32_f8_scale_f8_quant(
+            activations,
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+        )
     del activations
     inter_states = inter_states.view(args.token, args.topk, args.inter_dim)
     a2_scale = mxfp4_moe_sort_fwd(
@@ -229,7 +237,7 @@ def _resolve_ordinary_stage2(args):
         args.experts,
         args.topk,
         dtypes.bf16,
-        dtypes.fp8,
+        dtypes.fp4x2 if getattr(args, "a_dtype", "fp8") == "fp4" else dtypes.fp8,
         dtypes.fp4x2,
         QuantType.per_1x32,
         True,
