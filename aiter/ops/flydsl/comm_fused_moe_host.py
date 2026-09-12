@@ -73,7 +73,29 @@ class ShapeKey:
         )
 
 
-_CONFIG_NAME_PREFIX = "flydsl_comm_moe2_afp8_wfp4_bf16_"
+# One prefix per activation precision. The weight side is always mxfp4; the
+# activation side is fp8 for the original a8w4 rows and fp4 for GLM-5.2, which
+# dispatches a4w4. Keeping them distinct lets both live in one tuned table and
+# makes the precision recoverable from the name alone when parsing back.
+_CONFIG_NAME_PREFIXES = {
+    "fp8": "flydsl_comm_moe2_afp8_wfp4_bf16_",
+    "fp4": "flydsl_comm_moe2_afp4_wfp4_bf16_",
+}
+_CONFIG_NAME_PREFIX = _CONFIG_NAME_PREFIXES["fp8"]
+
+
+def _prefix_for(a_dtype: str) -> str:
+    try:
+        return _CONFIG_NAME_PREFIXES[a_dtype]
+    except KeyError:
+        raise ValueError(f"unsupported comm-fused activation dtype {a_dtype!r}")
+
+
+def _a_dtype_from_name(name: str) -> str | None:
+    for dtype, prefix in _CONFIG_NAME_PREFIXES.items():
+        if name.startswith(prefix):
+            return dtype
+    return None
 _RUNNER_CACHE = {}
 
 
@@ -119,7 +141,7 @@ def _mega_defaults() -> dict:
 
 
 def config_name(config: PipelineConfig) -> str:
-    prefix = _CONFIG_NAME_PREFIX
+    prefix = _prefix_for(getattr(config, "a_dtype", "fp8"))
     if isinstance(config, AtomicConfig):
         return (
             f"{prefix}atomic_rs{config.reduce_scatter_grid}"
@@ -175,9 +197,10 @@ def config_name(config: PipelineConfig) -> str:
 
 
 def _parse_megakernel_name(name: str, shape: Shape, m: int):
-    prefix = _CONFIG_NAME_PREFIX
-    if not name.startswith(prefix):
+    a_dtype = _a_dtype_from_name(name)
+    if a_dtype is None:
         return None
+    prefix = _prefix_for(a_dtype)
     parts = name[len(prefix) :].split("_")
     tile = re.fullmatch(r"t(\d+)x(\d+)x(\d+)", parts.pop(0))
     if tile is None:
@@ -227,6 +250,9 @@ def _parse_megakernel_name(name: str, shape: Shape, m: int):
             else:
                 raise ValueError(f"unknown megakernel option {part!r} in {name!r}")
     values["collective"] = collective
+    # _mega_defaults() is derived from the dataclass fields, so it already
+    # carries an a_dtype; the one recovered from the name prefix wins.
+    values["a_dtype"] = a_dtype
     return MegakernelConfig(shape=shape, m=m, **values)
 
 
