@@ -36,7 +36,7 @@ def compile_megakernel_producer(config: MegakernelConfig, composition):
         HIDDEN_MAX=shape.model_dim,
         epilog=("atomic" if config.producer_mode == "atomic_shared" else "reduce"),
         INTER_MAX=shape.inter_dim,
-        a_dtype="fp8",
+        a_dtype=config.a_dtype,
         b_dtype="fp4",
         topk=shape.topk,
         SBM=config.sort_block_m,

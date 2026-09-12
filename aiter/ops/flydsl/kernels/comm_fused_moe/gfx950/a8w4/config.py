@@ -113,6 +113,12 @@ class MegakernelConfig:
     service_tile_group: int = 1
     producer_mode: str = "routes"
     flat_producer_grid: bool = False
+    # Activation precision of the producer GEMM. The underlying port
+    # (compile_gemm2_a4w4_port) accepts ("fp4","fp4") and ("fp8","fp4"); this
+    # directory was written against fp8 and hard-coded it, which is why the
+    # fused path looked a8w4-only. GLM-5.2 dispatches a4w4, so it needs "fp4".
+    # Default stays "fp8" so existing tuned rows keep their meaning.
+    a_dtype: str = "fp8"
 
     def __post_init__(self):
         if self.m <= 0:
