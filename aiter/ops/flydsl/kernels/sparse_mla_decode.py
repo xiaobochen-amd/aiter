@@ -424,6 +424,14 @@ def compile_sparse_mla_partial(
                     lds.rsum[wave * fx.Int32(H) + head] = prob_sum
                 fx.gpu.barrier()
 
+                # The four per-wave sums are folded here, once per tile, rather
+                # than carried per wave and folded in the last tile. Deferring
+                # them is exact -- the fold is linear in alpha/beta and the
+                # `denom == 0` sentinels equal the wave-uniform `max == -inf` --
+                # but it is slower: the four ds_read_b32 below are the first LDS
+                # traffic after the barrier and they cover the latency of the
+                # plds read that feeds PV. Dropping them cost 1.2% at seq 48,
+                # 2.0% at seq 60 and 5.9% at seq 84.
                 tile_denom = fx.Float32(0.0)
                 for ww in fx.range_constexpr(PARTIAL_WAVES):
                     tile_denom = tile_denom + fx.Float32(lds.rsum[ww * H + head])

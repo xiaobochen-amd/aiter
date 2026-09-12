@@ -207,15 +207,29 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+# Absorbed-MLA decode runs this kernel at M = 6 * concurrency, so the rows that
+# matter sit just under the standard 64 bound and a single M_LEQ_64 entry has to
+# serve both ends of it. The extra bound splits them; tables without an
+# M_LEQ_48 entry fall through to M_LEQ_64 exactly as before.
+_M_BOUNDS = (1, 4, 8, 16, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+
 def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
-
+    # B is a factor of the launch width -- the grid is
+    # (B, cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)) -- so the tile that
+    # fills the CU array depends on it. Pass it through so a B-specialized
+    # table is picked when one exists; callers that omit B keep the
+    # (N, K)-keyed behaviour.
     return get_gemm_config(
         "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
         M,
         N,
         K,
+        bounds=_M_BOUNDS,
+        B=B,
     )

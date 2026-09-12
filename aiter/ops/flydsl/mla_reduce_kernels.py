@@ -305,10 +305,16 @@ def _uniform_i32(value):
 # Heads reduced per coarse CTA. The reduction itself is per (row, head) and does
 # not share anything across heads, so this only changes how the work is packed:
 # eight waves of one row read one 8 KB contiguous span per split and their LSE
-# columns land in the same scalar-cache lines. In-situ combine cost (decode
-# 48/72/96, us) over heads per CTA: 2.90/3.57/4.02 at 1, 2.69/3.39/3.75 at 4,
-# 2.66/3.20/3.51 at 8; 16 regresses to 3.20/-/3.90 because one CTA per row
-# leaves most of the CU array idle.
+# columns land in the same scalar-cache lines.
+#
+# Benched standalone, one head per CTA looks 8-10% better at decode row counts
+# (2.243 against 2.497 us at seq 48) because it turns seq*2 blocks into seq*16.
+# In situ it is not: the partials were just written by the producer, whose
+# split-major ownership leaves row `t` in one XCD's L2, and CTA `row*16 + b`
+# spreads a row's reads over all eight L2 domains where `row*2 + b` spreads them
+# over two. Measured end to end behind the producer, one head per CTA costs
+# +0.9% at seq 60 and +1.7% at seq 84. Re-time this against the producer, not
+# alone, before changing it.
 _COMBINE_HEADS_PER_CTA = 8
 
 # Longest split column the scalar LSE path takes. It reads the whole column with
