@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import flydsl.expr as fx
 import torch
@@ -18,6 +19,28 @@ from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 _BUFFER_MAX_BYTES = 1 << 31
 # L2 domains the dispatcher rotates workgroups through on gfx950.
 _XCDS = 8
+
+# Diagnostic only, off by default. The launcher picks `inner_iter`,
+# `split_major` and `use_buffer` at runtime from (seq, ng) and the pool size, so
+# a bench that hardcodes topk=2048 can be scoring a configuration deployment
+# never reaches -- the same failure mode as tuning a kernel family the model
+# does not dispatch. Set AITER_FLYDSL_LOG_CONFIGS=1 and read the server log to
+# find out which tuples production actually uses.
+_LOG_CONFIGS = os.environ.get("AITER_FLYDSL_LOG_CONFIGS", "0") == "1"
+_SEEN_CONFIGS: set = set()
+
+
+def _note_config(seq, ng, inner_iter, n_groups, split_major, use_buffer, kv_bytes):
+    key = (seq, ng, inner_iter, split_major, use_buffer)
+    if key in _SEEN_CONFIGS:
+        return
+    _SEEN_CONFIGS.add(key)
+    print(
+        f"[flydsl-sparse-mla-decode] seq={seq} width={ng * BLOCK_I} ng={ng} "
+        f"inner_iter={inner_iter} n_groups={n_groups} split_major={split_major} "
+        f"use_buffer={use_buffer} kv_pool={kv_bytes / 2 ** 30:.2f}GiB",
+        flush=True,
+    )
 
 
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
@@ -216,6 +239,9 @@ def _launch_partial(
     # VGPR per address instead of a 64-bit pair. Pools that cannot be reached
     # that way fall back to 64-bit pointer arithmetic.
     use_buffer = kv.numel() * kv.element_size() < _BUFFER_MAX_BYTES
+    if _LOG_CONFIGS:
+        _note_config(seq, ng, inner_iter, n_groups, split_major, use_buffer,
+                     kv.numel() * kv.element_size())
     launch = compile_sparse_mla_partial(
         ng,
         inner_iter=inner_iter,
