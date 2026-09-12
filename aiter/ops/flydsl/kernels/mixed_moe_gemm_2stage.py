@@ -55,6 +55,7 @@ def compile_mixed_moe_gemm1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    reuse_cached_b: bool = False,
 ):
     """Compile an ordinary stage1 MoE kernel."""
     return compile_mixed_moe_gemm1_common(
@@ -84,6 +85,7 @@ def compile_mixed_moe_gemm1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        reuse_cached_b=reuse_cached_b,
     )
 
 
@@ -114,6 +116,7 @@ def compile_mixed_moe_gemm2(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    reuse_cached_b: bool = False,
 ):
     """Compile an ordinary stage2 MoE kernel."""
     return compile_mixed_moe_gemm2_common(
@@ -141,4 +144,5 @@ def compile_mixed_moe_gemm2(
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        reuse_cached_b=reuse_cached_b,
     )

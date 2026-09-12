@@ -647,6 +647,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    reuse_cached_b: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -707,6 +708,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            reuse_cached_b=reuse_cached_b,
         )
     else:
         raise ValueError(
@@ -738,6 +740,7 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     enable_bias: bool = False,
+    reuse_cached_b: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -791,6 +794,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            reuse_cached_b=reuse_cached_b,
         )
     else:
         raise ValueError(
@@ -1749,6 +1753,9 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        # An expert can only spill over an m-block when it holds more than
+        # `tile_m` rows, so below that the cached-B path is dead code.
+        "reuse_cached_b": token_num > tile_m,
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
@@ -2267,6 +2274,9 @@ def _flydsl_moe_stage2_impl(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         enable_bias=(bias is not None),
+        # See the stage1 launcher: only sort blocks that an expert can spill
+        # over need the cached-B path.
+        reuse_cached_b=token_num > _sbm,
     )
     _run_compiled(exe, args)
 

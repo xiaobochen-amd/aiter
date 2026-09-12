@@ -66,6 +66,35 @@ from .mfma_preshuffle_pipeline import (
 )
 
 
+def _expert_spans_neighbour_block(*, expert_rsrc, blk, num_blks, expert_i32):
+    """True when the previous or next m-block is assigned the same expert.
+
+    An expert holding more rows than one m-block has its whole weight slab
+    re-read by each of its blocks. Those blocks land on the same XCD (their
+    linear workgroup ids differ by a multiple of grid.x, itself a multiple of
+    the XCD count), so the later readers can hit in L2 -- but only while the
+    slab is not tagged non-temporal, which is what this predicate gates.
+    """
+    c0 = arith.constant(0, index=True)
+    c1 = arith.constant(1, index=True)
+    no_expert = arith.constant(-1, type=T.i32)
+    has_prev = arith.cmpi(CmpIPredicate.ugt, blk, c0)
+    prev_expert = buffer_ops.buffer_load(
+        expert_rsrc, arith.select(has_prev, blk - c1, c0), vec_width=1, dtype=T.i32
+    )
+    prev_expert = arith.select(has_prev, prev_expert, no_expert)
+    next_blk = blk + c1
+    has_next = arith.cmpi(CmpIPredicate.ult, next_blk, num_blks)
+    next_expert = buffer_ops.buffer_load(
+        expert_rsrc, arith.select(has_next, next_blk, c0), vec_width=1, dtype=T.i32
+    )
+    next_expert = arith.select(has_next, next_expert, no_expert)
+    return arith.ori(
+        arith.cmpi(CmpIPredicate.eq, prev_expert, expert_i32),
+        arith.cmpi(CmpIPredicate.eq, next_expert, expert_i32),
+    )
+
+
 @contextmanager
 def _if_then(if_op):
     """Compat helper for SCF IfOp then-region across old/new Python APIs."""
@@ -153,6 +182,7 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    reuse_cached_b: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -175,6 +205,11 @@ def compile_mixed_moe_gemm1_common(
     is_f8_b = b_dtype == "fp8"
     if heterogeneous_b and not is_f4_b:
         raise ValueError("Heterogeneous B requires MXFP4 routed weights")
+
+    # A weight slab spread over several m-blocks is read once per block, so only
+    # the slabs read exactly once stay non-temporal
+    # (see `_expert_spans_neighbour_block`).
+    reuse_cached_b = reuse_cached_b and b_nt != 0 and not heterogeneous_b
 
     sort_block_m = tile_m
     num_waves = min(4, tile_n // 32)
@@ -735,6 +770,13 @@ def compile_mixed_moe_gemm1_common(
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
+            if const_expr(reuse_cached_b):
+                expert_is_reused = _expert_spans_neighbour_block(
+                    expert_rsrc=expert_rsrc,
+                    blk=bx,
+                    num_blks=size_expert_ids_in,
+                    expert_i32=expert_i32,
+                )
             if const_expr(heterogeneous_b):
                 is_shared_expert = arith.cmpi(
                     CmpIPredicate.eq,
@@ -742,7 +784,8 @@ def compile_mixed_moe_gemm1_common(
                     arith.constant(shared_expert_id, type=T.i32),
                 )
 
-            def moe_gemm1_body(shared_b: bool = False):
+            def moe_gemm1_body(shared_b: bool = False, b_nt_body: int | None = None):
+                body_b_nt = b_nt if b_nt_body is None else b_nt_body
                 body_k_base_idx = k_base_idx
                 body_lds_x_pong = lds_x_pong
                 body_lds_x_ping = lds_x_ping
@@ -992,7 +1035,7 @@ def compile_mixed_moe_gemm1_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
-                            cache_modifier=b_nt,
+                            cache_modifier=body_b_nt,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (
@@ -3060,6 +3103,14 @@ def compile_mixed_moe_gemm1_common(
                         with ir.InsertionPoint(format_if.else_block):
                             moe_gemm1_body(shared_b=False)
                             scf.YieldOp([])
+                    elif const_expr(reuse_cached_b):
+                        reuse_if = scf.IfOp(expert_is_reused, has_else=True)
+                        with ir.InsertionPoint(reuse_if.then_block):
+                            moe_gemm1_body(b_nt_body=0)
+                            scf.YieldOp([])
+                        with ir.InsertionPoint(reuse_if.else_block):
+                            moe_gemm1_body()
+                            scf.YieldOp([])
                     else:
                         moe_gemm1_body()
                     scf.YieldOp([])
@@ -3451,6 +3502,7 @@ def compile_mixed_moe_gemm2_common(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
+    reuse_cached_b: bool = False,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
@@ -3459,6 +3511,9 @@ def compile_mixed_moe_gemm2_common(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
+    # Non-temporal B only pays off for slabs that are read once; see the stage1
+    # builder and `_expert_spans_neighbour_block`.
+    reuse_cached_b = reuse_cached_b and b_nt != 0 and not heterogeneous_b
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -4030,6 +4085,13 @@ def compile_mixed_moe_gemm2_common(
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
+            if const_expr(reuse_cached_b):
+                expert_is_reused = _expert_spans_neighbour_block(
+                    expert_rsrc=expert_rsrc,
+                    blk=sort_blk,
+                    num_blks=sort_blocks_ub,
+                    expert_i32=expert_i32,
+                )
             if const_expr(heterogeneous_b):
                 is_shared_expert = arith.cmpi(
                     CmpIPredicate.eq,
@@ -4063,7 +4125,9 @@ def compile_mixed_moe_gemm2_common(
             def moe_gemm2_then_body(
                 shared_b: bool = False,
                 shared_n_half: int | None = None,
+                b_nt_body: int | None = None,
             ):
+                body_b_nt = b_nt if b_nt_body is None else b_nt_body
                 body_b_has_full_operand = is_f8_b or shared_b
                 body_tile_n = tile_n // 2 if shared_n_half is not None else tile_n
                 body_n_offset = (
@@ -4338,7 +4402,7 @@ def compile_mixed_moe_gemm2_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
-                            cache_modifier=b_nt,
+                            cache_modifier=body_b_nt,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (
@@ -5555,6 +5619,14 @@ def compile_mixed_moe_gemm2_common(
                         scf.YieldOp([])
                     with ir.InsertionPoint(format_if.else_block):
                         moe_gemm2_then_body(shared_b=False)
+                        scf.YieldOp([])
+                elif const_expr(reuse_cached_b):
+                    reuse_if = scf.IfOp(expert_is_reused, has_else=True)
+                    with ir.InsertionPoint(reuse_if.then_block):
+                        moe_gemm2_then_body(b_nt_body=0)
+                        scf.YieldOp([])
+                    with ir.InsertionPoint(reuse_if.else_block):
+                        moe_gemm2_then_body()
                         scf.YieldOp([])
                 else:
                     moe_gemm2_then_body()
