@@ -140,9 +140,30 @@ def _decode_partial_groups(seq: int, ng_total: int, num_cu: int) -> int:
     a second producer CTA serialises a whole fat CTA behind the first. So take
     the shortest CTA -- the largest `n_groups` -- that still fits the array
     once. Among equally short CTAs take the smallest count, because a ragged
-    split pays for its padding tile in gather traffic: at seq 24 counts 8 and
-    10 both own four tiles and 10 spends a quarter of them on padding, which is
-    the whole 2.3% between those two rows.
+    split pays for its padding tile: at seq 24 counts 8 and 10 both own four
+    tiles and 10 spends a quarter of them on padding, which is the whole 2.3%
+    between those two rows. The padding costs skeleton, not traffic -- an out
+    of range row number is killed by the buffer bounds check, so a padding tile
+    moves no bytes.
+
+    What a tile slot is worth, and therefore what a perfectly packed grid could
+    buy, is priced at seq 48 by sweeping `ng_total` at a fixed `n_groups` of 5,
+    which moves how many of the five CTAs carry a seventh *real* tile while
+    every arm from 31 up runs seven slots (control arm 0.06-0.6%):
+
+        ng_total   slots   CTAs at 7 real   us
+            30       6            0        14.58
+            31       7            1        15.07
+            32       7            2        15.28   (ship)
+            33       7            3        15.43
+
+    The first real tile on the critical CTA is 0.49 us; every further CTA that
+    converts padding to real work is only 0.18 us, which is exactly the 6.5%
+    the added rows put on the gather's 2.6 us of exposed DRAM. So the wall is
+    the busiest CTA's real tiles plus footprint, and the slack in a 240/256
+    grid absorbs the rest. A cross-token schedule that packed all 1536 tiles
+    into 256 CTAs of six slots would land near 14.75 us against 15.28 -- worth
+    3.5% of the producer, not the 8-14% a per-CTA slot count suggests.
 
     When no count fits the array once inside `_DECODE_MAX_TILES` -- which needs
     `seq` past eight times that -- keep the power-of-two grouping.

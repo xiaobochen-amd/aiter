@@ -504,8 +504,17 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     N = kv_lora_rank
     K = k
 
+    # qh is the BMM's batch and a factor of the launch width, so it selects the
+    # tile the same way it does for the standalone entry point. Omitting it here
+    # left this path on the (N, K)-keyed table while the standalone one moved to
+    # the B-specialised tables, and that is the whole difference between the
+    # merged form being slower than the two nodes it replaces and being much
+    # faster: at (B=16, M=48, N=512, K=192) it measures +13.3% against
+    # bmm + fused_qk_rope_cat_and_cache_mla on the generic table and -23.6% on
+    # the tuned one, with a bit-identical q_out. Also -17.9 / -27.8 / -37.5 /
+    # -36.6% at M = 60 / 84 / 8 / 42.
     if config is None:
-        config, _ = _get_fp8_config(M, N, K)
+        config, _ = _get_fp8_config(M, N, K, qh)
 
     config["BLOCK_SIZE_K"] = group_size
 

@@ -68,24 +68,41 @@ BARRIER_SLOTS = 96
 # it in the writer's L2 only buys the reader a miss.
 _CPOL_DEVICE = 0x11
 
+def _fused_combine_plan(n_groups: int) -> list[tuple[int, int, int]]:
+    """Rounds of `(dv_slices, slots, head_base)` reducing one token's H heads.
 
-def _fused_dv_slices(n_groups: int) -> int:
-    """Dv slices per head when the reduction rides in the producer's epilogue.
+    The standalone reducer splits a head across lanes to size its *grid*; here
+    the grid is already the producer's, so what the split sizes instead is how
+    a token's work divides among the `4 * n_groups` waves that produced it. A
+    slot is one 64-lane job holding `DV / (64 * dv)` of one head's values, so a
+    round hands each wave at most one slot and `dv` trades store width against
+    how many waves a head keeps busy.
 
-    The standalone reducer picks this to size its *grid*; here the grid is
-    already the producer's, so what it sizes instead is how the token's work
-    divides among the `4 * n_groups` waves that produced it. A slice is one
-    64-lane job, so the waves need `ceil(16 * dv / (4 * n_groups))` rounds and
-    each round is `1 / dv` of a full-width one -- minimise the product, and
-    break ties toward the fewest slices, which keeps the store widest and
-    rebuilds the LSE weights the fewest times.
+    Narrow slots win, so `dv` minimises round count and nothing else: three
+    rounds of `dv=2` beat two of `dv=1` by 3.7% at twelve waves, and a
+    mixed-width schedule that saves a round costs 0.96%.
+
+    Which head a wave takes within a round is not a lever. Slots are packed
+    head-major, so the `dv` waves sharing a head each read that head's LSE
+    column and a wave's head changes every round; cutting instead by DV slice,
+    so a wave keeps its head and a chunk reads one column for all `dv` of its
+    rounds, removed 37% of the epilogue's uncached LSE loads at seq 84 and
+    measured +0.03% against a lazy control arm. The column is issued alongside
+    the partials it shares a round with, so it is never the round's critical
+    path.
     """
+    units = PARTIAL_WAVES * n_groups
     best = None
     for dv in (1, 2, 4):
-        cost = -(-(H * dv) // (PARTIAL_WAVES * n_groups)) / dv
+        cost = -(-(H * dv) // units) / dv
         if best is None or cost < best[0] - 1e-9:
             best = (cost, dv)
-    return best[1]
+    dv = best[1]
+    slots = H * dv
+    return [
+        (dv, min(units, slots - r * units), r * units // dv)
+        for r in range(-(-slots // units))
+    ]
 
 
 def _arrive_and_wait(bar_ptr, arrivals: int, is_master):
@@ -146,17 +163,29 @@ def _arrive_and_wait(bar_ptr, arrivals: int, is_master):
         scf.YieldOp([arith.addi(body.arguments[0], arith.constant(1, type=i32))])
 
 
-def _split_weights(load_lse, ni, scalar):
-    """Softmax weights of one (token, head)'s `ni` partial records.
+def _lse_reads(load_lse, ni, scalar):
+    """Issue one (token, head) column's LSE loads for `_split_weights`.
 
-    `load_lse` maps a split index to that record's LSE. Both branches are the
-    standalone reducer's, kept because the choice between them is a property of
-    the column length, not of who is running it: the scalar form spends one exp2
-    per record but reads the column with wave-uniform addresses, and the
-    butterfly's two 6-step shuffles cost the same whatever `ni` is.
+    Split out from the weights so a caller with several columns in flight can
+    put every column's loads on the wire before it consumes the first one.
     """
     if scalar:
-        lse_vals = [load_lse(fx.Int32(s)) for s in fx.range_constexpr(ni)]
+        return [load_lse(fx.Int32(s)) for s in fx.range_constexpr(ni)]
+    lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
+    return [load_lse((lane < fx.Int32(ni)).select(lane, fx.Int32(0)))]
+
+
+def _split_weights(lse_vals, ni, scalar):
+    """Softmax weights of one (token, head)'s `ni` partial records.
+
+    `lse_vals` is what `_lse_reads` returned for the same `(ni, scalar)`. Both
+    branches are the standalone reducer's, kept because the choice between them
+    is a property of the column length, not of who is running it: the scalar
+    form spends one exp2 per record but reads the column with wave-uniform
+    addresses, and the butterfly's two 6-step shuffles cost the same whatever
+    `ni` is.
+    """
+    if scalar:
         max_lse = _tree_reduce(lse_vals, lambda a, b: fx.Float32(a).maximumf(b))
         weights = [
             fx.Float32(fx.rocdl.exp2(T.f32, (v - max_lse).ir_value()))
@@ -169,8 +198,7 @@ def _split_weights(load_lse, ni, scalar):
 
     lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
     in_split = lane < fx.Int32(ni)
-    lse = load_lse(in_split.select(lane, fx.Int32(0)))
-    lse = in_split.select(lse, fx.Float32(float("-inf")))
+    lse = in_split.select(lse_vals[0], fx.Float32(float("-inf")))
     max_lse = lse
     for off in [32, 16, 8, 4, 2, 1]:
         max_lse = fx.Float32(max_lse).maximumf(
@@ -276,14 +304,11 @@ def compile_sparse_mla_partial(
     seeded = inner_iter > 1
     if fuse_combine and n_groups < 2:
         raise ValueError("fuse_combine needs at least two partial records")
-    # Reduction geometry. A token owns `4 * n_groups` waves and `16 * dv_slices`
-    # 64-lane slots; the slot count per wave is `16 * dv / (4 * n_groups)`, which
-    # does not depend on the runtime row count, so the round count is static.
-    dv_slices = _fused_dv_slices(n_groups) if fuse_combine else 1
-    combine_slots = H * dv_slices
+    # Reduction geometry. A token owns `4 * n_groups` waves, and how its H heads
+    # are cut into 64-lane slots depends only on that count, so the schedule --
+    # and therefore the round count -- is static.
     combine_units = PARTIAL_WAVES * n_groups
-    combine_rounds = -(-combine_slots // combine_units)
-    combine_vals = DV // (64 * dv_slices)
+    combine_plan = _fused_combine_plan(n_groups) if fuse_combine else []
     scalar_lse = n_groups <= 16
 
     @fx.struct
@@ -307,7 +332,9 @@ def compile_sparse_mla_partial(
             + (f"_prime{xpf_prime}" if xpf_prime > _XPF_DEPTH else "")
             + (f"_ng{n_groups}" if ragged else "")
             + (
-                f"_coop_dv{dv_slices}_dev"
+                "_coop_"
+                + "_".join(f"{dv}x{slots}" for dv, slots, _ in combine_plan)
+                + "_dev"
                 if fuse_combine
                 else ""
             )
@@ -885,10 +912,10 @@ def compile_sparse_mla_partial(
                         )
                     )
 
-                def load_partial(s, rhead, out_lane):
+                def load_partial(s, rhead, out_lane, vals):
                     # bf16 pairs ride as i32 so a slice is still one dword
                     # transaction; a copy atom would carry the default policy.
-                    words = combine_vals // 2
+                    words = vals // 2
                     row = tok * fx.Int32(n_groups) + fx.Int32(s)
                     raw = buffer_ops.buffer_load(
                         partial_rsrc,
@@ -903,51 +930,65 @@ def compile_sparse_mla_partial(
                     else:
                         vec = fx.Vector(raw, shape=words, dtype=fx.Int32)
                     vec = vec.bitcast(fx.BFloat16)
-                    return [
-                        vec[i].to(fx.Float32)
-                        for i in fx.range_constexpr(combine_vals)
-                    ]
+                    return [vec[i].to(fx.Float32) for i in fx.range_constexpr(vals)]
 
-                def reduce_slot(slot):
-                    if fx.const_expr(dv_slices == 1):
-                        rhead, out_lane = slot, lane
+                def round_reads(dv, slots, head_base):
+                    """Put one round's whole column on the wire.
+
+                    A short round reads with its unit clamped instead of under
+                    the store's guard: the address stays in bounds, the result
+                    is thrown away, and the loads leave the branch so they can
+                    be issued alongside the other rounds'.
+                    """
+                    vals = DV // (64 * dv)
+                    u = unit
+                    if fx.const_expr(slots < combine_units):
+                        u = (unit < fx.Int32(slots)).select(unit, fx.Int32(0))
+                    if fx.const_expr(dv == 1):
+                        rhead, out_lane = fx.Int32(head_base) + u, lane
                     else:
-                        rhead = slot // fx.Int32(dv_slices)
-                        out_lane = (slot % fx.Int32(dv_slices)) * fx.Int32(
-                            64
-                        ) + lane
-                    scales = _split_weights(
-                        lambda s: load_lse(s, rhead), n_groups, scalar_lse
+                        rhead = fx.Int32(head_base) + u // fx.Int32(dv)
+                        out_lane = (u % fx.Int32(dv)) * fx.Int32(64) + lane
+                    return (
+                        rhead,
+                        out_lane,
+                        vals,
+                        _lse_reads(
+                            lambda s: load_lse(s, rhead), n_groups, scalar_lse
+                        ),
+                        [
+                            load_partial(s, rhead, out_lane, vals)
+                            for s in fx.range_constexpr(n_groups)
+                        ],
                     )
-                    acc = [
-                        fx.Float32(0.0) for _ in fx.range_constexpr(combine_vals)
-                    ]
+
+                def round_combine(reads):
+                    rhead, out_lane, vals, lse_vals, parts = reads
+                    scales = _split_weights(lse_vals, n_groups, scalar_lse)
+                    acc = [fx.Float32(0.0) for _ in fx.range_constexpr(vals)]
                     for s in fx.range_constexpr(n_groups):
-                        vals = load_partial(s, rhead, out_lane)
                         acc = [
-                            acc[i] + vals[i] * scales[s]
-                            for i in fx.range_constexpr(combine_vals)
+                            acc[i] + parts[s][i] * scales[s]
+                            for i in fx.range_constexpr(vals)
                         ]
                     _store_final_out(
-                        final_buf, tok, rhead, out_lane, acc, combine_vals,
-                        fx.BFloat16,
+                        final_buf, tok, rhead, out_lane, acc, vals, fx.BFloat16
                     )
 
-                for r in fx.range_constexpr(combine_rounds):
-                    slot = unit + fx.Int32(r * combine_units)
-                    if fx.const_expr((r + 1) * combine_units <= combine_slots):
-                        reduce_slot(slot)
+                for dv, slots, head_base in combine_plan:
+                    if fx.const_expr(slots == combine_units):
+                        round_combine(round_reads(dv, slots, head_base))
                     else:
                         with _if_then(
                             scf.IfOp(
                                 arith.cmpi(
                                     CmpIPredicate.slt,
-                                    _raw(slot),
-                                    arith.constant(combine_slots, type=T.i32),
+                                    _raw(unit),
+                                    arith.constant(slots, type=T.i32),
                                 )
                             )
                         ):
-                            reduce_slot(slot)
+                            round_combine(round_reads(dv, slots, head_base))
 
     @flyc.jit
     def launch(

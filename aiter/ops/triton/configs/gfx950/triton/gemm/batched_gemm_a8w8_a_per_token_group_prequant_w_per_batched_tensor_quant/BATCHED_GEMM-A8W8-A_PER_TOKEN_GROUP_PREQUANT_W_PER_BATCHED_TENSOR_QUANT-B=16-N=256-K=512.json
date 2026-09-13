@@ -19,6 +19,16 @@
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
     },
+    "M_LEQ_48": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+        "waves_per_eu": 3,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 64,
