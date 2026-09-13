@@ -79,6 +79,36 @@ def _pointer_view(ptr, dtype, shape, stride):
     return fx.make_view(typed_ptr, fx.make_layout(shape, stride))
 
 
+def _tree_reduce(values, op):
+    """Balanced pairwise reduction over a constexpr-length list.
+
+    Pairwise rather than sequential so the fp32 error stays log-depth, matching
+    what the cross-lane butterfly gives (the pair order differs, so the last
+    bits do too).
+    """
+    cur = list(values)
+    while len(cur) > 1:
+        nxt = [
+            op(cur[2 * i], cur[2 * i + 1]) for i in fx.range_constexpr(len(cur) // 2)
+        ]
+        if len(cur) % 2:
+            nxt.append(cur[-1])
+        cur = nxt
+    return cur[0]
+
+
+def _uniform_i32(value):
+    """Launder a wave-invariant lane value into a scalar the backend trusts.
+
+    ``thread_idx.x // 64`` is wave-invariant but divergence analysis cannot see
+    that, so any address derived from it would be forced onto the vector memory
+    path. Reading lane 0 states the invariant explicitly for one instruction.
+    """
+    return fx.Int32(
+        fx.rocdl.readlane(T.i32, value.ir_value(), fx.Int32(0).ir_value())
+    )
+
+
 def _pointer_buffer_tensor(ptr, dtype, shape, stride):
     """Build a public buffer-backed tensor view from a pointer ABI argument."""
     return fx.rocdl.make_buffer_tensor(_pointer_view(ptr, dtype, shape, stride))

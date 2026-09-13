@@ -17,6 +17,12 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
 from . import buffer_ops
+from .mla_reduce import (
+    _pointer_buffer_tensor,
+    _store_final_out,
+    _tree_reduce,
+    _uniform_i32,
+)
 
 H = 16
 DV = 512
@@ -33,6 +39,155 @@ PITCH = DV + 16
 # cost nothing, and it is still +0.4% at seq 48 and +9.2% at seq 84. The
 # prologue is the one place a deeper burst pays -- see `_pick_xpf_prime`.
 _XPF_DEPTH = 1
+
+# Sense bit of a barrier counter, the poll ceiling that keeps a grid the
+# hardware did not co-schedule from wedging the device, and the backoff between
+# polls -- see `_arrive_and_wait`.
+_BARRIER_SENSE = -(1 << 31)
+_BARRIER_MAX_POLLS = 1 << 20
+_BARRIER_SLEEP = 1
+# i32 slots per counter. One 128 B line each: the counters are hammered by
+# uncached polls, and two on a line would serialise two tokens' rendezvous.
+BARRIER_STRIDE = 32
+BARRIER_SLOTS = 96
+
+# CPol bits: SC0 in bit 0, SC1 in bit 4. Both set makes a store write through
+# past every cache and a load read past every cache, which is what a reducer on
+# another L2 domain needs. A token's splits only share a domain when the
+# dispatcher's `block % 8` fan-out happens to keep them together, which under
+# split-major ownership means `seq % 8 == 0`: drop these bits and seq 48 stays
+# bit identical while seq 60 and seq 84 lose 0.4% of the output to stale reads,
+# with the partials themselves still correct on disk.
+#
+# Carrying the policy per instruction rather than fencing is what makes the
+# fusion pay, and it is not even a trade: an agent-scope fence pair was priced
+# at 5.1 us for the release writeback and 1.3 us for the acquire invalidate,
+# against 1.3-2.3 us for this whole epilogue, because a fence is a whole-cache
+# operation that every CTA issues. Against plain cached access it is still
+# 0.3-0.4 us cheaper here -- a partial is read once, by another CU, so leaving
+# it in the writer's L2 only buys the reader a miss.
+_CPOL_DEVICE = 0x11
+
+
+def _fused_dv_slices(n_groups: int) -> int:
+    """Dv slices per head when the reduction rides in the producer's epilogue.
+
+    The standalone reducer picks this to size its *grid*; here the grid is
+    already the producer's, so what it sizes instead is how the token's work
+    divides among the `4 * n_groups` waves that produced it. A slice is one
+    64-lane job, so the waves need `ceil(16 * dv / (4 * n_groups))` rounds and
+    each round is `1 / dv` of a full-width one -- minimise the product, and
+    break ties toward the fewest slices, which keeps the store widest and
+    rebuilds the LSE weights the fewest times.
+    """
+    best = None
+    for dv in (1, 2, 4):
+        cost = -(-(H * dv) // (PARTIAL_WAVES * n_groups)) / dv
+        if best is None or cost < best[0] - 1e-9:
+            best = (cost, dv)
+    return best[1]
+
+
+def _arrive_and_wait(bar_ptr, arrivals: int, is_master):
+    """Arrive at, and wait on, one sense-reversing barrier of `arrivals` CTAs.
+
+    Costs one i32 of scratch and needs no reset, which a HIP graph replay could
+    not do anyway: the master adds `SENSE - (arrivals - 1)` and everyone else
+    adds one, so every launch adds exactly `SENSE`, and the counter's top bit
+    alone tells a CTA whether the generation it joined has completed. The bit
+    cannot flip early because the partial sums stay below it until the last
+    arrival. Correct from any starting value with the low 31 bits clear.
+
+    The caller must have drained its stores to the scope the readers use before
+    calling; the atomic here is relaxed on purpose, because an acquire or
+    release at agent scope lowers to an L2 writeback-invalidate, which in this
+    kernel costs more than the whole reduction (measured 8.6 us against 0.9).
+
+    Poll traffic is the cost that matters, not the atomic: the load has to skip
+    every cache to see another CTA's write, so each poll is a round trip to the
+    coherence point and the pollers all queue on one line. That is why this is
+    called once per token over `n_groups` CTAs rather than once over the grid --
+    240 pollers on a single counter cost 9.3 us at seq 48.
+
+    The wait is bounded. Every CTA is resident by construction -- the launcher
+    only fuses when the grid fits the CU array once -- but a bound turns a
+    violated assumption into a wrong answer instead of a hung device.
+    """
+    i32 = T.i32
+    ptr = fx.to_llvm_ptr(bar_ptr)
+    delta = is_master.select(
+        fx.Int32(_BARRIER_SENSE - (arrivals - 1)), fx.Int32(1)
+    )
+    old = llvm.atomicrmw(
+        llvm.AtomicBinOp.add,
+        ptr,
+        _raw(delta),
+        llvm.AtomicOrdering.monotonic,
+        syncscope="agent",
+    )
+    zero = arith.constant(0, type=i32)
+    sense = arith.constant(_BARRIER_SENSE, type=i32)
+    limit = arith.constant(_BARRIER_MAX_POLLS, type=i32)
+    loop = scf.WhileOp([i32], [zero])
+    test = loop.before.blocks.append(i32)
+    with ir.InsertionPoint(test):
+        polls = test.arguments[0]
+        cur = llvm.load(i32, ptr, volatile_=True)
+        pending = arith.cmpi(
+            CmpIPredicate.eq, arith.andi(arith.xori(cur, old), sense), zero
+        )
+        scf.ConditionOp(
+            arith.andi(pending, arith.cmpi(CmpIPredicate.slt, polls, limit)), [polls]
+        )
+    body = loop.after.blocks.append(i32)
+    with ir.InsertionPoint(body):
+        if fx.const_expr(_BARRIER_SLEEP):
+            fx.rocdl.s_sleep(_BARRIER_SLEEP)
+        scf.YieldOp([arith.addi(body.arguments[0], arith.constant(1, type=i32))])
+
+
+def _split_weights(load_lse, ni, scalar):
+    """Softmax weights of one (token, head)'s `ni` partial records.
+
+    `load_lse` maps a split index to that record's LSE. Both branches are the
+    standalone reducer's, kept because the choice between them is a property of
+    the column length, not of who is running it: the scalar form spends one exp2
+    per record but reads the column with wave-uniform addresses, and the
+    butterfly's two 6-step shuffles cost the same whatever `ni` is.
+    """
+    if scalar:
+        lse_vals = [load_lse(fx.Int32(s)) for s in fx.range_constexpr(ni)]
+        max_lse = _tree_reduce(lse_vals, lambda a, b: fx.Float32(a).maximumf(b))
+        weights = [
+            fx.Float32(fx.rocdl.exp2(T.f32, (v - max_lse).ir_value()))
+            for v in lse_vals
+        ]
+        inv = fx.Float32(
+            fx.rocdl.rcp(T.f32, _tree_reduce(weights, lambda a, b: a + b).ir_value())
+        )
+        return [w * inv for w in weights]
+
+    lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
+    in_split = lane < fx.Int32(ni)
+    lse = load_lse(in_split.select(lane, fx.Int32(0)))
+    lse = in_split.select(lse, fx.Float32(float("-inf")))
+    max_lse = lse
+    for off in [32, 16, 8, 4, 2, 1]:
+        max_lse = fx.Float32(max_lse).maximumf(
+            fx.Float32(max_lse).shuffle_xor(fx.Int32(off), fx.Int32(64))
+        )
+    scale = fx.Float32(fx.rocdl.exp2(T.f32, (lse - max_lse).ir_value()))
+    scale = in_split.select(scale, fx.Float32(0.0))
+    denom = scale
+    for off in [32, 16, 8, 4, 2, 1]:
+        denom = denom + fx.Float32(denom).shuffle_xor(fx.Int32(off), fx.Int32(64))
+    scale = scale * fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
+    return [
+        fx.Float32(
+            fx.rocdl.readlane(T.f32, scale.ir_value(), fx.Int32(s).ir_value())
+        )
+        for s in fx.range_constexpr(ni)
+    ]
 
 
 @contextmanager
@@ -82,6 +237,7 @@ def compile_sparse_mla_partial(
     use_buffer: bool = True,
     xpf_prime: int = 1,
     n_groups: int | None = None,
+    fuse_combine: bool = False,
 ):
     """Compile the 64-key BF16-partial, log2-LSE producer.
 
@@ -92,6 +248,13 @@ def compile_sparse_mla_partial(
     `ng % n_groups` real tiles. The short groups run their final tile with the
     index row forced negative, which the existing padding mask already turns
     into an all `-inf` score -- an exactly neutral tile, no separate epilogue.
+
+    `fuse_combine` folds the reducer in behind a grid-wide barrier instead of
+    launching it as a second kernel. Only legal when every CTA is resident --
+    the launcher gates on the grid fitting the CU array once -- and only worth
+    it because a graph node on this device costs 1.5-1.8 us of wall against a
+    reducer whose body is 0.2-0.6 us. Each token is reduced by the very CTAs
+    that produced it, so the partials are read back from the L2 that wrote them.
     """
     if not 1 <= ng <= 33:
         raise ValueError(f"sparse MLA decode needs 1..33 splits, got {ng}")
@@ -111,6 +274,17 @@ def compile_sparse_mla_partial(
     # Fold the online-softmax rescale into the PV MFMA. See the loop body. A
     # single tile has nothing to rescale, so it keeps the plain form.
     seeded = inner_iter > 1
+    if fuse_combine and n_groups < 2:
+        raise ValueError("fuse_combine needs at least two partial records")
+    # Reduction geometry. A token owns `4 * n_groups` waves and `16 * dv_slices`
+    # 64-lane slots; the slot count per wave is `16 * dv / (4 * n_groups)`, which
+    # does not depend on the runtime row count, so the round count is static.
+    dv_slices = _fused_dv_slices(n_groups) if fuse_combine else 1
+    combine_slots = H * dv_slices
+    combine_units = PARTIAL_WAVES * n_groups
+    combine_rounds = -(-combine_slots // combine_units)
+    combine_vals = DV // (64 * dv_slices)
+    scalar_lse = n_groups <= 16
 
     @fx.struct
     class PartialStorage:
@@ -132,6 +306,11 @@ def compile_sparse_mla_partial(
             + ("_buf" if use_buffer else "")
             + (f"_prime{xpf_prime}" if xpf_prime > _XPF_DEPTH else "")
             + (f"_ng{n_groups}" if ragged else "")
+            + (
+                f"_coop_dv{dv_slices}_dev"
+                if fuse_combine
+                else ""
+            )
         ),
         known_block_size=[PARTIAL_THREADS, 1, 1],
     )
@@ -141,6 +320,8 @@ def compile_sparse_mla_partial(
         index_ptr: fx.Pointer,
         partial_ptr: fx.Pointer,
         lse_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+        bar_ptr: fx.Pointer,
         scale_log2e: fx.Float32,
         seq: fx.Int32,
     ):
@@ -228,6 +409,34 @@ def compile_sparse_mla_partial(
             out_record = (fx.Int64(tok) * n_groups + fx.Int64(split)) * H + fx.Int64(
                 head
             )
+            # The fused reducer sits on another CU, and for a token whose splits
+            # do not all land on one L2 domain on another domain too, so the
+            # records it will read are published past every cache. Both sides
+            # carry the policy on the instruction; see `_CPOL_DEVICE`.
+            if fx.const_expr(fuse_combine):
+                partial_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(partial_ptr))
+                )
+                lse_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(fx.ptrtoint(lse_ptr))
+                )
+                out_elem = (
+                    (tok * fx.Int32(n_groups) + split) * fx.Int32(H) + head
+                ) * fx.Int32(DV)
+
+            def store_partial(vec, out_col):
+                if fx.const_expr(fuse_combine):
+                    buffer_ops.buffer_store(
+                        vec,
+                        partial_rsrc,
+                        out_elem + out_col,
+                        cache_modifier=_CPOL_DEVICE,
+                    )
+                else:
+                    fx.ptr_store(
+                        vec, partial_ptr + out_record * DV + fx.Int64(out_col)
+                    )
+
             running_max = fx.Float32(float("-inf"))
             running_denom = fx.Float32(0.0)
             running_acc = [
@@ -578,17 +787,15 @@ def compile_sparse_mla_partial(
                         )
                         acc = _mfma32(avec, bvec, acc)
                     if fx.const_expr(inner_iter == 1):
-                        out_col = dv_base + fx.Int32(4) * group
-                        fx.ptr_store(
+                        store_partial(
                             (fx.Vector(acc) * output_scale).to(fx.BFloat16),
-                            partial_ptr + out_record * DV + fx.Int64(out_col),
+                            dv_base + fx.Int32(4) * group,
                         )
                     else:
                         if fx.const_expr(k_i + 1 == inner_iter):
-                            out_col = dv_base + fx.Int32(4) * group
-                            fx.ptr_store(
+                            store_partial(
                                 (fx.Vector(acc) * final_inv_denom).to(fx.BFloat16),
-                                partial_ptr + out_record * DV + fx.Int64(out_col),
+                                dv_base + fx.Int32(4) * group,
                             )
                         else:
                             running_acc[j] = fx.Vector(acc)
@@ -624,7 +831,123 @@ def compile_sparse_mla_partial(
                         fx.Float32(-(2**30)),
                         fly_math.log2(running_denom) + running_max,
                     )
-                fx.ptr_store(lse, lse_ptr + out_record)
+                if fx.const_expr(fuse_combine):
+                    buffer_ops.buffer_store(
+                        lse,
+                        lse_rsrc,
+                        (tok * fx.Int32(n_groups) + split) * fx.Int32(H) + head,
+                        cache_modifier=_CPOL_DEVICE,
+                    )
+                else:
+                    fx.ptr_store(lse, lse_ptr + out_record)
+
+            if fx.const_expr(fuse_combine):
+                # Publish, rendezvous, reduce. Every wave drains its own stores
+                # -- which are already write-through, so retiring them is all
+                # the release this needs -- then one thread per CTA joins the
+                # token's rendezvous while the rest wait on the cheap
+                # workgroup barrier.
+                fx.rocdl.s_waitcnt(vmcnt=0)
+                fx.gpu.barrier()
+                with _if_then(
+                    scf.IfOp(
+                        arith.cmpi(
+                            CmpIPredicate.eq, _raw(tid), arith.constant(0, type=T.i32)
+                        )
+                    )
+                ):
+                    _arrive_and_wait(
+                        bar_ptr + fx.Int64(tok) * BARRIER_STRIDE,
+                        n_groups,
+                        split == fx.Int32(0),
+                    )
+                fx.gpu.barrier()
+
+                # A token's reducers are the very CTAs that produced it, and
+                # its work is spread over all of them: the waves number
+                # themselves `split * 4 + wave` and take slots round robin, so
+                # a round's slots are contiguous and no CTA is left holding the
+                # whole reduction.
+                final_buf = _pointer_buffer_tensor(
+                    out_ptr, fx.BFloat16, (seq, H, DV), (H * DV, DV, 1)
+                )
+                lse_row = tok * fx.Int32(n_groups * H)
+                unit = split * fx.Int32(PARTIAL_WAVES) + _uniform_i32(wave)
+
+                def load_lse(s, rhead):
+                    return fx.Float32(
+                        buffer_ops.buffer_load(
+                            lse_rsrc,
+                            lse_row + s * fx.Int32(H) + rhead,
+                            vec_width=1,
+                            dtype=fx.Float32,
+                            cache_modifier=_CPOL_DEVICE,
+                        )
+                    )
+
+                def load_partial(s, rhead, out_lane):
+                    # bf16 pairs ride as i32 so a slice is still one dword
+                    # transaction; a copy atom would carry the default policy.
+                    words = combine_vals // 2
+                    row = tok * fx.Int32(n_groups) + fx.Int32(s)
+                    raw = buffer_ops.buffer_load(
+                        partial_rsrc,
+                        (row * fx.Int32(H) + rhead) * fx.Int32(DV // 2)
+                        + out_lane * fx.Int32(words),
+                        vec_width=words,
+                        dtype=fx.Int32,
+                        cache_modifier=_CPOL_DEVICE,
+                    )
+                    if fx.const_expr(words == 1):
+                        vec = fx.Vector.from_elements([fx.Int32(raw)], fx.Int32)
+                    else:
+                        vec = fx.Vector(raw, shape=words, dtype=fx.Int32)
+                    vec = vec.bitcast(fx.BFloat16)
+                    return [
+                        vec[i].to(fx.Float32)
+                        for i in fx.range_constexpr(combine_vals)
+                    ]
+
+                def reduce_slot(slot):
+                    if fx.const_expr(dv_slices == 1):
+                        rhead, out_lane = slot, lane
+                    else:
+                        rhead = slot // fx.Int32(dv_slices)
+                        out_lane = (slot % fx.Int32(dv_slices)) * fx.Int32(
+                            64
+                        ) + lane
+                    scales = _split_weights(
+                        lambda s: load_lse(s, rhead), n_groups, scalar_lse
+                    )
+                    acc = [
+                        fx.Float32(0.0) for _ in fx.range_constexpr(combine_vals)
+                    ]
+                    for s in fx.range_constexpr(n_groups):
+                        vals = load_partial(s, rhead, out_lane)
+                        acc = [
+                            acc[i] + vals[i] * scales[s]
+                            for i in fx.range_constexpr(combine_vals)
+                        ]
+                    _store_final_out(
+                        final_buf, tok, rhead, out_lane, acc, combine_vals,
+                        fx.BFloat16,
+                    )
+
+                for r in fx.range_constexpr(combine_rounds):
+                    slot = unit + fx.Int32(r * combine_units)
+                    if fx.const_expr((r + 1) * combine_units <= combine_slots):
+                        reduce_slot(slot)
+                    else:
+                        with _if_then(
+                            scf.IfOp(
+                                arith.cmpi(
+                                    CmpIPredicate.slt,
+                                    _raw(slot),
+                                    arith.constant(combine_slots, type=T.i32),
+                                )
+                            )
+                        ):
+                            reduce_slot(slot)
 
     @flyc.jit
     def launch(
@@ -633,6 +956,8 @@ def compile_sparse_mla_partial(
         index_ptr: fx.Pointer,
         partial_ptr: fx.Pointer,
         lse_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+        bar_ptr: fx.Pointer,
         scale_log2e: fx.Float32,
         seq: fx.Int32,
         stream: fx.Stream,
@@ -643,6 +968,8 @@ def compile_sparse_mla_partial(
             index_ptr,
             partial_ptr,
             lse_ptr,
+            out_ptr,
+            bar_ptr,
             scale_log2e,
             seq,
         ).launch(

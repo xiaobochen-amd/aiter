@@ -162,6 +162,18 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
+    # BLOCK_SIZE_K is the quantisation group size, so a K that is not a whole
+    # number of groups runs its short last group at full width: at K=192 against
+    # group_size 128 a quarter of the arithmetic is spent on a block of zeros,
+    # and the mask rides along on the full-width groups that never needed one.
+    # Peeling that group to its own power-of-two width is bit-exact (verified on
+    # eleven shapes by zero-padding K) but not reachable through this codegen:
+    # a second dot of a different K makes Triton stage the narrow B tile through
+    # LDS one byte at a time (M=48: 673 -> 1026 instructions, VGPR 82 -> 118,
+    # 32 buffer_load_ubyte + 35 ds_write_b8) and re-materialise the 64-bit index
+    # math (M=84: 673 -> 3513, 2388 of them SALU). Measured +43..+55% on uk,
+    # unchanged on uv, with the tail loads either in place or hoisted above the
+    # loop. Do not re-walk it without first checking what the narrow dot lowers to.
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             a = tl.load(a_ptrs)
@@ -170,10 +182,19 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
-        a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
-        a_scale_recip = 1.0 / a_scale
-        a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+        # Widen A once and feed both the group amax and the rescale from the
+        # f32 copy: reading `a` twice makes the backend widen it twice, once
+        # fused into the abs (v_and_b32_sdwa per element) and again for the
+        # multiply. The clamp is dead by construction -- a_scale is
+        # max|a| / DTYPE_MAX, so |a * (1 / a_scale)| <= DTYPE_MAX for every
+        # element, including the max|a| < 1e-10 floor -- and it costs a
+        # v_med3_f32 per element. Together that is 10 of the 117 instructions
+        # in the K-loop body at (N=256, K=512) and 11 of 138 at (N=512, K=192),
+        # bit-identical on both shapes at M = 8, 42, 48, 60, 84.
+        af = a.to(tl.float32)
+        m = tl.maximum(tl.max(tl.abs(af), axis=-1), 1e-10)[:, None]
+        a_scale = m * one_over_DTYPE_MAX
+        a = (af * (1.0 / a_scale)).to(b_ptr.dtype.element_ty)
 
         accumulator += tl.dot(a, b) * a_scale
 

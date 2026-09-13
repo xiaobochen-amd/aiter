@@ -12,7 +12,15 @@ import os
 import flydsl.expr as fx
 import torch
 
-from .kernels.sparse_mla_decode import BLOCK_I, DIM, DV, H, compile_sparse_mla_partial
+from .kernels.sparse_mla_decode import (
+    BARRIER_SLOTS,
+    BARRIER_STRIDE,
+    BLOCK_I,
+    DIM,
+    DV,
+    H,
+    compile_sparse_mla_partial,
+)
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
@@ -185,6 +193,51 @@ def _pick_xpf_prime(inner_iter: int, producer_ctas: int, num_cu: int) -> int:
     return 2 if producer_ctas <= 2 * num_cu else 1
 
 
+def _fuse_combine(seq: int, n_groups: int, num_cu: int) -> bool:
+    """Report whether the reduction can ride in the producer's epilogue.
+
+    What it buys is one graph node. A node on this device costs 1.5-1.8 us of
+    wall whatever it contains -- measured by launching the reducer twice in the
+    same graph and differencing -- and the reducer's own body is only 0.2-0.6 us
+    of that, so the launch, not the reduction, is what the decode step pays for
+    84 times.
+
+    Two conditions:
+
+    * Residency. The fused form rendezvouses across CTAs, which only terminates
+      if a token's splits are all resident at once. `num_cu` is the conservative
+      bound: the dispatcher walks workgroups round robin over the CU array, so a
+      grid no larger than the array puts at most one CTA on a CU, and the
+      producer's occupancy -- two CTAs per CU at its LDS and register footprint
+      -- covers that twice over.
+    * Column length. Past 16 splits the reduction stops being worth carrying:
+      the epilogue rebuilds the softmax weights with a cross-lane butterfly
+      instead of a scalar column, the per-lane slice narrows to a single dword,
+      and 32 CTAs contend for one token's counter. Measured against the two
+      kernel path, same block ABBA, all bit identical: 16 splits is -6.1% at
+      seq 10 and -7.6% at seq 14, and 32 splits is +3.2% at seq 8.
+    """
+    return 2 <= n_groups <= 16 and seq * n_groups <= num_cu
+
+
+@functools.lru_cache(maxsize=8)
+def _barrier_scratch(device_index: int) -> torch.Tensor:
+    """Per-token rendezvous counters for the fused reduction, one line each.
+
+    Cached per device so a HIP graph captures a stable address, and zeroed only
+    here: the barrier is sense reversing, so every launch leaves each counter on
+    the value the next one expects whatever the split count. That is the whole
+    reason for the sense trick -- counters that had to be cleared between
+    launches would need either a second kernel or a host memset inside the
+    captured graph, which is the cost the fusion is trying to remove.
+    """
+    return torch.zeros(
+        BARRIER_SLOTS * BARRIER_STRIDE,
+        dtype=torch.int32,
+        device=torch.device("cuda", device_index),
+    )
+
+
 def _use_split_major(seq: int, n_groups: int, num_cu: int) -> bool:
     """Use split-major ownership once the producer grid is saturated."""
     return seq * n_groups >= 2 * num_cu
@@ -322,10 +375,12 @@ def _launch_partial(
     indices: torch.Tensor,
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
+    out: torch.Tensor,
     sm_scale: float,
     *,
     ng: int,
     n_groups: int,
+    fuse_combine: bool,
 ) -> None:
     inner_iter = -(-ng // n_groups)
     seq = int(q.shape[0])
@@ -347,6 +402,7 @@ def _launch_partial(
         use_buffer=use_buffer,
         xpf_prime=_pick_xpf_prime(inner_iter, seq * n_groups, num_cu),
         n_groups=n_groups,
+        fuse_combine=fuse_combine,
     )
     _run_compiled(
         launch,
@@ -355,6 +411,8 @@ def _launch_partial(
         ptr_arg(indices, fx.Int32),
         ptr_arg(partial_output, fx.BFloat16),
         ptr_arg(partial_lse, fx.Float32),
+        ptr_arg(out, fx.BFloat16),
+        ptr_arg(_barrier_scratch(q.device.index), fx.Int32),
         float(sm_scale) * math.log2(math.e),
         int(q.shape[0]),
         fx.Stream(torch.cuda.current_stream(q.device)),
@@ -400,21 +458,25 @@ def flydsl_sparse_mla_decode(
             device=q.device,
         )
 
+    fuse_combine = _fuse_combine(seq, ng_partial, _num_cu(q.device.index))
     _launch_partial(
         q,
         kv,
         indices,
         partial_output,
         partial_lse,
+        out,
         sm_scale,
         ng=ng,
         n_groups=ng_partial,
+        fuse_combine=fuse_combine,
     )
-    _flydsl_sparse_mla_decode_combine(
-        partial_output.unsqueeze(0),
-        partial_lse.unsqueeze(0),
-        out.unsqueeze(0),
-    )
+    if not fuse_combine:
+        _flydsl_sparse_mla_decode_combine(
+            partial_output.unsqueeze(0),
+            partial_lse.unsqueeze(0),
+            out.unsqueeze(0),
+        )
     return out
 
 

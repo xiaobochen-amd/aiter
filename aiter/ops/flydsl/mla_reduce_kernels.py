@@ -29,6 +29,8 @@ from .kernels.mla_reduce import (
     _load_partial_out_narrow,
     _pointer_buffer_tensor,
     _store_final_out,
+    _tree_reduce,
+    _uniform_i32,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
     derive_actual_max_splits,
@@ -269,37 +271,6 @@ def _storage_ref(t: torch.Tensor):
         return weakref.ref(t.untyped_storage())
     except (AttributeError, TypeError):
         return None
-
-
-def _tree_reduce(values, op):
-    """Balanced pairwise reduction over a constexpr-length list.
-
-    Pairwise rather than sequential so the fp32 error stays log-depth, matching
-    what the cross-lane butterfly gives (the pair order differs, so the last
-    bits do too).
-    """
-    cur = list(values)
-    while len(cur) > 1:
-        nxt = [
-            op(cur[2 * i], cur[2 * i + 1])
-            for i in fx.range_constexpr(len(cur) // 2)
-        ]
-        if len(cur) % 2:
-            nxt.append(cur[-1])
-        cur = nxt
-    return cur[0]
-
-
-def _uniform_i32(value):
-    """Launder a wave-invariant lane value into a scalar the backend trusts.
-
-    ``thread_idx.x // 64`` is wave-invariant but divergence analysis cannot see
-    that, so any address derived from it would be forced onto the vector memory
-    path. Reading lane 0 states the invariant explicitly for one instruction.
-    """
-    return fx.Int32(
-        fx.rocdl.readlane(T.i32, value.ir_value(), fx.Int32(0).ir_value())
-    )
 
 
 # Heads reduced per coarse CTA. The reduction itself is per (row, head) and does
