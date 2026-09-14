@@ -93,6 +93,18 @@ def _sglang_roots():
     roots += [
         os.path.dirname(os.path.dirname(os.path.dirname(o))) for o in origins
     ]
+    # An editable install can stitch sglang together as a namespace package, in
+    # which case `__file__` is None and the only handle on the tree is
+    # `__path__`. Derive the root from the subpackages too: the top-level path
+    # can point at a stub directory while srt/ and kernels/ live in the tree
+    # that actually runs, which is the one that needs patching.
+    # <root>/python/sglang[/srt] -> <root>
+    for name, up in (("sglang", 2), ("sglang.srt", 3), ("sglang.kernels", 3)):
+        sub = sys.modules.get(name)
+        for entry in list(getattr(sub, "__path__", None) or []):
+            for _ in range(up):
+                entry = os.path.dirname(entry)
+            roots.append(entry)
     seen = []
     for root in roots:
         if os.path.isfile(os.path.join(root, _PROBE)) and root not in seen:
@@ -149,7 +161,9 @@ def install_prequant_hook(root):
     insertion keyed on it lands on every tree that has the function at all,
     which a context diff would not. Idempotent and non-fatal, like the rest.
     """
-    path = os.path.join(root, "sglang", "srt", "speculative", "eagle_worker_v2.py")
+    path = os.path.join(
+        root, "python", "sglang", "srt", "speculative", "eagle_worker_v2.py"
+    )
     try:
         with open(path) as f:
             text = f.read()
