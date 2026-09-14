@@ -154,14 +154,21 @@ def _maybe_mxfp4_bf16_moe_weights(w1, w2, quant_type, scales, biases, activation
         return None
     if w1.shape[2] % 64 or w2.shape[2] % 64 or w1.shape[1] % 32 or w2.shape[1] % 32:
         return None
-    # Capture bakes whatever runs into the graph; a 5 GB one-shot quantisation
-    # must not land there. Warmup runs eager first, so the cache is already hot
-    # by the time capture starts.
-    if torch.cuda.is_current_stream_capturing():
-        return None
-
+    # A cache hit is a dict lookup returning tensors that already exist, which
+    # is legal under capture -- so the lookup comes first. Only the cold path
+    # (a 5 GB one-shot quantisation) must stay out of the graph.
     key = (id(w1), w1._version, id(w2), w2._version)
     hit = _bf16_moe_mxfp4_cache.get(key)
+    if hit is None and torch.cuda.is_current_stream_capturing():
+        # A 5 GB one-shot quantisation must not land inside the graph. This used
+        # to just return None on the assumption that an eager warmup had already
+        # filled the cache -- which is true on one sglang tree and false on
+        # another, and when it is false the bf16 weights get baked into the
+        # graph and every replay runs them, with nothing in the log to say so.
+        # Now the cold-cache case is loud, and `prequant_bf16_moe_weights` gives
+        # the caller a way to fill the cache before capture starts.
+        _warn_capture_cold_cache(w1, w2)
+        return None
     if hit is None:
         w1_qt, w1_scale = _quant_moe_weight_mxfp4(w1)
         w2_qt, w2_scale = _quant_moe_weight_mxfp4(w2)
@@ -175,6 +182,38 @@ def _maybe_mxfp4_bf16_moe_weights(w1, w2, quant_type, scales, biases, activation
             "(AITER_BF16_MOE_MXFP4=0 to disable)"
         )
     return hit[2:]
+
+
+_capture_cold_warned: set = set()
+
+
+def _warn_capture_cold_cache(w1, w2):
+    shapes = (tuple(w1.shape), tuple(w2.shape))
+    if shapes in _capture_cold_warned:
+        return
+    _capture_cold_warned.add(shapes)
+    logger.warning(
+        f"[fused_moe] dense bf16 experts {shapes[0]}/{shapes[1]} reached CUDA "
+        "graph capture before being quantised, so bf16 is what the graph will "
+        "replay. Call aiter.fused_moe.prequant_bf16_moe_weights(w1, w2) on "
+        "these tensors before capture to get the MXFP4 path."
+    )
+
+
+def prequant_bf16_moe_weights(w1, w2, activation=ActivationType.Silu):
+    """Fill the MXFP4 cache for a dense bf16 expert pair, ahead of capture.
+
+    Same gate as the per-call path minus the capture check, so it can be called
+    from wherever the weights are known to be final -- after load, before the
+    graph runner captures. Returns True if the pair is now cached. Safe to call
+    repeatedly; the second call is a dict lookup.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    got = _maybe_mxfp4_bf16_moe_weights(
+        w1, w2, QuantType.No, (None, None, None, None), (None, None), activation
+    )
+    return got is not None
 
 
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
