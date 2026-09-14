@@ -31,6 +31,8 @@ _NUM_QK_TILES = _BLOCK_N // 16
 _QK_TILES_PER_WAVE = _NUM_QK_TILES // _NUM_WAVES
 _DV_TILES_PER_WAVE = (_V_HEAD_DIM // 16) // _NUM_WAVES
 _PV_K_STEPS = _BLOCK_N // 32
+# Latent low half, latent high half and the rope tail, per QK tile a wave owns.
+_KV_FRAGMENTS = 9 * _QK_TILES_PER_WAVE
 _KV_LDS_PITCH = _V_HEAD_DIM + 16
 _FP8_MAX = 448.0
 _LOG2E = 1.4426950408889634
@@ -88,7 +90,7 @@ def _compile_sparse_mla_prefill():
         row_sum: fx.Array[fx.Float32, _NUM_WAVES * 16, 16]
 
     @flyc.kernel(
-        name="flydsl_sparse_mla_prefill_fp8_gfx950",
+        name="flydsl_sparse_mla_prefill_fp8_gfx950_w128_xpf",
         known_block_size=[_NUM_THREADS, 1, 1],
     )
     def kernel(
@@ -185,6 +187,14 @@ def _compile_sparse_mla_prefill():
         index_row = token * _TOPK
         key_slot_col = 8 * (lane_col // 4) + (lane_col % 4)
         key_slot_group = 8 * lane_group
+        # Gather view of the same 16 keys: eight lanes share one key row and
+        # cover 128 contiguous bytes of it, so one request spans a full pair of
+        # cache lines instead of 64 B. Lanes 0..7 of every group serve the
+        # wave's keys 0..7 and lanes 8..15 serve keys 8..15, whose slots sit
+        # exactly 16 apart.
+        wide_slot_col = 8 * (lane // 32) + (lane // 8) % 4
+        wide_element = (lane % 8) * 4
+        wide_byte = (lane % 8) * 16
 
         # Stage indices once to avoid repeating scattered VMEM loads in the key loop.
         for iteration in range_constexpr(_TOPK // (_NUM_THREADS * 4)):
@@ -195,6 +205,56 @@ def _compile_sparse_mla_prefill():
                 load_i32_vector4(indices_divided, index_row + element),
             )
         fx.barrier()
+
+        def staged_row(block_start, element):
+            raw = fx.Int32(
+                _llvm.load(
+                    i32_type,
+                    _lds_ptr(indices_base, (block_start + element) * 4),
+                )
+            )
+            return (raw >= fx.Int32(0)).select(raw, fx.Int32(0))
+
+        def issue_gather(block_start):
+            """Issue one key block's KV gather. Registers only, no LDS traffic."""
+            fragments = []
+            for tile_index in range_constexpr(_QK_TILES_PER_WAVE):
+                tile = wave * _QK_TILES_PER_WAVE + tile_index
+                tile_slot = fx.Int32(_key_slot(tile, 0))
+                low_base = staged_row(block_start, tile_slot + wide_slot_col) * (
+                    _HEAD_DIM // 4
+                )
+                high_base = staged_row(
+                    block_start, tile_slot + wide_slot_col + 16
+                ) * (_HEAD_DIM // 4)
+                for chunk in range_constexpr(4):
+                    fragments.append(
+                        load_i32_vector4(
+                            kv_divided, low_base + 32 * chunk + wide_element
+                        )
+                    )
+                for chunk in range_constexpr(4):
+                    fragments.append(
+                        load_i32_vector4(
+                            kv_divided, high_base + 32 * chunk + wide_element
+                        )
+                    )
+                # The 64 B rope tail is one line per row either way, so it
+                # keeps the narrow mapping and stays a register operand.
+                fragments.append(
+                    load_i32_vector4(
+                        kv_divided,
+                        staged_row(block_start, tile_slot + key_slot_col)
+                        * (_HEAD_DIM // 4)
+                        + (_V_HEAD_DIM // 4)
+                        + 4 * lane_group,
+                    )
+                )
+            return fragments
+
+        # Prime the software pipeline before the Q fragments are read back, so
+        # the first block's gather overlaps the remaining prologue.
+        prefetched = issue_gather(fx.Int32(0))
 
         q_fragments = []
         for chunk in range_constexpr(4):
@@ -237,10 +297,13 @@ def _compile_sparse_mla_prefill():
         fx.barrier()
 
         i32_pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
-        init = [_raw(neg_inf), _raw(zero_f)] + [
-            _raw(zero4) for _ in range_constexpr(_DV_TILES_PER_WAVE)
-        ]
+        init = (
+            [_raw(neg_inf), _raw(zero_f)]
+            + [_raw(zero4) for _ in range_constexpr(_DV_TILES_PER_WAVE)]
+            + [_raw(item) for item in prefetched]
+        )
         loop_result = init
+        gather_state = 2 + _DV_TILES_PER_WAVE
 
         for key_start_iv, state in range(0, fx.Int32(_TOPK), _BLOCK_N, init=init):
             key_start = fx.Int32(key_start_iv)
@@ -249,68 +312,56 @@ def _compile_sparse_mla_prefill():
             accumulators = [
                 Vec(state[2 + item]) for item in range_constexpr(_DV_TILES_PER_WAVE)
             ]
+            gathered = [
+                Vec(state[gather_state + item])
+                for item in range_constexpr(_KV_FRAGMENTS)
+            ]
 
-            # Issue all gathered KV loads before the QK MFMAs.
-            kv_low = []
-            kv_high = []
+            # Publish this block's KV, which the previous iteration gathered.
             for tile_index in range_constexpr(_QK_TILES_PER_WAVE):
                 tile = wave * _QK_TILES_PER_WAVE + tile_index
-                row = fx.Int32(
-                    _llvm.load(
-                        i32_type,
-                        _lds_ptr(
-                            indices_base,
-                            (key_start + fx.Int32(_key_slot(tile, 0)) + key_slot_col)
-                            * 4,
-                        ),
-                    )
-                )
-                safe_row = (row >= fx.Int32(0)).select(row, fx.Int32(0))
-                kv_base = safe_row * (_HEAD_DIM // 4)
-                low_chunks = []
-                high_chunks = []
+                tile_slot = fx.Int32(_key_slot(tile, 0))
+                wide_offset = (tile_slot + wide_slot_col) * _KV_LDS_PITCH + wide_byte
                 for chunk in range_constexpr(4):
-                    low_chunks.append(
-                        load_i32_vector4(
-                            kv_divided,
-                            kv_base + 32 * chunk + 4 * lane_group,
-                        )
+                    _lds_store_i32x4(
+                        values_base,
+                        wide_offset + 128 * chunk,
+                        gathered[9 * tile_index + chunk],
                     )
-                    high_chunks.append(
-                        load_i32_vector4(
-                            kv_divided,
-                            kv_base + 32 * chunk + 16 + 4 * lane_group,
-                        )
+                    _lds_store_i32x4(
+                        values_base,
+                        wide_offset + 16 * _KV_LDS_PITCH + 128 * chunk,
+                        gathered[9 * tile_index + 4 + chunk],
                     )
-                low_chunks.append(
-                    load_i32_vector4(
-                        kv_divided, kv_base + (_V_HEAD_DIM // 4) + 4 * lane_group
-                    )
-                )
-                kv_low.append(low_chunks)
-                kv_high.append(high_chunks)
+
+            # The next block's rows are independent of everything below, and the
+            # registers just published to LDS are free, so issue that gather now
+            # and let this block's QK, softmax and PV hide its latency. The last
+            # iteration re-gathers its own block, which is still cache resident,
+            # rather than reading past the staged index array.
+            step = key_start + fx.Int32(_BLOCK_N)
+            prefetched = issue_gather(
+                (step < fx.Int32(_TOPK)).select(step, key_start)
+            )
 
             scores = []
             for tile_index in range_constexpr(_QK_TILES_PER_WAVE):
                 tile = wave * _QK_TILES_PER_WAVE + tile_index
+                tile_slot = fx.Int32(_key_slot(tile, 0))
+
+                # QK wants key `lane_col` in lane `lane_col`, which no wide
+                # gather can produce, so the operand is read back from the LDS
+                # copy PV needs anyway. Writer and reader are the same wave, so
+                # this adds no barrier.
+                key_location = tile_slot + key_slot_col
                 score_fragment = fx.make_rmem_tensor(4, fx.Float32)
                 score_fragment.store(zero4)
-                for chunk in range_constexpr(4):
-                    kv_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                    kv_fragment.store(
-                        kv_low[tile_index][chunk].shuffle(
-                            kv_high[tile_index][chunk], list(range(8))
-                        )
-                    )
-                    fx.gemm(
-                        qk_mma,
-                        score_fragment,
-                        kv_fragment,
-                        q_fragments[chunk],
-                        score_fragment,
-                    )
+                # The rope operand is already lane-correct, so its MFMA runs
+                # while the latent copy drains into LDS.
                 kv_fragment = fx.make_rmem_tensor(8, fx.Int32)
-                kv_fragment.store(kv_low[tile_index][4].shuffle(zero4i, list(range(8))))
+                kv_fragment.store(
+                    gathered[9 * tile_index + 8].shuffle(zero4i, list(range(8)))
+                )
                 fx.gemm(
                     qk_mma,
                     score_fragment,
@@ -318,21 +369,36 @@ def _compile_sparse_mla_prefill():
                     q_fragments[4],
                     score_fragment,
                 )
-                score = Vec(score_fragment.load().ir_value())
-
-                key_location = fx.Int32(_key_slot(tile, 0)) + key_slot_col
                 value_offset = key_location * _KV_LDS_PITCH
                 for chunk in range_constexpr(4):
-                    _lds_store_i32x4(
-                        values_base,
-                        value_offset + 128 * chunk + 16 * lane_group,
-                        kv_low[tile_index][chunk],
+                    low = Vec(
+                        _llvm.load(
+                            i32x4_type,
+                            _lds_ptr(
+                                values_base,
+                                value_offset + 128 * chunk + 16 * lane_group,
+                            ),
+                        )
                     )
-                    _lds_store_i32x4(
-                        values_base,
-                        value_offset + 128 * chunk + 64 + 16 * lane_group,
-                        kv_high[tile_index][chunk],
+                    high = Vec(
+                        _llvm.load(
+                            i32x4_type,
+                            _lds_ptr(
+                                values_base,
+                                value_offset + 128 * chunk + 64 + 16 * lane_group,
+                            ),
+                        )
                     )
+                    kv_fragment = fx.make_rmem_tensor(8, fx.Int32)
+                    kv_fragment.store(low.shuffle(high, list(range(8))))
+                    fx.gemm(
+                        qk_mma,
+                        score_fragment,
+                        kv_fragment,
+                        q_fragments[chunk],
+                        score_fragment,
+                    )
+                score = Vec(score_fragment.load().ir_value())
 
                 validity = Vec(
                     _llvm.load(
@@ -498,6 +564,7 @@ def _compile_sparse_mla_prefill():
                     _raw(accumulators[item])
                     for item in range_constexpr(_DV_TILES_PER_WAVE)
                 ]
+                + [_raw(item) for item in prefetched]
             )
 
         final_sum = fx.Float32(loop_result[1])

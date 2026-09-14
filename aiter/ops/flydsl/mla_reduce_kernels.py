@@ -29,6 +29,8 @@ from .kernels.mla_reduce import (
     _load_partial_out_narrow,
     _pointer_buffer_tensor,
     _store_final_out,
+    _tree_reduce,
+    _uniform_i32,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
     derive_actual_max_splits,
@@ -271,23 +273,53 @@ def _storage_ref(t: torch.Tensor):
         return None
 
 
-# Cache the complete 33-split x 2-topology domain. Recompiling an evicted entry
+# Heads reduced per coarse CTA. The reduction itself is per (row, head) and does
+# not share anything across heads, so this only changes how the work is packed:
+# eight waves of one row read one 8 KB contiguous span per split and their LSE
+# columns land in the same scalar-cache lines.
+#
+# Benched standalone, one head per CTA is 8-10% better at decode row counts
+# (2.243 against 2.497 us at seq 48) because it turns seq*2 blocks into seq*16.
+# Behind the producer it used to be worse (+0.9% at seq 60, +1.7% at seq 84):
+# with the old `row * blocks_per_row + b` numbering, raising blocks_per_row from
+# 2 to 16 spread one row's reads from two L2 domains over all eight. Now that
+# the grid is row-minor the block count no longer steers which domain a CTA
+# lands in, and the standalone ordering wins in situ too, by 0.5% at seq 48 and
+# seq 60. Re-time this against the producer, not alone, before changing it.
+_COMBINE_HEADS_PER_CTA = 1
+
+# Longest split column the scalar LSE path takes. It reads the whole column with
+# wave-uniform s_loads and rebuilds each split weight in VALU, which removes two
+# 6-step cross-lane butterflies whose ds_swizzle legs each cost a serialised
+# lgkmcnt(0) round trip -- but it spends one exp2 per split, so long columns keep
+# the butterfly, whose cost is independent of the split count.
+_COMBINE_SCALAR_LSE_MAX_NI = 16
+
+
+# Cache the complete 33-split x 3-topology domain. Recompiling an evicted entry
 # costs about 20 ms even with the on-disk cache warm.
 @functools.lru_cache(maxsize=128)
-def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
+def _compile_sparse_decode_direct_combine(ni: int, dv_slices: int):
     if not 1 <= ni <= 33:
         raise ValueError(f"sparse decode split count must be 1..33, got {ni}")
+    if dv_slices not in (1, 2, 4):
+        raise ValueError(f"sparse decode combine takes 1, 2 or 4 Dv slices")
 
-    # One wave owns one head. Fine mode splits Dv into four independent slices;
-    # coarse mode keeps eight values per lane while retaining wave-local scales.
-    dv_slices_per_head = 4 if fine else 1
-    blocks_per_row = 16 * dv_slices_per_head
-    values_per_lane = 2 if fine else 8
-    topology = "fine" if fine else "coarse"
+    # A slot is one reduction output fragment: one head's Dv cut into
+    # `dv_slices` independent slices, each owned by one 64-lane CTA. The cut
+    # costs store width -- 16, 8 or 4 bytes per lane -- and buys wave count,
+    # which is what the reduction is actually short of at decode row counts.
+    slots_per_row = 16 * dv_slices
+    values_per_lane = 512 // (64 * dv_slices)
+    heads_per_cta = 1 if dv_slices > 1 else _COMBINE_HEADS_PER_CTA
+    scalar_lse = ni <= _COMBINE_SCALAR_LSE_MAX_NI
+    blocks_per_row = slots_per_row // heads_per_cta
+    threads = 64 * heads_per_cta
+    tag = f"_dv{dv_slices}_h{heads_per_cta}" + ("_slse" if scalar_lse else "")
 
     @flyc.kernel(
-        name=f"flydsl_sparse_mla_decode_combine_ni{ni}_{topology}",
-        known_block_size=[64, 1, 1],
+        name=f"flydsl_sparse_mla_decode_combine_ni{ni}{tag}",
+        known_block_size=[threads, 1, 1],
     )
     def kernel(
         partial_output: fx.Pointer,
@@ -295,13 +327,29 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
         final_output: fx.Pointer,
         seq: fx.Int32,
     ):
-        lane = fx.Int32(fx.thread_idx.x)
-        block = fx.Int32(fx.block_idx.x)
-        block_in_row = block % fx.Int32(blocks_per_row)
-        row = block // fx.Int32(blocks_per_row)
-        head = block_in_row // fx.Int32(dv_slices_per_head)
-        dv_slice = block_in_row % fx.Int32(dv_slices_per_head)
-        out_lane = dv_slice * fx.Int32(64) + lane
+        tid = fx.Int32(fx.thread_idx.x)
+        # Row on grid-x, the row's slot group on grid-y, so the flat workgroup
+        # index is `block_in_row * seq + row` -- the producer's own split-major
+        # owner formula. gfx950 hands workgroup `i` to XCD `i % 8`, so every CTA
+        # that reads row `r` now lands in the same L2 domain that wrote it
+        # instead of the `row * blocks_per_row + b` numbering, which spread a
+        # row's partials over `blocks_per_row` domains.
+        row = fx.Int32(fx.block_idx.x)
+        block_in_row = fx.Int32(fx.block_idx.y)
+        if fx.const_expr(heads_per_cta > 1):
+            lane = tid % fx.Int32(64)
+            slot = block_in_row * fx.Int32(heads_per_cta) + _uniform_i32(
+                tid // fx.Int32(64)
+            )
+        else:
+            lane = tid
+            slot = block_in_row
+        if fx.const_expr(dv_slices == 1):
+            head = slot
+            out_lane = lane
+        else:
+            head = slot // fx.Int32(dv_slices)
+            out_lane = (slot % fx.Int32(dv_slices)) * fx.Int32(64) + lane
         partial_buf = _pointer_buffer_tensor(
             partial_output,
             fx.BFloat16,
@@ -315,29 +363,61 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
             (16 * 512, 512, 1),
         )
 
-        in_split = lane < fx.Int32(ni)
-        safe_split = in_split.select(lane, fx.Int32(0))
-        lse = fx.Float32(
-            fx.ptr_load(
-                partial_lse
-                + ((fx.Int64(row) * ni + fx.Int64(safe_split)) * 16 + fx.Int64(head))
+        if fx.const_expr(scalar_lse):
+            lse_vals = [
+                fx.Float32(
+                    fx.ptr_load(
+                        partial_lse
+                        + ((fx.Int64(row) * ni + fx.Int64(split)) * 16 + fx.Int64(head))
+                    )
+                )
+                for split in fx.range_constexpr(ni)
+            ]
+            max_lse = _tree_reduce(lse_vals, lambda a, b: fx.Float32(a).maximumf(b))
+            weights = [
+                fx.Float32(fx.rocdl.exp2(T.f32, (v - max_lse).ir_value()))
+                for v in lse_vals
+            ]
+            denom = _tree_reduce(weights, lambda a, b: a + b)
+            inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
+            split_scales = [w * inv for w in weights]
+        else:
+            in_split = lane < fx.Int32(ni)
+            safe_split = in_split.select(lane, fx.Int32(0))
+            lse = fx.Float32(
+                fx.ptr_load(
+                    partial_lse
+                    + (
+                        (fx.Int64(row) * ni + fx.Int64(safe_split)) * 16
+                        + fx.Int64(head)
+                    )
+                )
             )
-        )
-        neg_inf = fx.Float32(float("-inf"))
-        zero = fx.Float32(0.0)
-        lse = in_split.select(lse, neg_inf)
-        max_lse = lse
-        for off in [32, 16, 8, 4, 2, 1]:
-            peer = fx.Float32(max_lse).shuffle_xor(fx.Int32(off), fx.Int32(64))
-            max_lse = fx.Float32(max_lse).maximumf(peer)
-        scale = fx.Float32(fx.rocdl.exp2(T.f32, (lse - max_lse).ir_value()))
-        scale = in_split.select(scale, zero)
-        denom = scale
-        for off in [32, 16, 8, 4, 2, 1]:
-            peer = fx.Float32(denom).shuffle_xor(fx.Int32(off), fx.Int32(64))
-            denom = denom + peer
-        inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
-        scale = scale * inv
+            neg_inf = fx.Float32(float("-inf"))
+            zero = fx.Float32(0.0)
+            lse = in_split.select(lse, neg_inf)
+            max_lse = lse
+            for off in [32, 16, 8, 4, 2, 1]:
+                peer = fx.Float32(max_lse).shuffle_xor(fx.Int32(off), fx.Int32(64))
+                max_lse = fx.Float32(max_lse).maximumf(peer)
+            scale = fx.Float32(fx.rocdl.exp2(T.f32, (lse - max_lse).ir_value()))
+            scale = in_split.select(scale, zero)
+            denom = scale
+            for off in [32, 16, 8, 4, 2, 1]:
+                peer = fx.Float32(denom).shuffle_xor(fx.Int32(off), fx.Int32(64))
+                denom = denom + peer
+            inv = fx.Float32(fx.rocdl.rcp(T.f32, denom.ir_value()))
+            scale = scale * inv
+            split_scales = [
+                fx.Float32(
+                    fx.rocdl.readlane(
+                        T.f32,
+                        scale.ir_value(),
+                        fx.Int32(split).ir_value(),
+                    )
+                )
+                for split in fx.range_constexpr(ni)
+            ]
 
         acc = [fx.Float32(0.0) for _ in fx.range_constexpr(values_per_lane)]
         for split in fx.range_constexpr(ni):
@@ -349,15 +429,8 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
                 values_per_lane,
                 fx.BFloat16,
             )
-            split_scale = fx.Float32(
-                fx.rocdl.readlane(
-                    T.f32,
-                    scale.ir_value(),
-                    fx.Int32(split).ir_value(),
-                )
-            )
             acc = [
-                acc[i] + vals[i] * split_scale
+                acc[i] + vals[i] * split_scales[split]
                 for i in fx.range_constexpr(values_per_lane)
             ]
         _store_final_out(
@@ -379,8 +452,8 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
         stream: fx.Stream,
     ):
         kernel(partial_output, partial_lse, final_output, seq).launch(
-            grid=(seq * fx.Int32(blocks_per_row), 1, 1),
-            block=(64, 1, 1),
+            grid=(seq, blocks_per_row, 1),
+            block=(threads, 1, 1),
             stream=stream,
             value_attrs={"rocdl.waves_per_eu": 4},
         )
@@ -389,9 +462,39 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
 
 
 def _use_fine_decode_combine(seq: int, ni: int, num_cu: int) -> bool:
-    """Select the Dv-sliced reducer only over its measured occupancy window."""
+    """Select the four-way Dv split only over its measured occupancy window."""
     fine_ctas = seq * 64
     return ni > 16 and num_cu <= fine_ctas <= 3 * num_cu
+
+
+def _combine_dv_slices(seq: int, ni: int, num_cu: int) -> int:
+    """Return how many Dv slices one head's reduction is cut into.
+
+    Slicing Dv is pure parallelism: the slices of a head touch disjoint columns
+    and are bit-identical to the unsliced reduction, so the only cost is the
+    narrower store (16, 8 or 4 bytes per lane) and the LSE column each extra CTA
+    has to re-derive. That second cost is what separates the two branches. The
+    butterfly path builds its weights with cross-lane reductions whose cost does
+    not depend on the split count, so it can afford four slices; the scalar path
+    spends one exp2 per split in every CTA, so a fourth slice buys wave count at
+    four times the exp2 bill and stops paying.
+
+    Two slices pay everywhere the scalar path runs. The gain decays with how
+    full the unsliced grid already is, but it never changes sign: timed behind
+    the producer against the `seq * 16` CTAs one slice launches, it is -9.72% at
+    224, -8.00% at 288, -8.06% at 384, -3.74% at 512, -2.08% at 672, -1.19% at
+    768, -0.84% at 960, -0.74% at 1344 and -0.58% at 1536. Do not gate this on
+    the grid filling the SIMD array -- a gate at 1024 was tried and it gives up
+    the two heaviest verify shapes for nothing. Four slices was 0.62% worse than
+    two at seq 60 and 1.07% worse at seq 14, and its one win, 0.25% at seq 84,
+    does not survive a second block.
+
+    Re-time this with a same-block A/B, not across ruler runs: the verify call
+    drifts about 0.7% between processes, which is wider than the effect.
+    """
+    if _use_fine_decode_combine(seq, ni, num_cu):
+        return 4
+    return 2 if ni <= _COMBINE_SCALAR_LSE_MAX_NI else 1
 
 
 def _flydsl_sparse_mla_decode_combine(
@@ -442,8 +545,9 @@ def _flydsl_sparse_mla_decode_combine(
     num_cu = torch.cuda.get_device_properties(
         final_output.device.index
     ).multi_processor_count
-    fine = _use_fine_decode_combine(seq, ni, num_cu)
-    direct = _compile_sparse_decode_direct_combine(ni, fine)
+    direct = _compile_sparse_decode_direct_combine(
+        ni, _combine_dv_slices(seq, ni, num_cu)
+    )
     _run_compiled(
         direct,
         _pointer_arg(partial_output, torch.bfloat16),

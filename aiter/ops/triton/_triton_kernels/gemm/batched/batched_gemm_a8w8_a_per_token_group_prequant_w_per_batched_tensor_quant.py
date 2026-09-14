@@ -22,6 +22,26 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 )
 
 
+@triton.jit
+def _reciprocal(x):
+    """1 / x to within about half an ulp, for a strictly positive x.
+
+    The backend expands `1.0 / x` into the IEEE sequence -- two v_div_scale, a
+    v_rcp, three refinement FMAs, v_div_fmas and v_div_fixup -- and neither
+    tl.fdiv(..., ieee_rounding=False) nor the fast-math flags relax it on
+    gfx950. v_rcp_f32 carries at most one ulp and the Newton step halves that.
+    """
+    r = tl.inline_asm_elementwise(
+        "v_rcp_f32_e32 $0, $1",
+        "=v,v",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return r * (2.0 - x * r)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -162,6 +182,42 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
+    # BLOCK_SIZE_K is the quantisation group size, so a K that is not a whole
+    # number of groups runs its short last group at full width: at K=192 against
+    # group_size 128 a quarter of the arithmetic is spent on a block of zeros,
+    # and the mask rides along on the full-width groups that never needed one.
+    # Peeling that group to its own power-of-two width is bit-exact (verified on
+    # eleven shapes by zero-padding K) but not reachable through this codegen:
+    # a second dot of a different K makes Triton stage the narrow B tile through
+    # LDS one byte at a time (M=48: 673 -> 1026 instructions, VGPR 82 -> 118,
+    # 32 buffer_load_ubyte + 35 ds_write_b8) and re-materialise the 64-bit index
+    # math (M=84: 673 -> 3513, 2388 of them SALU). Measured +43..+55% on uk,
+    # unchanged on uv, with the tail loads either in place or hoisted above the
+    # loop. Do not re-walk it without first checking what the narrow dot lowers to.
+    # The loop order is load-quantise-dot per group and it has to stay that
+    # way. Moving the gathers of several groups above the dot chain makes this
+    # kernel wrong: Triton stages each group's activation scale through LDS to
+    # carry it from the reduction layout into the MFMA output layout, and with
+    # more than one group in flight it emits the extra ds_write without the
+    # matching fence -- 8 ds_write against 11 s_barrier where a separated form
+    # needs 16 -- so one group's scale write races the previous group's read.
+    # Measured relL2 0.059..0.070 against 0.0017 for this loop in 8 of 192
+    # (M, K, tile, num_warps, num_stages) combinations, non-deterministic at
+    # M=200, and one combination changed verdict between two processes. The
+    # hazard is not reachable from here: an explicit tl.debug_barrier() on
+    # either side of the quantise still diverges on a heavy-tailed input, and
+    # hoisting is not worth repairing anyway -- two or four groups ahead
+    # measure +1.0 / +2.2% at (N=256, K=512) and +0.7 / -0.4% at (N=512, K=192)
+    # against this loop, and the barriers themselves add up to +9.7%. Hoisting
+    # only B is fenced correctly and bit-exact but costs +8.8..+16.8% at
+    # (N=256, K=512): the latency that matters is the activation gather feeding
+    # the prequant, not the weights. num_stages cannot substitute either -- 4 /
+    # 5 / 6 measure +16.6 / +31.1 / +47.4% against 3 at (M=48, N=512, K=192).
+    # Nor can the compile options: kpack=2 is -0.0%, schedule_hint=attention
+    # -0.2..-0.0%, memory-bound-attention +0.2/+1.4%, enable_fp_fusion=False
+    # +0.9/+1.1% and no longer bit-exact. num_warps below 4 removes the scale's
+    # cross-warp broadcast outright and still loses: 2 costs +8.5..+22% and 1
+    # costs +11..+57% over BN in {32, 64, 128, 256}, all bit-exact.
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             a = tl.load(a_ptrs)
@@ -170,10 +226,25 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
-        a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
-        a_scale_recip = 1.0 / a_scale
-        a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+        # Widen A once and feed both the group amax and the rescale from the
+        # f32 copy: reading `a` twice makes the backend widen it twice, once
+        # fused into the abs (v_and_b32_sdwa per element) and again for the
+        # multiply. The clamp is dead by construction -- a_scale is
+        # max|a| / DTYPE_MAX, so |a * (1 / a_scale)| <= DTYPE_MAX for every
+        # element, including the max|a| < 1e-10 floor -- and it costs a
+        # v_med3_f32 per element. Together that is 10 of the 117 instructions
+        # in the K-loop body at (N=256, K=512) and 11 of 138 at (N=512, K=192),
+        # bit-identical on both shapes at M = 8, 42, 48, 60, 84.
+        # The reciprocal is the other ten: a_scale is one value per row, so an
+        # IEEE-correct 1/x buys nothing the fp8 rounding can see, and the
+        # refined v_rcp_f32 is bit-identical to it on every shape and input
+        # distribution measured. It cannot ride on the convert's own scale
+        # operand, which the backend ties off at 1.0 -- an fp8-typed inline asm
+        # result fails register allocation on this LLVM whatever the pack width.
+        af = a.to(tl.float32)
+        m = tl.maximum(tl.max(tl.abs(af), axis=-1), 1e-10)[:, None]
+        a_scale = m * one_over_DTYPE_MAX
+        a = (af * _reciprocal(a_scale)).to(b_ptr.dtype.element_ty)
 
         accumulator += tl.dot(a, b) * a_scale
 
@@ -207,15 +278,45 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+# Absorbed-MLA decode runs this kernel at M = 6 * concurrency, so the rows that
+# matter sit just under the standard 64 bound and a single M_LEQ_64 entry has to
+# serve both ends of it. The extra bound splits them; tables without an
+# M_LEQ_48 entry fall through to M_LEQ_64 exactly as before.
+#
+# What the two ends disagree about is num_stages, and the split runs along
+# whether the M tile is ragged rather than along M itself. Repeated-launch
+# pricing of the B=16 decode shapes puts the whole body in the latency regime
+# -- a second dot chain per iteration costs 0.008 us on (N=512, K=192) and
+# -0.004 us on (N=256, K=512), the prequant prologue is 2.5% and 16% of the
+# body, and 46-54% of the call is the graph node itself (1.47-1.54 us, flat in
+# grid, workgroup size and kernarg count, and unchanged when consecutive nodes
+# write disjoint buffers) -- so the depth of the load pipeline is the one thing
+# left that moves it. Deeper only pays where ceil(M / BLOCK_SIZE_M) is exact:
+# 2 -> 3 measures -1.9% at M=48 and -1.3% at M=64 on (N=256, K=512) but +0.3%
+# at M=60, and -1.1% / -2.3% at M=60 / M=64 on (N=512, K=192). Past 3 it turns
+# over hard on both (+3.4 / +3.7 / +15.1% at 4 / 5 / 6 on uv48, +16.3 / +31.0 /
+# +47.2% on uk48), and the tile axis is not an alternative: BLOCK_SIZE_M 32 is
+# +27..+45% even where it buys both more CTAs and fewer bytes than the shipped
+# 16, and GROUP_SIZE_M above 1 is +1.9..+6.1% everywhere. All of it bit-exact.
+_M_BOUNDS = (1, 4, 8, 16, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+
 def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
-
+    # B is a factor of the launch width -- the grid is
+    # (B, cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)) -- so the tile that
+    # fills the CU array depends on it. Pass it through so a B-specialized
+    # table is picked when one exists; callers that omit B keep the
+    # (N, K)-keyed behaviour.
     return get_gemm_config(
         "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
         M,
         N,
         K,
+        bounds=_M_BOUNDS,
+        B=B,
     )
