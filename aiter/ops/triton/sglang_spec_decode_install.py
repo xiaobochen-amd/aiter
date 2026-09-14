@@ -111,6 +111,59 @@ def _patch(root, args):
     )
 
 
+_PREQUANT_ANCHOR = (
+    '        """Capture the draft worker\'s own cuda graphs '
+    '(decode + draft-extend)."""\n'
+)
+
+_PREQUANT_HOOK = '''        # aiter: quantise any dense bf16 expert pair *before* capture. The
+        # one-shot conversion cannot run inside a graph, and on some trees this
+        # layer's first touch IS the capture -- in which case the graph replays
+        # bf16 forever. Doing it here removes the dependence on warmup order.
+        try:
+            from aiter.fused_moe import prequant_bf16_moe_weights
+
+            _m = getattr(self.draft_runner, "model", None)
+            _n = 0
+            for _mod in (_m.modules() if _m is not None else ()):
+                _w13 = getattr(_mod, "w13_weight", None)
+                _w2 = getattr(_mod, "w2_weight", None)
+                if _w13 is None or _w2 is None:
+                    continue
+                if prequant_bf16_moe_weights(_w13.data, _w2.data):
+                    _n += 1
+            if _n:
+                logger.info(
+                    f"aiter: prequantised {_n} dense bf16 MoE pair(s) before capture"
+                )
+        except Exception as _e:  # never block capture
+            logger.warning(f"aiter bf16 MoE prequant skipped: {_e}")
+'''
+
+
+def install_prequant_hook(root):
+    """Insert the pre-capture MXFP4 prequant call into eagle_worker_v2.
+
+    Kept out of the unified diff on purpose. The diff carries multi-line context
+    that differs between sglang trees, and this one-line anchor does not -- an
+    insertion keyed on it lands on every tree that has the function at all,
+    which a context diff would not. Idempotent and non-fatal, like the rest.
+    """
+    path = os.path.join(root, "sglang", "srt", "speculative", "eagle_worker_v2.py")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return "no-eagle-worker"
+    if "prequant_bf16_moe_weights" in text:
+        return "present"
+    if _PREQUANT_ANCHOR not in text:
+        return "no-anchor"
+    with open(path, "w") as f:
+        f.write(text.replace(_PREQUANT_ANCHOR, _PREQUANT_ANCHOR + _PREQUANT_HOOK, 1))
+    return "installed"
+
+
 def install(root=None):
     """Apply the call sites to ``root``. Returns "present", "installed" or a reason."""
     if not os.path.isfile(PATCH_FILE):
@@ -121,9 +174,14 @@ def install(root=None):
     if not roots:
         return "no-sglang"
     root = roots[0]
+    # Independent of the diff below: it has its own anchor and its own idempotence
+    # check, and it must land even on a tree where the diff is already applied.
+    hook = install_prequant_hook(root)
+    if hook not in ("present", "installed"):
+        logger.warning("aiter bf16 MoE prequant hook: %s", hook)
     missing = _missing_markers(root)
     if not missing:
-        return "present"
+        return "present" if hook != "installed" else "installed"
     if len(missing) != len(_MARKERS):
         # Some files carry the call sites and some do not. Patching from here
         # would fail half-way and leave a worse tree than either end state.
