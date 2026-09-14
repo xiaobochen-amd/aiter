@@ -158,3 +158,14 @@ try:
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+# Install aiter's speculative-decode call sites into sglang, if one is installed.
+# Idempotent and best-effort; see ops/triton/sglang_spec_decode_install.py. This
+# has to happen at import time because sglang imports aiter before it imports the
+# modules the call sites live in.
+try:
+    from .ops.triton.sglang_spec_decode_install import maybe_install
+
+    maybe_install()
+except Exception:
+    pass

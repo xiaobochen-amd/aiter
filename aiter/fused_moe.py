@@ -61,9 +61,11 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
 BLOCK_SIZE_M = 32
 
 # Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
-# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
+# FlyDSL is preferred: it folds the Opus backend's P0 and P23 kernels into one
+# launch, which measures 8.96us -> 5.00us of sort per MoE call on the deployed
+# TP4/EP4 shape. Set AITER_USE_FLYDSL_MOE_SORTING=0 to fall back to Opus.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "1") == "1"
 # "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
 #   auto (default) / adaptive -> use the adaptive branch. NO shape fallback: the
 #     kernel is codegen'd for a fixed shape set (SHAPES in
@@ -73,6 +75,108 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 #   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
+
+# A checkpoint may ship a MoE layer whose expert weights are dense bf16 while the
+# rest of the model is MXFP4 -- GLM-5.2's MTP/EAGLE draft layer is one. Such a
+# layer takes the QuantType.No branch and lands on CK 2-stage, which streams 4x
+# the weight bytes of the MXFP4 layers for the same GEMM. Decode MoE is purely
+# weight-streaming (measured 5.2-5.6 TB/s against a 5.97 TB/s read roof), so the
+# bytes are the whole cost: at the GLM-5.2 draft shape the bf16 path measures
+# 571 us against 155 us for the same shape with MXFP4 weights.
+#
+# Convert those weights to MXFP4 once, on the first call, and memoise. Set
+# AITER_BF16_MOE_MXFP4=0 to keep the dense bf16 weights.
+_BF16_MOE_MXFP4 = os.environ.get("AITER_BF16_MOE_MXFP4", "1") == "1"
+# Keyed on (id, _version) per pitfalls/06's weight-quant cache rule; the entry
+# pins the source tensors so an id can never be recycled under a live key.
+_bf16_moe_mxfp4_cache: dict = {}
+
+
+def _unshuffle_weight_16x16(w: torch.Tensor) -> torch.Tensor:
+    """Undo ``shuffle_weight(w, layout=(16, 16))`` for a 3-D expert weight.
+
+    ``shuffle_weight`` views ``(E, N, K)`` as ``(E, N/16, 16, K/BK, BK/Kel, Kel)``
+    and permutes it by ``(0, 1, 3, 4, 2, 5)``; this applies the inverse so the
+    quantiser can see row-major values again.
+    """
+    experts, n, k = w.shape
+    kel = 16 // w.element_size()
+    bk = 32  # IK * 2 for layout=(16, 16)
+    return (
+        w.view(experts, n // 16, k // bk, bk // kel, 16, kel)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .view(experts, n, k)
+    )
+
+
+def _quant_moe_weight_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4-quantise one dense bf16 expert weight into the preshuffled layout.
+
+    Mirrors the a4w4 preparation the tuned path expects: per-1x32 e8m0 quant,
+    ``(16, 16)`` weight shuffle and the matching e8m0 scale shuffle.
+    """
+    from aiter.ops.quant import per_1x32_mx_quant_hip
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility import fp4_utils
+
+    if getattr(w, "is_shuffled", False):
+        w = _unshuffle_weight_16x16(w)
+    experts, n, k = w.shape
+    w_qt, w_scale = per_1x32_mx_quant_hip(
+        w.contiguous().view(experts * n, k), quant_dtype=dtypes.fp4x2, shuffle=False
+    )
+    w_qt = shuffle_weight(w_qt.view(experts, n, k // 2), layout=(16, 16))
+    # e8m0_shuffle takes the flat (E*N, K//32) scale, matching the quant output.
+    return w_qt, fp4_utils.e8m0_shuffle(w_scale)
+
+
+def _maybe_mxfp4_bf16_moe_weights(w1, w2, quant_type, scales, biases, activation):
+    """Return MXFP4 ``(w1, w2, w1_scale, w2_scale)`` for a dense bf16 MoE, else None.
+
+    The gate is deliberately narrow: only a dense bf16 expert pair with no
+    scales, no biases and a Silu gate-up geometry qualifies, which in a
+    MXFP4-served model is exactly the odd layer out.
+    """
+    if not _BF16_MOE_MXFP4 or quant_type != QuantType.No:
+        return None
+    if activation != ActivationType.Silu:
+        return None
+    if any(t is not None for t in scales) or any(t is not None for t in biases):
+        return None
+    if w1.dtype != dtypes.bf16 or w2.dtype != dtypes.bf16:
+        return None
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
+        return None
+    # Gate-up fused stage1 only, and both K axes must tile the 32-wide microscale
+    # group and the (16, 16) shuffle.
+    if w1.shape[1] != 2 * w2.shape[2] or w1.shape[2] != w2.shape[1]:
+        return None
+    if w1.shape[2] % 64 or w2.shape[2] % 64 or w1.shape[1] % 32 or w2.shape[1] % 32:
+        return None
+    # Capture bakes whatever runs into the graph; a 5 GB one-shot quantisation
+    # must not land there. Warmup runs eager first, so the cache is already hot
+    # by the time capture starts.
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    key = (id(w1), w1._version, id(w2), w2._version)
+    hit = _bf16_moe_mxfp4_cache.get(key)
+    if hit is None:
+        w1_qt, w1_scale = _quant_moe_weight_mxfp4(w1)
+        w2_qt, w2_scale = _quant_moe_weight_mxfp4(w2)
+        torch.cuda.empty_cache()  # the transient unshuffled bf16 copy is large
+        # (w1, w2) are pinned so their ids stay reserved while the entry lives.
+        hit = (w1, w2, w1_qt, w2_qt, w1_scale, w2_scale)
+        _bf16_moe_mxfp4_cache[key] = hit
+        logger.info(
+            f"[fused_moe] dense bf16 experts {tuple(w1.shape)}/{tuple(w2.shape)} "
+            f"(is_shuffled={getattr(w1, 'is_shuffled', False)}) converted to MXFP4 "
+            "(AITER_BF16_MOE_MXFP4=0 to disable)"
+        )
+    return hit[2:]
+
+
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
@@ -572,6 +676,18 @@ def fused_moe(
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
         )
+    mxfp4 = _maybe_mxfp4_bf16_moe_weights(
+        w1,
+        w2,
+        quant_type,
+        (w1_scale, w2_scale, a1_scale, a2_scale),
+        (bias1, bias2),
+        activation,
+    )
+    if mxfp4 is not None:
+        w1, w2, w1_scale, w2_scale = mxfp4
+        quant_type = QuantType.per_1x32
+
     if not block_size_M:
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
@@ -2176,6 +2292,36 @@ def _flydsl_v2_stage2_wrapper(
     return out
 
 
+# Per token tier for the heuristic mxfp4 FlyDSL MoE fallback:
+# (token_upper_bound, tile_m, stage1 tile_n, stage1 suffix, stage2 suffix).
+# The last entry's bound is None and matches everything above it. Kept as a
+# table rather than an if-chain so a tier can be re-measured on its own.
+_MXFP4_FLYDSL_TOKEN_TIERS = (
+    (2048, 32, 128, "_w2", "_bnt2"),
+    (4096, 64, 128, "_w3_bnt0", ""),
+    # Above 4096 tokens the MoE is compute-bound and the widest M tile wins: the
+    # table used to fall back to tile_m=64 past 16384, which measures 2.6% slower
+    # at 16384 tokens and 1.2% slower at 24576 (three tile_m=128 variants land
+    # within 0.2%, three tile_m=64 variants within 0.7%, the two groups
+    # disjoint). Keeping one open tier also drops two kernel variants from the
+    # set that has to JIT-compile per run.
+    (None, 128, 128, "_w2_bnt0", ""),
+)
+
+
+# a4w4-only geometry for decode-sized calls (token < the first tier bound):
+# (stage1 tile_n, stage1 suffix, stage2 tile_n). See the comments at the use
+# site for why these differ from the generic tier.
+_A4W4_DECODE_GEOMETRY = (64, "_w3_kw2", 64)
+
+
+def _pick_mxfp4_flydsl_tier(token):
+    for bound, tile_m, s1_tn, s1_sfx, s2_sfx in _MXFP4_FLYDSL_TOKEN_TIERS:
+        if bound is None or token < bound:
+            return tile_m, s1_tn, s1_sfx, s2_sfx
+    raise AssertionError("_MXFP4_FLYDSL_TOKEN_TIERS must end with an open tier")
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -2834,15 +2980,7 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 tile_n, stage1 suffix, stage2 suffix).
-        if token < 2048:
-            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 32, 128, "_w2", "_bnt2"
-        elif token < 4096:
-            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 64, 128, "_w3_bnt0", ""
-        elif token < 16384:
-            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 128, 128, "_w2_bnt0", ""
-        else:
-            _tile_m, _s1_tn, _s1_sfx, _s2_sfx = 64, 128, "_w4_bnt0", ""
+        _tile_m, _s1_tn, _s1_sfx, _s2_sfx = _pick_mxfp4_flydsl_tier(token)
         # Decode-sized a4w4 stage1 is a weight-streaming GEMM: one workgroup walks
         # a whole expert slab, so its cost is set by how many K streams it keeps in
         # flight, not by how wide N is. At tile_n=128 all four waves sit on the
@@ -2852,16 +2990,15 @@ def get_2stage_cfgs(
         # workgroup and the workgroup count. Staying at four waves is what matters:
         # tile_n=32/_kw4 ties this, while tile_n=64/_kw4 needs eight and loses.
         _s2_tn = 128
+        # Stage2 streams weights the same way, but its reduction is fixed at
+        # inter_dim, so the K axis has nothing left to give: splitting it
+        # (_kw2/_kw4) measures neutral-to-worse. What it does have is a wide
+        # N (model_dim), and at tile_n=128 the 32-row M tile leaves most CUs
+        # idle at decode sizes. tile_n=64 doubles the workgroup count over
+        # model_dim while each of the four waves still owns a full 16-column
+        # MFMA block, so the added blocks land on otherwise idle CUs.
         if (_a_type, _w_type) == ("fp4", "fp4") and token < 2048:
-            _s1_tn, _s1_sfx = 64, "_w3_kw2"
-            # Stage2 streams weights the same way, but its reduction is fixed at
-            # inter_dim, so the K axis has nothing left to give: splitting it
-            # (_kw2/_kw4) measures neutral-to-worse. What it does have is a wide
-            # N (model_dim), and at tile_n=128 the 32-row M tile leaves most CUs
-            # idle at decode sizes. tile_n=64 doubles the workgroup count over
-            # model_dim while each of the four waves still owns a full 16-column
-            # MFMA block, so the added blocks land on otherwise idle CUs.
-            _s2_tn = 64
+            _s1_tn, _s1_sfx, _s2_tn = _A4W4_DECODE_GEOMETRY
         _base_kn1 = flydsl_kernel_name(
             1, _a_type, _w_type, _out_type, _tile_m, _s1_tn, 256
         )

@@ -183,6 +183,31 @@ def _fill_sentinel_slots(
         buffer_ops.buffer_store(c_zero, sorted_w_rsrc, safe)
 
 
+def _num_valid_ids_rsrc(num_valid_ids, i32_tokens, topk, has_row_inv):
+    """Descriptor for num_valid_ids bounded to the table's real extent.
+
+    The row-inverse entry index is ``token * topk + slot``, and both halves come
+    out of the mesh rather than from the launch geometry, so a mesh cell holding
+    an unexpected count addresses past the end of the table. Bounding the
+    descriptor turns such a store into a hardware discard, which costs nothing,
+    whereas the same check written as a store predicate costs ~2.8%.
+
+    ``max_size=False`` cannot be used for this: these memrefs are dynamically
+    shaped, so the static size probe fails and it silently falls back to the
+    same 4 GiB default as ``max_size=True`` -- large enough to catch the
+    0x7FFFFFFF discard sentinel but not a near miss. Host sizing keys the table
+    on the static capacity, which is what ``i32_tokens`` carries.
+    """
+    if not has_row_inv:
+        return buffer_ops.create_buffer_resource(
+            num_valid_ids, num_records_bytes=ROW_INV_BASE * 4
+        )
+    nbytes = (fx.Int32(ROW_INV_BASE) + i32_tokens * fx.Int32(topk)) * fx.Int32(4)
+    return buffer_ops.create_buffer_resource(
+        num_valid_ids, num_records_bytes=nbytes
+    )
+
+
 def _store_row_inv(row_inv_rsrc, present, assign_idx, sorted_row, weight_bits):
     """Publish sorted_row for one (token, topk slot) assignment, if present.
 
@@ -356,7 +381,7 @@ def _compile_moe_sorting_oneshot(
         sorted_e_rsrc = buffer_ops.create_buffer_resource(
             sorted_expert_ids, max_size=True
         )
-        nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        nvalid_rsrc = _num_valid_ids_rsrc(num_valid_ids, i32_tokens, topk, False)
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
 
         # LDS: capture field pointers ONCE — dominates all child scf.for/scf.if.
@@ -1089,7 +1114,7 @@ def _compile_moe_sorting_multiphase(
         stride = gpu.grid_dim.x * fx.Int32(K2_BLOCK)
         topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
-        nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        nv_rsrc = _num_valid_ids_rsrc(num_valid_ids, i32_tokens, topk, has_row_inv)
         c_zero = fx.Int32(0)
         c_topk = fx.Int32(topk)
         c_one = fx.Int32(1)
@@ -1364,7 +1389,7 @@ def _compile_moe_sorting_multiphase(
             sorted_weights_out, max_size=True
         )
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
-        nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        nvalid_rsrc = _num_valid_ids_rsrc(num_valid_ids, i32_tokens, topk, has_row_inv)
 
         # LDS: cumsum[E+1] for prefix sums + cross-wave scratch
         lds = fx.SharedAllocator().allocate(K4SharedStorage).peek()

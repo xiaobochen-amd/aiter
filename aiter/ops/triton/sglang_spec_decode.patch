@@ -1,0 +1,373 @@
+diff -ruN a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+--- a/python/sglang/srt/arg_groups/speculative_hook.py	2026-09-14 00:34:48.593643973 +0000
++++ b/python/sglang/srt/arg_groups/speculative_hook.py	2026-09-14 00:34:48.581644193 +0000
+@@ -631,8 +631,16 @@
+     # option. Conditions mirror the validation below so the flip never triggers a raise.
+     from sglang.srt.utils import is_hip
+ 
++    # AITER_GREEDY_SPEC_GATE=1 (default) keeps the flip off: rejection
++    # sampling only changes the served distribution when a request asks for
++    # temperature/top_p, and forcing it on makes every draft step materialise a
++    # full-vocab proposal q that a greedy batch never reads. The draft worker
++    # logs a warning if a non-greedy batch ever arrives while the gate is on
++    # (it cannot repair one: the draft graphs are captured once, at startup).
++    greedy_gate = os.environ.get("AITER_GREEDY_SPEC_GATE", "1") == "1"
+     if (
+         is_hip()
++        and not greedy_gate
+         and not server_args.speculative_use_rejection_sampling
+         and server_args.speculative_algorithm in ("EAGLE", "EAGLE3")
+         and server_args.speculative_eagle_topk == 1
+diff -ruN a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+--- a/python/sglang/srt/layers/logits_processor.py	2026-09-14 00:34:48.593643973 +0000
++++ b/python/sglang/srt/layers/logits_processor.py	2026-09-14 00:34:48.577644267 +0000
+@@ -331,6 +331,11 @@
+ 
+         self.input_logprob_processor = InputLogprobProcessor()
+ 
++        # Set by the EAGLE draft worker when the draft picks its token with
++        # aiter's vocab-parallel greedy argmax: one id per row does not need the
++        # shard to become a full row, so the all-gather is skipped entirely.
++        self.aiter_vocab_parallel = False
++
+     def forward(
+         self,
+         input_ids,
+@@ -669,7 +674,7 @@
+             logits.mul_(self.logit_scale)
+ 
+         used_tp_lm_head_all_to_all = False
+-        if self.do_tensor_parallel_all_gather:
++        if self.do_tensor_parallel_all_gather and not self.aiter_vocab_parallel:
+             if self.use_attn_tp_group:
+                 logits = self._gather_attn_tp_logits(logits)
+             elif self._can_use_tp_lm_head_all_to_all(
+diff -ruN a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+--- a/python/sglang/srt/speculative/eagle_utils.py	2026-09-14 00:34:48.594643954 +0000
++++ b/python/sglang/srt/speculative/eagle_utils.py	2026-09-14 00:34:48.587644083 +0000
+@@ -884,13 +884,34 @@
+         use_rejection_sampling = _use_rej
+ 
+         # Apply temperature and get target probs
+-        expanded_temperature = torch.repeat_interleave(
+-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
+-        )  # (bs * num_draft_tokens, 1)
++        from sglang.srt.speculative.spec_utils import fused_verify_probs
+ 
+-        target_probs = F.softmax(
+-            next_token_logits / expanded_temperature, dim=-1
+-        )  # (bs * num_draft_tokens, vocab_size)
++        _fused_probs = fused_verify_probs()
++        if (
++            _fused_probs
++            and next_token_logits.is_cuda
++            and next_token_logits.dim() == 2
++            and next_token_logits.stride(1) == 1
++            and sampling_info.temperatures.numel() == bs
++        ):
++            # (bs * num_draft_tokens, vocab_size); the repeat_interleave of the
++            # temperatures is folded into the kernel's row indexing.
++            from sglang.srt.speculative.spec_utils import _log_fused_once
++
++            _log_fused_once("verify_probs", next_token_logits.shape)
++            target_probs = _fused_probs(
++                next_token_logits,
++                sampling_info.temperatures,
++                verify_input.draft_token_num,
++            )
++        else:
++            expanded_temperature = torch.repeat_interleave(
++                sampling_info.temperatures, verify_input.draft_token_num, dim=0
++            )  # (bs * num_draft_tokens, 1)
++
++            target_probs = F.softmax(
++                next_token_logits / expanded_temperature, dim=-1
++            )  # (bs * num_draft_tokens, vocab_size)
+         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+         if _is_hip:
+             if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py	2026-09-14 00:34:48.594643954 +0000
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py	2026-09-14 00:35:07.878289463 +0000
+@@ -1,5 +1,6 @@
+ import contextlib
+ import logging
++import os
+ import time
+ from dataclasses import replace
+ from typing import List, Optional
+@@ -181,6 +182,7 @@
+ 
+         # Alias for better readability
+         self.draft_runner = self.draft_worker.model_runner
++        self._vp_greedy = None
+         self._init_dsa_index_share_state()
+         # Eager draft-extend seed buffer (graph paths use their own static ones).
+         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
+@@ -233,7 +235,61 @@
+             self.draft_worker.init_attention_backends()
+             self.init_attention_backend()
+ 
++    def _init_vocab_parallel_greedy(self):
++        """Bind the draft's greedy pick to aiter's vocab-parallel argmax.
++
++        Only legal when the proposal is deterministic: rejection sampling reads
++        the full-vocab q, which a shard cannot reconstruct. Must run before
++        graph capture, since it changes what the draft forward captures.
++        """
++        self._vp_greedy = None
++        if (
++            get_spec().speculative_use_rejection_sampling
++            or self.topk != 1
++            or self.hot_token_id is not None
++            or not _is_hip
++            or os.environ.get("AITER_GREEDY_SPEC_GATE", "1") != "1"
++        ):
++            return
++
++        from sglang.srt.layers.logits_processor import LogitsProcessor
++        from sglang.srt.speculative.spec_utils import (
++            greedy_draft_pick,
++            vocab_parallel_argmax_available,
++        )
++
++        # Dropping the all-gather is only legal if aiter can reduce the shard
++        # partials. If that half is missing the pick would argmax this rank's
++        # slice, so keep the gather and let the stock path run.
++        if not vocab_parallel_argmax_available():
++            logger.warning(
++                "AITER_GREEDY_SPEC_GATE is on but aiter's vocab-parallel argmax "
++                "is unavailable; keeping the draft logits all-gather."
++            )
++            return
++
++        vocab_size = self.draft_runner.model_config.vocab_size
++        from sglang.srt.distributed import get_tp_group
++
++        tp_group = get_tp_group()
++        skipped = 0
++        for mod in self.draft_runner.model.modules():
++            if isinstance(mod, LogitsProcessor) and mod.do_tensor_parallel_all_gather:
++                mod.aiter_vocab_parallel = True
++                skipped += 1
++        self._vp_greedy = lambda logits: greedy_draft_pick(
++            logits, vocab_size, tp_group
++        )
++        logger.info(
++            "aiter vocab-parallel greedy draft enabled: vocab=%d tp=%d, "
++            "all-gather skipped on %d draft logits processor(s)",
++            vocab_size,
++            tp_group.world_size,
++            skipped,
++        )
++
+     def init_cuda_graphs(self):
++        self._init_vocab_parallel_greedy()
+         with (
+             self.draft_tp_context(self.draft_runner.tp_group),
+             speculative_moe_backend_context(),
+@@ -675,6 +731,10 @@
+                     )
+                     draft_probs_list.append(probs)
+                     forward_batch.positions.add_(1)
++                elif self._vp_greedy is not None:
++                    topk_index = self._vp_greedy(logits_output.next_token_logits)
++                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
++                    forward_batch.positions.add_(1)
+                 elif self.topk == 1 and not _is_hip:
+                     if _is_cuda:
+                         topk_p, topk_index = draft_topk1_postprocess(
+@@ -830,6 +890,18 @@
+ 
+         # Assemble the next-iter draft spec_info from the extend output.
+         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
++        if self._vp_greedy is not None:
++            topk_index = self._vp_greedy(logits_output.next_token_logits)
++            return EagleDraftInput(
++                topk_p=torch.ones_like(topk_index, dtype=torch.float32),
++                topk_index=topk_index,
++                draft_probs=None,
++                hidden_states=logits_output.hidden_states,
++                bonus_tokens=next_token_ids,
++                num_tokens_per_req=1,
++                num_tokens_for_logprob_per_req=1,
++                dsa_topk_indices=prefill_dsa_topk,
++            )
+         probs = renorm_draft_probs(
+             logits_output.next_token_logits,
+             batch.sampling_info,
+@@ -866,6 +938,15 @@
+     def _draft_extend_for_decode(
+         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+     ):
++        if self._vp_greedy is not None and not batch.sampling_info.is_all_greedy:
++            # The gate traded the full-vocab proposal q away for the payload it
++            # costs, which only holds while every request decodes greedily. The
++            # graphs are captured once, so this cannot be repaired per batch.
++            logger.warning_once(
++                "AITER_GREEDY_SPEC_GATE is on but this batch asks for sampling; "
++                "EAGLE verify is committing greedy tokens. Restart with "
++                "AITER_GREEDY_SPEC_GATE=0 to serve temperature/top_p correctly."
++            )
+         # Batch 2: Draft extend
+         draft_extend_input = EagleDraftExtendInput(
+             hidden_states=batch_result.logits_output.hidden_states,
+@@ -980,6 +1061,10 @@
+                 draft_logits_output.next_token_logits,
+                 batch.sampling_info.temperatures,
+             )
++        elif self._vp_greedy is not None:
++            ret_topk_index = self._vp_greedy(draft_logits_output.next_token_logits)
++            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
++            ret_draft_probs = None
+         elif self.topk == 1 and not _is_hip:
+             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+             # MTP draft selection on FP8 logits.
+diff -ruN a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+--- a/python/sglang/srt/speculative/spec_utils.py	2026-09-14 00:34:48.594643954 +0000
++++ b/python/sglang/srt/speculative/spec_utils.py	2026-09-14 00:35:07.877289482 +0000
+@@ -164,6 +164,126 @@
+     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+ 
+ 
++_FUSED_DRAFT_SAMPLE = None
++
++
++def _fused_draft_sample():
++    """aiter's fused softmax + Gumbel-max draw, or None if unavailable.
++
++    The torch chain below is seven full-vocab passes whose kernels run one
++    program per row -- 8-14 programs on a 256-CU part. aiter.draft_sample does
++    the same work in two column-split passes. Resolved once, before graph
++    capture; AITER_FUSED_DRAFT_SAMPLE=0 restores the torch chain.
++    """
++    global _FUSED_DRAFT_SAMPLE
++    if _FUSED_DRAFT_SAMPLE is None:
++        _FUSED_DRAFT_SAMPLE = False
++        if os.environ.get("AITER_FUSED_DRAFT_SAMPLE", "1") == "1":
++            try:
++                from aiter.ops.triton.draft_sample import draft_sample
++
++                _FUSED_DRAFT_SAMPLE = draft_sample
++            except Exception:
++                logger.warning_once("aiter fused draft sampling unavailable")
++    return _FUSED_DRAFT_SAMPLE
++
++
++_FUSED_VERIFY_PROBS = None
++
++
++def fused_verify_probs():
++    """aiter's fused verify softmax, or None if unavailable.
++
++    The torch form is three full-vocab kernels (repeat_interleave of the
++    temperatures, a divide, and a one-program-per-row softmax) on
++    [bs * num_draft_tokens, vocab]; the aiter op is two column-split passes.
++    Resolved once; AITER_FUSED_VERIFY_PROBS=0 restores the torch chain.
++    """
++    global _FUSED_VERIFY_PROBS
++    if _FUSED_VERIFY_PROBS is None:
++        _FUSED_VERIFY_PROBS = False
++        if os.environ.get("AITER_FUSED_VERIFY_PROBS", "1") == "1":
++            try:
++                from aiter.ops.triton.draft_sample import verify_target_probs
++
++                _FUSED_VERIFY_PROBS = verify_target_probs
++            except Exception:
++                logger.warning_once("aiter fused verify probs unavailable")
++    return _FUSED_VERIFY_PROBS
++
++
++_VOCAB_PARALLEL_ARGMAX = None
++
++
++def _vocab_parallel_argmax():
++    """aiter's sharded greedy argmax pair, or None if unavailable."""
++    global _VOCAB_PARALLEL_ARGMAX
++    if _VOCAB_PARALLEL_ARGMAX is None:
++        _VOCAB_PARALLEL_ARGMAX = False
++        try:
++            from aiter.ops.triton.draft_sample import (
++                shard_argmax_partials,
++                shard_argmax_reduce,
++            )
++
++            _VOCAB_PARALLEL_ARGMAX = (shard_argmax_partials, shard_argmax_reduce)
++        except Exception:
++            logger.warning_once("aiter vocab-parallel greedy argmax unavailable")
++    return _VOCAB_PARALLEL_ARGMAX
++
++
++def vocab_parallel_argmax_available() -> bool:
++    """True when aiter can reduce shard partials into a global argmax.
++
++    The caller has to ask before it disables a logits processor all-gather: with
++    the gather gone and the reduce missing, a greedy pick would argmax this
++    rank's slice and hand back a shard-local id.
++    """
++    return bool(_vocab_parallel_argmax())
++
++
++def greedy_draft_pick(logits, vocab_size, tp_group):
++    """Greedy next draft token from a (possibly vocab-sharded) logits row.
++
++    When the draft's logits processor skipped its all-gather, ``logits`` is only
++    this rank's lm_head shard; the ranks then exchange the per-chunk (max, id)
++    partials -- twelve bytes per (row, chunk) -- instead of two bytes per vocab
++    entry per row. Ties resolve to the lowest id, which is what the gathered
++    row's argmax would return and what ROCm's torch.argmax does not guarantee
++    (sglang #26358).
++    """
++    fns = _vocab_parallel_argmax()
++    if not fns:
++        return torch.argmax(logits, dim=-1, keepdim=True)
++    partials_fn, reduce_fn = fns
++    rows, width = logits.shape
++    tp_size = tp_group.world_size if tp_group is not None else 1
++    sharded = width < vocab_size
++    offset = tp_group.rank_in_group * width if sharded else 0
++    parts, nsplit = partials_fn(logits, offset, vocab_size)
++    if sharded:
++        _log_fused_once(
++            "greedy_draft_pick shard=%d/%d gather=%dB (full row would be %dB)"
++            % (width, vocab_size, parts.numel() * 4 * tp_size, rows * vocab_size * 2),
++            logits.shape,
++        )
++        parts = tp_group.all_gather(parts, dim=0)
++    else:
++        tp_size = 1
++        _log_fused_once("greedy_draft_pick full-row", logits.shape)
++    return reduce_fn(parts, rows, nsplit, tp_size)
++
++
++_FUSED_SEEN = set()
++
++
++def _log_fused_once(tag, shape):
++    """One line per server proving the fused branch was actually entered."""
++    if tag not in _FUSED_SEEN:
++        _FUSED_SEEN.add(tag)
++        logger.info("aiter fused %s active, first shape %s", tag, tuple(shape))
++
++
+ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
+     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+ 
+@@ -171,6 +291,17 @@
+     only if q is exactly the distribution X was drawn from, so callers must hand
+     the returned q (not a recomputed one) to the verify.
+     """
++    fused = _fused_draft_sample()
++    if (
++        fused
++        and next_token_logits.is_cuda
++        and next_token_logits.dim() == 2
++        and next_token_logits.stride(1) == 1
++        and temperatures.numel() == next_token_logits.shape[0]
++        and envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get()
++    ):
++        _log_fused_once("draft_sample", next_token_logits.shape)
++        return fused(next_token_logits, temperatures)
+     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+     topk_p, topk_index = fast_sample(probs, num_samples=1)
+     return probs, topk_p, topk_index

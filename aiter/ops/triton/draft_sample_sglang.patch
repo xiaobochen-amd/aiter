@@ -1,0 +1,26 @@
+Superseded: see sglang_spec_decode.patch + sglang_spec_decode_install.py
+========================================================================
+
+This file used to carry the sglang call sites for aiter.ops.triton.draft_sample
+as a hand-applied diff. They now live in ``sglang_spec_decode.patch`` and are
+installed idempotently by ``sglang_spec_decode_install.maybe_install()``, which
+``aiter/__init__.py`` calls at import time.
+
+Ops in ``aiter.ops.triton.draft_sample`` used by those call sites:
+
+  draft_sample(logits, temperatures)            -> (q, q(X), X)
+  verify_target_probs(logits, temperatures, n)  -> softmax(logits / repeat(T, n))
+  shard_argmax_partials / shard_argmax_reduce   -> vocab-parallel greedy pick
+  greedy_argmax(logits)                         -> single-rank lowest-id argmax
+
+Each site logs one line on first use ("aiter fused <tag> active, first shape
+...") so a deployment can confirm the branch was actually taken.
+
+One correction to the claim this file used to make. "Both sites are
+import-guarded, so reverting aiter silently restores the torch chain" is *not*
+true of the vocab-parallel greedy pick: the draft's logits processor has its
+all-gather disabled before cuda-graph capture, so losing the aiter half leaves
+the gather off and the pick reducing this rank's slice alone -- a shard-local
+id, on every rank, with no error. ``_init_vocab_parallel_greedy`` therefore asks
+``spec_utils.vocab_parallel_argmax_available()`` first and keeps the gather when
+the answer is no.
