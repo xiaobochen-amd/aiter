@@ -22,6 +22,26 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 )
 
 
+@triton.jit
+def _reciprocal(x):
+    """1 / x to within about half an ulp, for a strictly positive x.
+
+    The backend expands `1.0 / x` into the IEEE sequence -- two v_div_scale, a
+    v_rcp, three refinement FMAs, v_div_fmas and v_div_fixup -- and neither
+    tl.fdiv(..., ieee_rounding=False) nor the fast-math flags relax it on
+    gfx950. v_rcp_f32 carries at most one ulp and the Newton step halves that.
+    """
+    r = tl.inline_asm_elementwise(
+        "v_rcp_f32_e32 $0, $1",
+        "=v,v",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return r * (2.0 - x * r)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -162,6 +182,9 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
+    # Load-quantise-dot per group, and it has to stay that way: hoisting the
+    # gathers above the dot chain makes Triton emit the scale's LDS write
+    # without the matching fence, so one group's write races the previous read.
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             a = tl.load(a_ptrs)
@@ -170,10 +193,13 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
-        a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
-        a_scale_recip = 1.0 / a_scale
-        a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+        # Widen A once and feed both the group amax and the rescale from the
+        # f32 copy; reading `a` twice makes the backend widen it twice. The
+        # clamp is dead by construction (|a / a_scale| <= DTYPE_MAX).
+        af = a.to(tl.float32)
+        m = tl.maximum(tl.max(tl.abs(af), axis=-1), 1e-10)[:, None]
+        a_scale = m * one_over_DTYPE_MAX
+        a = (af * _reciprocal(a_scale)).to(b_ptr.dtype.element_ty)
 
         accumulator += tl.dot(a, b) * a_scale
 
@@ -207,15 +233,26 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+# Absorbed-MLA decode runs this kernel at M = 6 * concurrency, so the rows that
+# matter sit just under the standard 64 bound; the extra M_LEQ_48 entry splits
+# them. Tables without one fall through to M_LEQ_64 exactly as before.
+_M_BOUNDS = (1, 4, 8, 16, 32, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+
 def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
-
+    # B is a factor of the launch width, so the tile that fills the CU array
+    # depends on it. Pass it through so a B-specialized table is picked when one
+    # exists; callers that omit B keep the (N, K)-keyed behaviour.
     return get_gemm_config(
         "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
         M,
         N,
         K,
+        bounds=_M_BOUNDS,
+        B=B,
     )
