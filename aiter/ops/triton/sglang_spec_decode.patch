@@ -1,38 +1,6 @@
-diff -ruN a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
---- a/python/sglang/srt/arg_groups/speculative_hook.py	2026-09-14 00:34:48.593643973 +0000
-+++ b/python/sglang/srt/arg_groups/speculative_hook.py	2026-09-14 00:34:48.581644193 +0000
-@@ -631,8 +631,16 @@
-     # option. Conditions mirror the validation below so the flip never triggers a raise.
-     from sglang.srt.utils import is_hip
- 
-+    # The gate defaults OFF, i.e. rejection sampling is left enabled.
-+    #
-+    # It was written to skip the full-vocab proposal q that a greedy batch never
-+    # reads. That saving is real, but it is not free: the comment above this
-+    # block says why -- ROCm has no sampling-verify kernel, so with rejection
-+    # sampling disabled EAGLE verify falls back to argmax. On a batch that asks
-+    # for temperature/top_p that path emits token ids outside the vocabulary,
-+    # which `_check_vocab_boundary_finish` catches and reports, confusingly, as
-+    # `FINISH_MATCHED_STR(matched="NaN happened")`.
-+    #
-+    # Measured on GLM-5.2 TP4/EP4 at c8, 320 requests through bench_serving:
-+    # gate on -> 33 s wall, ~32 tokens per request, six of eight concurrent
-+    # requests killed; gate off -> 291 s wall, ~1086 tokens per request, clean.
-+    # The failure is probabilistic per request, so a short probe reads clean
-+    # often enough to mislead a bisection -- use a full bench load to test it.
-+    #
-+    # Set AITER_GREEDY_SPEC_GATE=1 to get the old behaviour back, but only for
-+    # a deployment that can guarantee every request decodes greedily.
-+    greedy_gate = os.environ.get("AITER_GREEDY_SPEC_GATE", "0") == "1"
-     if (
-         is_hip()
-+        and not greedy_gate
-         and not server_args.speculative_use_rejection_sampling
-         and server_args.speculative_algorithm in ("EAGLE", "EAGLE3")
-         and server_args.speculative_eagle_topk == 1
 diff -ruN a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
---- a/python/sglang/srt/layers/logits_processor.py	2026-09-14 00:34:48.593643973 +0000
-+++ b/python/sglang/srt/layers/logits_processor.py	2026-09-14 00:34:48.577644267 +0000
+--- a/python/sglang/srt/layers/logits_processor.py	2026-09-05 18:47:08.000000000 +0000
++++ b/python/sglang/srt/layers/logits_processor.py	2026-09-15 09:35:25.000000000 +0000
 @@ -331,6 +331,11 @@
  
          self.input_logprob_processor = InputLogprobProcessor()
@@ -55,9 +23,9 @@ diff -ruN a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/lay
                  logits = self._gather_attn_tp_logits(logits)
              elif self._can_use_tp_lm_head_all_to_all(
 diff -ruN a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
---- a/python/sglang/srt/speculative/eagle_utils.py	2026-09-14 00:34:48.594643954 +0000
-+++ b/python/sglang/srt/speculative/eagle_utils.py	2026-09-14 00:34:48.587644083 +0000
-@@ -884,13 +884,34 @@
+--- a/python/sglang/srt/speculative/eagle_utils.py	2026-09-05 18:47:08.000000000 +0000
++++ b/python/sglang/srt/speculative/eagle_utils.py	2026-09-15 09:35:25.000000000 +0000
+@@ -884,13 +884,31 @@
          use_rejection_sampling = _use_rej
  
          # Apply temperature and get target probs
@@ -79,9 +47,6 @@ diff -ruN a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/spe
 +        ):
 +            # (bs * num_draft_tokens, vocab_size); the repeat_interleave of the
 +            # temperatures is folded into the kernel's row indexing.
-+            from sglang.srt.speculative.spec_utils import _log_fused_once
-+
-+            _log_fused_once("verify_probs", next_token_logits.shape)
 +            target_probs = _fused_probs(
 +                next_token_logits,
 +                sampling_info.temperatures,
@@ -99,8 +64,8 @@ diff -ruN a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/spe
          if _is_hip:
              if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
 diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
---- a/python/sglang/srt/speculative/eagle_worker_v2.py	2026-09-14 00:34:48.594643954 +0000
-+++ b/python/sglang/srt/speculative/eagle_worker_v2.py	2026-09-14 00:35:07.878289463 +0000
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py	2026-09-05 18:47:08.000000000 +0000
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py	2026-09-15 09:35:25.000000000 +0000
 @@ -1,5 +1,6 @@
  import contextlib
  import logging
@@ -133,7 +98,7 @@ diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt
 +            or self.topk != 1
 +            or self.hot_token_id is not None
 +            or not _is_hip
-+            or os.environ.get("AITER_GREEDY_SPEC_GATE", "0") != "1"
++            or os.environ.get("AITER_VP_GREEDY_DRAFT", "0") != "1"
 +        ):
 +            return
 +
@@ -148,7 +113,7 @@ diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt
 +        # slice, so keep the gather and let the stock path run.
 +        if not vocab_parallel_argmax_available():
 +            logger.warning(
-+                "AITER_GREEDY_SPEC_GATE is on but aiter's vocab-parallel argmax "
++                "AITER_VP_GREEDY_DRAFT is on but aiter's vocab-parallel argmax "
 +                "is unavailable; keeping the draft logits all-gather."
 +            )
 +            return
@@ -213,13 +178,13 @@ diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt
          self, batch: ScheduleBatch, batch_result: GenerationBatchResult
      ):
 +        if self._vp_greedy is not None and not batch.sampling_info.is_all_greedy:
-+            # The gate traded the full-vocab proposal q away for the payload it
-+            # costs, which only holds while every request decodes greedily. The
-+            # graphs are captured once, so this cannot be repaired per batch.
++            # The vocab-parallel draft pick trades the full-vocab proposal q
++            # for the payload it costs, which only holds while every request
++            # decodes greedily; the graphs are captured once, so not per batch.
 +            logger.warning_once(
-+                "AITER_GREEDY_SPEC_GATE is on but this batch asks for sampling; "
-+                "EAGLE verify is committing greedy tokens. Restart with "
-+                "AITER_GREEDY_SPEC_GATE=0 to serve temperature/top_p correctly."
++                "AITER_VP_GREEDY_DRAFT is on but this batch asks for sampling; "
++                "the draft is proposing greedily. Restart with "
++                "AITER_VP_GREEDY_DRAFT=0 to serve temperature/top_p correctly."
 +            )
          # Batch 2: Draft extend
          draft_extend_input = EagleDraftExtendInput(
@@ -236,9 +201,9 @@ diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt
              # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
              # MTP draft selection on FP8 logits.
 diff -ruN a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
---- a/python/sglang/srt/speculative/spec_utils.py	2026-09-14 00:34:48.594643954 +0000
-+++ b/python/sglang/srt/speculative/spec_utils.py	2026-09-14 00:35:07.877289482 +0000
-@@ -164,6 +164,126 @@
+--- a/python/sglang/srt/speculative/spec_utils.py	2026-09-05 18:47:08.000000000 +0000
++++ b/python/sglang/srt/speculative/spec_utils.py	2026-09-15 09:35:25.000000000 +0000
+@@ -164,6 +164,110 @@
      return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
  
  
@@ -340,32 +305,16 @@ diff -ruN a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/spec
 +    offset = tp_group.rank_in_group * width if sharded else 0
 +    parts, nsplit = partials_fn(logits, offset, vocab_size)
 +    if sharded:
-+        _log_fused_once(
-+            "greedy_draft_pick shard=%d/%d gather=%dB (full row would be %dB)"
-+            % (width, vocab_size, parts.numel() * 4 * tp_size, rows * vocab_size * 2),
-+            logits.shape,
-+        )
 +        parts = tp_group.all_gather(parts, dim=0)
 +    else:
 +        tp_size = 1
-+        _log_fused_once("greedy_draft_pick full-row", logits.shape)
 +    return reduce_fn(parts, rows, nsplit, tp_size)
-+
-+
-+_FUSED_SEEN = set()
-+
-+
-+def _log_fused_once(tag, shape):
-+    """One line per server proving the fused branch was actually entered."""
-+    if tag not in _FUSED_SEEN:
-+        _FUSED_SEEN.add(tag)
-+        logger.info("aiter fused %s active, first shape %s", tag, tuple(shape))
 +
 +
  def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
      """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
  
-@@ -171,6 +291,17 @@
+@@ -171,6 +275,16 @@
      only if q is exactly the distribution X was drawn from, so callers must hand
      the returned q (not a recomputed one) to the verify.
      """
@@ -378,7 +327,6 @@ diff -ruN a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/spec
 +        and temperatures.numel() == next_token_logits.shape[0]
 +        and envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get()
 +    ):
-+        _log_fused_once("draft_sample", next_token_logits.shape)
 +        return fused(next_token_logits, temperatures)
      probs = torch.softmax(next_token_logits / temperatures, dim=-1)
      topk_p, topk_index = fast_sample(probs, num_samples=1)

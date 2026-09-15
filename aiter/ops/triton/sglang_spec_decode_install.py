@@ -19,7 +19,7 @@ aiter ops stay unused.
 
 Env switches (read by the installed call sites, not by this module):
 
-  AITER_GREEDY_SPEC_GATE=0    restore sglang's forced rejection sampling
+  AITER_VP_GREEDY_DRAFT=1     skip the draft logits all-gather (greedy-only)
   AITER_FUSED_DRAFT_SAMPLE=0  restore the torch draft proposal chain
   AITER_FUSED_VERIFY_PROBS=0  restore the torch verify softmax
 
@@ -48,7 +48,6 @@ _PROBE = "python/sglang/srt/speculative/spec_utils.py"
 # silent -- the server starts and simply never enters the aiter path.
 _MARKERS = {
     "python/sglang/srt/layers/logits_processor.py": "aiter_vocab_parallel",
-    "python/sglang/srt/arg_groups/speculative_hook.py": "AITER_GREEDY_SPEC_GATE",
     "python/sglang/srt/speculative/spec_utils.py": "greedy_draft_pick",
     "python/sglang/srt/speculative/eagle_utils.py": "fused_verify_probs",
     "python/sglang/srt/speculative/eagle_worker_v2.py": "_init_vocab_parallel_greedy",
