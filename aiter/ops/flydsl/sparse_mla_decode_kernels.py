@@ -208,10 +208,69 @@ def _pick_xpf_prime(inner_iter: int, producer_ctas: int, num_cu: int) -> int:
     wall time. Groupings below 4 own too few tiles to prefetch at all: issuing
     two of an inner_iter=2 CTA's tiles up front is the whole CTA at once, which
     is the `_XPF_DEPTH=2` schedule measured at +1.6% on seq 14.
+
+    A grouping that lifts its index column has no chase left to fold, so the
+    second tile is pure cost there and the table above inverts: against a
+    duplicate shipped arm it reads -6.2% at seven tiles and -5.0% at eight to
+    drop back to one, bit identical, while the groupings that still read their
+    rows inside the gather keep wanting two (+1.9 .. +2.4% at eleven tiles).
+    The chase was throttling the burst: it is now the prologue's only
+    outstanding traffic, and doubling it doubles what the first body's LDS
+    writes wait on.
     """
-    if inner_iter < 4:
+    if inner_iter < 4 or _pick_index_prefetch(inner_iter):
         return 1
     return 2 if producer_ctas <= 2 * num_cu else 1
+
+
+# Groupings whose index rows are all fetched before the Q publish, keyed by
+# tiles per CTA. Everything else keeps a tile's rows inside its own gather.
+#
+# The depth is all or nothing. A bounded rolling depth issues the same loads a
+# fixed number of tiles ahead and reads flat to worse on every grouping tried --
+# depths 2 and 4 measure +2.1% and +2.8% at seven tiles and +0.8% and +1.9% at
+# eleven -- because the body's own KV wait already retires them. Lifting the
+# whole column is -0.4 .. -1.0% at seven tiles (three runs, each against a
+# duplicate shipped arm) and +1.8 .. +5.6% at eleven, where the column costs 33
+# more live registers than the body has slack for. It only pays alongside the
+# one-tile prologue prime it forces -- see `_pick_xpf_prime`.
+_INDEX_PREFETCH = {2: 2, 7: 7, 8: 8}
+
+
+def _pick_index_prefetch(inner_iter: int) -> int:
+    """Return how many tiles of index rows the producer keeps in flight.
+
+    Zero -- the default -- fetches a tile's rows inside its own gather, so the
+    steady-state body pays an index round trip before it can issue the nine
+    `buffer_load_dwordx4` that row numbers address. Lifting the whole CTA's
+    rows into the prologue removes that, at three live registers per tile, and
+    the two effects do not trade off monotonically. Measured against the
+    shipped path on the full call (same process, ABBA, min of 6-8, against a
+    duplicate shipped arm pricing in-block position bias, all bit identical):
+
+        seq  tiles  n_groups  CTAs/CU   delta
+         14      2        16     0.88   -0.75%
+         24      4         8     0.75   +1.24%
+         36      5         7     0.98   +2.40%
+         42      6         6     0.98   +1.64%
+         48      7         5     0.94    0.00%
+         60      8         4     0.94   -0.81%
+         72     11         3     0.84    0.00%
+         84     11         3     0.98   +6.31%
+         96      4         8     3.00   -0.30%
+
+    So take the depth from a table of the groupings that measured a win and
+    leave the rest alone. A depth between the two ends is not a third option:
+    rolling four tiles ahead measures +0.8% at seven tiles per CTA and +0.46%
+    at eleven, in both cases worse than either lifting all of them or none.
+
+    Nor are the losses register pressure. At the depth this lifts to, eleven
+    tiles is 200 VGPRs against 172 and eight tiles is 166 against 170 -- no
+    spill anywhere, and all of it inside the 256 that would keep two waves on
+    a SIMD -- while the eleven-tile streams differ by ten `v_pk_mul_f32` the
+    allocator could no longer pair.
+    """
+    return _INDEX_PREFETCH.get(inner_iter, 0)
 
 
 def _fuse_combine(seq: int, n_groups: int, num_cu: int) -> bool:
@@ -422,6 +481,7 @@ def _launch_partial(
         split_major=split_major,
         use_buffer=use_buffer,
         xpf_prime=_pick_xpf_prime(inner_iter, seq * n_groups, num_cu),
+        ixpf_depth=_pick_index_prefetch(inner_iter),
         n_groups=n_groups,
         fuse_combine=fuse_combine,
     )

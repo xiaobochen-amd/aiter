@@ -82,6 +82,11 @@ def _fused_combine_plan(n_groups: int) -> list[tuple[int, int, int]]:
     rounds of `dv=2` beat two of `dv=1` by 3.7% at twelve waves, and a
     mixed-width schedule that saves a round costs 0.96%.
 
+    Staging the rounds' reads across the round loop changes what a round costs,
+    so this width was rescanned with that in place rather than inherited: at
+    seq 84, neither halving nor doubling it separated from a duplicate shipped
+    arm, so the choice above stands on its own measurements.
+
     Which head a wave takes within a round is not a lever. Slots are packed
     head-major, so the `dv` waves sharing a head each read that head's LSE
     column and a wave's head changes every round; cutting instead by DV slice,
@@ -264,6 +269,7 @@ def compile_sparse_mla_partial(
     split_major: bool = False,
     use_buffer: bool = True,
     xpf_prime: int = 1,
+    ixpf_depth: int = 0,
     n_groups: int | None = None,
     fuse_combine: bool = False,
 ):
@@ -276,6 +282,10 @@ def compile_sparse_mla_partial(
     `ng % n_groups` real tiles. The short groups run their final tile with the
     index row forced negative, which the existing padding mask already turns
     into an all `-inf` score -- an exactly neutral tile, no separate epilogue.
+
+    `ixpf_depth` is how many tiles of index rows are in flight at once. Zero
+    fetches a tile's rows inside its own gather, which is what the KV stage's
+    depth used to imply; see `issue_index` and `_pick_index_prefetch`.
 
     `fuse_combine` folds the reducer in behind a grid-wide barrier instead of
     launching it as a second kernel. Only legal when every CTA is resident --
@@ -330,11 +340,12 @@ def compile_sparse_mla_partial(
             + ("_split_major" if split_major else "")
             + ("_buf" if use_buffer else "")
             + (f"_prime{xpf_prime}" if xpf_prime > _XPF_DEPTH else "")
+            + (f"_ixpf{ixpf_depth}" if ixpf_depth else "")
             + (f"_ng{n_groups}" if ragged else "")
             + (
                 "_coop_"
                 + "_".join(f"{dv}x{slots}" for dv, slots, _ in combine_plan)
-                + "_dev"
+                + "_dev_staged"
                 if fuse_combine
                 else ""
             )
@@ -470,8 +481,8 @@ def compile_sparse_mla_partial(
                 fx.Vector.filled(4, 0.0, fx.Float32) for _ in fx.range_constexpr(8)
             ]
 
-            def issue_gather(k_i):
-                """Issue one tile's gather; nothing here touches LDS."""
+            def tile_of(k_i):
+                """The 64-key tile this CTA's round `k_i` owns."""
                 # Preserve the direct reducer's XOR tree: for ng=32 and
                 # inner_iter=2, merge (0,16), (1,17), ... rather than adjacent
                 # rows.  This removes one real partial row per pair while
@@ -484,23 +495,50 @@ def compile_sparse_mla_partial(
                 # alpha comes out one, so the tile leaves the accumulator, the
                 # running maximum and the LSE bit for bit unchanged.
                 if fx.const_expr(ragged and k_i + 1 == inner_iter):
-                    in_range = tile < fx.Int32(ng)
+                    return tile, tile < fx.Int32(ng)
+                return tile, None
+
+            def issue_index(k_i):
+                """Put one tile's three index rows on the wire.
+
+                Split from the gather because the two stages are priced on
+                different axes: a KV stage in flight is 36 live registers,
+                which is what `_XPF_DEPTH` is about, while an index stage is
+                three dwords. Nothing here consumes the loads -- the clamp and
+                the padding mask live in `issue_gather` -- so the wait for them
+                sinks to the gather whose addresses they are.
+
+                Left joined, the body issues these three and then drains them to
+                `vmcnt(0)` before the nine `buffer_load_dwordx4` they address
+                can issue, with eight `ds_write_b128` and six MFMA to cover the
+                round trip. Lifted, the body's deepest wait is `vmcnt(1)` -- the
+                KV arrival its LDS writes have to wait for regardless.
+                """
+                tile, in_range = tile_of(k_i)
+                if fx.const_expr(in_range is not None):
                     tile = in_range.select(tile, split)
                 index_base = fx.Int64(tok) * (ng * BLOCK_I) + fx.Int64(
                     tile * fx.Int32(BLOCK_I)
                 )
+                return [
+                    fx.Int32(fx.ptr_load(index_ptr + index_base + fx.Int64(s)))
+                    for s in (slot, wide_slot, wide_slot + fx.Int32(16))
+                ]
 
-                def gather_row(gather_slot):
-                    raw = fx.Int32(
-                        fx.ptr_load(index_ptr + index_base + fx.Int64(gather_slot))
-                    )
+            def issue_gather(k_i):
+                """Issue one tile's KV gather; nothing here touches LDS."""
+                row, raw_low, raw_high = (
+                    rows_held[k_i] if ixpf_depth else issue_index(k_i)
+                )
+                _, in_range = tile_of(k_i)
+                if fx.const_expr(in_range is not None):
+                    row = in_range.select(row, fx.Int32(-1))
+
+                def gather_row(raw):
                     return (raw >= fx.Int32(0)).select(raw, fx.Int32(0))
 
-                row = fx.Int32(fx.ptr_load(index_ptr + index_base + fx.Int64(slot)))
-                if fx.const_expr(ragged and k_i + 1 == inner_iter):
-                    row = in_range.select(row, fx.Int32(-1))
-                low_row = gather_row(wide_slot)
-                high_row = gather_row(wide_slot + fx.Int32(16))
+                low_row = gather_row(raw_low)
+                high_row = gather_row(raw_high)
                 low = [
                     kvload16(low_row, wide_dword + fx.Int32(cc * 32))
                     for cc in fx.range_constexpr(4)
@@ -554,12 +592,12 @@ def compile_sparse_mla_partial(
             # The prologue may run deeper than the steady state: the first two
             # tiles have nothing to hide behind, so issuing both before the Q
             # publish folds their two serial index->KV chases into one burst.
-            pipeline = [
-                issue_gather(k)
-                for k in fx.range_constexpr(
-                    min(max(xpf_prime, _XPF_DEPTH), inner_iter)
-                )
-            ]
+            kv_prime = min(max(xpf_prime, _XPF_DEPTH), inner_iter)
+            index_ahead = (
+                min(max(ixpf_depth, kv_prime), inner_iter) if ixpf_depth else 0
+            )
+            rows_held = [issue_index(k) for k in fx.range_constexpr(index_ahead)]
+            pipeline = [issue_gather(k) for k in fx.range_constexpr(kv_prime)]
             for q_data, q_dst in q_held:
                 fx.ptr_store(q_data.bitcast(fx.Uint8), q_dst)
             # 576 = 2 x 256 + 64, so one wave publishes the remainder. Its load
@@ -603,6 +641,15 @@ def compile_sparse_mla_partial(
             )
 
             for k_i in fx.range_constexpr(inner_iter):
+                # Keep the index stage `index_ahead` tiles in front of the
+                # gather it feeds. Issued at the top of the body, so the rows
+                # a later body's gather needs have already retired behind the
+                # KV wait this body's LDS writes do anyway.
+                if fx.const_expr(
+                    index_ahead
+                    and len(rows_held) < min(inner_iter, k_i + 1 + index_ahead)
+                ):
+                    rows_held.append(issue_index(len(rows_held)))
                 row, low, high, rope = pipeline[k_i]
                 lds.ilds[slot] = row
                 for cc in fx.range_constexpr(4):
@@ -975,9 +1022,9 @@ def compile_sparse_mla_partial(
                         final_buf, tok, rhead, out_lane, acc, vals, fx.BFloat16
                     )
 
-                for dv, slots, head_base in combine_plan:
+                def emit_round(slots, reads):
                     if fx.const_expr(slots == combine_units):
-                        round_combine(round_reads(dv, slots, head_base))
+                        round_combine(reads)
                     else:
                         with _if_then(
                             scf.IfOp(
@@ -988,7 +1035,21 @@ def compile_sparse_mla_partial(
                                 )
                             )
                         ):
-                            round_combine(round_reads(dv, slots, head_base))
+                            round_combine(reads)
+
+                # Every round's column goes on the wire before the first one is
+                # consumed. `round_reads` already lifts its loads out of a short
+                # round's guard for this reason; carrying it across rounds is
+                # what keeps round r+1's partials from queueing behind round r's
+                # store, which they otherwise do -- one in-order vmcnt covers
+                # both. Worth 3.2% of the seq 84 call, bit identical, and a
+                # compile-time identity for the single-round plans.
+                staged = [
+                    (slots, round_reads(dv, slots, head_base))
+                    for dv, slots, head_base in combine_plan
+                ]
+                for slots, reads in staged:
+                    emit_round(slots, reads)
 
     @flyc.jit
     def launch(
