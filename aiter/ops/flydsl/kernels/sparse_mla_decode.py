@@ -270,6 +270,7 @@ def compile_sparse_mla_partial(
     use_buffer: bool = True,
     xpf_prime: int = 1,
     ixpf_depth: int = 0,
+    ixpf_rows_only: bool = False,
     n_groups: int | None = None,
     fuse_combine: bool = False,
 ):
@@ -341,6 +342,7 @@ def compile_sparse_mla_partial(
             + ("_buf" if use_buffer else "")
             + (f"_prime{xpf_prime}" if xpf_prime > _XPF_DEPTH else "")
             + (f"_ixpf{ixpf_depth}" if ixpf_depth else "")
+            + ("_ixro" if ixpf_depth and ixpf_rows_only else "")
             + (f"_ng{n_groups}" if ragged else "")
             + (
                 "_coop_"
@@ -498,7 +500,7 @@ def compile_sparse_mla_partial(
                     return tile, tile < fx.Int32(ng)
                 return tile, None
 
-            def issue_index(k_i):
+            def issue_index(k_i, fields="all"):
                 """Put one tile's three index rows on the wire.
 
                 Split from the gather because the two stages are priced on
@@ -520,16 +522,31 @@ def compile_sparse_mla_partial(
                 index_base = fx.Int64(tok) * (ng * BLOCK_I) + fx.Int64(
                     tile * fx.Int32(BLOCK_I)
                 )
+                wide = (wide_slot, wide_slot + fx.Int32(16))
+                # `fields` picks which of the three rows this call puts on the
+                # wire. "wide" is the pair that addresses eight of the nine
+                # gather loads; "narrow" is the one the rope tail and the LDS
+                # write need. Splitting them lets the prologue lift only the
+                # pair, at two registers a tile instead of three.
+                sl = {
+                    "all": (slot,) + wide,
+                    "wide": wide,
+                    "narrow": (slot,),
+                }[fields]
                 return [
-                    fx.Int32(fx.ptr_load(index_ptr + index_base + fx.Int64(s)))
-                    for s in (slot, wide_slot, wide_slot + fx.Int32(16))
+                    fx.Int32(fx.ptr_load(index_ptr + index_base + fx.Int64(x)))
+                    for x in sl
                 ]
 
             def issue_gather(k_i):
                 """Issue one tile's KV gather; nothing here touches LDS."""
-                row, raw_low, raw_high = (
-                    rows_held[k_i] if ixpf_depth else issue_index(k_i)
-                )
+                if fx.const_expr(ixpf_depth and ixpf_rows_only):
+                    raw_low, raw_high = rows_held[k_i]
+                    (row,) = issue_index(k_i, "narrow")
+                elif fx.const_expr(ixpf_depth):
+                    row, raw_low, raw_high = rows_held[k_i]
+                else:
+                    row, raw_low, raw_high = issue_index(k_i)
                 _, in_range = tile_of(k_i)
                 if fx.const_expr(in_range is not None):
                     row = in_range.select(row, fx.Int32(-1))
@@ -596,7 +613,10 @@ def compile_sparse_mla_partial(
             index_ahead = (
                 min(max(ixpf_depth, kv_prime), inner_iter) if ixpf_depth else 0
             )
-            rows_held = [issue_index(k) for k in fx.range_constexpr(index_ahead)]
+            _ixf = "wide" if ixpf_rows_only else "all"
+            rows_held = [
+                issue_index(k, _ixf) for k in fx.range_constexpr(index_ahead)
+            ]
             pipeline = [issue_gather(k) for k in fx.range_constexpr(kv_prime)]
             for q_data, q_dst in q_held:
                 fx.ptr_store(q_data.bitcast(fx.Uint8), q_dst)
@@ -605,7 +625,9 @@ def compile_sparse_mla_partial(
             # issuing it with the other two only saves a wait the CTA has to do
             # a few instructions later anyway, and the out-of-range chunks the
             # other three waves would then have to clamp cost more than that
-            # (measured +0.0 to +0.4% on the producer at seq 8, 48, 60 and 84).
+            # (measured +0.0 to +0.4% on the producer at seq 8, 48, 60 and 84,
+            # and +1.5 to +2.2% again at seq 48 and 60 once the index column
+            # moved to the prologue and left the burst that much tighter).
             q_tail_chunk = tid + fx.Int32(2 * PARTIAL_THREADS)
             with _if_then(
                 scf.IfOp(
@@ -649,7 +671,7 @@ def compile_sparse_mla_partial(
                     index_ahead
                     and len(rows_held) < min(inner_iter, k_i + 1 + index_ahead)
                 ):
-                    rows_held.append(issue_index(len(rows_held)))
+                    rows_held.append(issue_index(len(rows_held), _ixf))
                 row, low, high, rope = pipeline[k_i]
                 lds.ilds[slot] = row
                 for cc in fx.range_constexpr(4):
@@ -769,8 +791,12 @@ def compile_sparse_mla_partial(
                     fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.Uint8),
                     lds.plds.ptr + lane * fx.Int32(H) + wave * fx.Int32(4),
                 )
-                prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(16), fx.Int32(64))
-                prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                prob_sum = prob_sum + prob_sum.shuffle_xor(
+                    fx.Int32(16), fx.Int32(64)
+                )
+                prob_sum = prob_sum + prob_sum.shuffle_xor(
+                    fx.Int32(32), fx.Int32(64)
+                )
                 with _if_then(
                     scf.IfOp(
                         arith.cmpi(

@@ -161,9 +161,18 @@ def _decode_partial_groups(seq: int, ng_total: int, num_cu: int) -> int:
     converts padding to real work is only 0.18 us, which is exactly the 6.5%
     the added rows put on the gather's 2.6 us of exposed DRAM. So the wall is
     the busiest CTA's real tiles plus footprint, and the slack in a 240/256
-    grid absorbs the rest. A cross-token schedule that packed all 1536 tiles
-    into 256 CTAs of six slots would land near 14.75 us against 15.28 -- worth
-    3.5% of the producer, not the 8-14% a per-CTA slot count suggests.
+    grid absorbs the rest.
+
+    Widening that sweep to five slots separates the two costs. At `ng_total`
+    25 / 30 / 32 the same grid runs 5 / 6 / 7 slots over 1200 / 1440 / 1536
+    real tiles and measures 12.49 / 13.88 / 14.47 us, which resolves to 5.56 us
+    a call, 63 ns a slot and 5.5 ns a real tile: the wall tracks the grid's
+    total real tiles rather than the busiest CTA's slot count, and a padding
+    slot is worth 63 ns, not a tile. A cross-token schedule that packed all
+    1536 tiles into 256 CTAs of six slots therefore only drops the three
+    padding slots -- 14.41 us against 14.47, or 0.4% -- and not the 3.5% a
+    critical-path reading of the rows above suggests, which does not repay the
+    second Q block and second partial record such a CTA has to carry.
 
     When no count fits the array once inside `_DECODE_MAX_TILES` -- which needs
     `seq` past eight times that -- keep the power-of-two grouping.
@@ -234,8 +243,30 @@ def _pick_xpf_prime(inner_iter: int, producer_ctas: int, num_cu: int) -> int:
 # duplicate shipped arm) and +1.8 .. +5.6% at eleven, where the column costs 33
 # more live registers than the body has slack for. It only pays alongside the
 # one-tile prologue prime it forces -- see `_pick_xpf_prime`.
-_INDEX_PREFETCH = {2: 2, 7: 7, 8: 8}
+_INDEX_PREFETCH = {2: 2, 7: 7, 8: 8, 11: 11}
 
+# Which of those entries lift only the wide pair rather than all three rows.
+# Eleven tiles is the one shape where the full column loses (+6.31% at seq 84,
+# 0.00% at seq 72) and the note above says the cost is ten `v_pk_mul_f32` the
+# allocator stopped pairing, not spill. Two registers a tile instead of three
+# gives the allocator back eleven registers while still taking the index round
+# trip off the eight loads that address the KV halves.
+_INDEX_PREFETCH_ROWS_ONLY = {11}
+#
+# The wide-pair form keeps the one-tile prologue prime that `_pick_xpf_prime`
+# forces on any grouping that prefetches, even though `row` is still chased
+# inside the gather and the reasoning behind that gate ("no chase left to
+# fold") therefore does not literally apply. Letting eleven tiles keep the two
+# it wanted before it prefetched anything reads +4.03% on `mla_v14` (21.14 ->
+# 21.99, bit identical). The rope chase is a single 64 B load and cannot carry
+# a second tile: once the prologue holds a whole column of index loads, those
+# are its outstanding traffic, and priming another tile just doubles what the
+# first body's LDS writes wait on.
+
+
+def _pick_index_rows_only(inner_iter: int) -> bool:
+    """Whether this grouping lifts only the wide index pair."""
+    return inner_iter in _INDEX_PREFETCH_ROWS_ONLY
 
 def _pick_index_prefetch(inner_iter: int) -> int:
     """Return how many tiles of index rows the producer keeps in flight.
@@ -269,6 +300,13 @@ def _pick_index_prefetch(inner_iter: int) -> int:
     spill anywhere, and all of it inside the 256 that would keep two waves on
     a SIMD -- while the eleven-tile streams differ by ten `v_pk_mul_f32` the
     allocator could no longer pair.
+
+    Parking the column in LDS instead buys the register back and costs
+    `inner_iter * 256` bytes of a budget that prices occupancy at 0.1-0.2%
+    here, but it puts a `ds_read_b32` back on the gather's address path -- the
+    round trip this lever exists to remove -- and reads +6.7% at seven tiles,
+    +2.3% at eight and +1.9% at eleven, bit identical each time. The register
+    column is the only form that pays.
     """
     return _INDEX_PREFETCH.get(inner_iter, 0)
 
@@ -482,6 +520,7 @@ def _launch_partial(
         use_buffer=use_buffer,
         xpf_prime=_pick_xpf_prime(inner_iter, seq * n_groups, num_cu),
         ixpf_depth=_pick_index_prefetch(inner_iter),
+        ixpf_rows_only=_pick_index_rows_only(inner_iter),
         n_groups=n_groups,
         fuse_combine=fuse_combine,
     )
