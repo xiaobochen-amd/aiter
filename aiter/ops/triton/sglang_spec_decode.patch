@@ -5,13 +5,25 @@ diff -ruN a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt
      # option. Conditions mirror the validation below so the flip never triggers a raise.
      from sglang.srt.utils import is_hip
  
-+    # AITER_GREEDY_SPEC_GATE=1 (default) keeps the flip off: rejection
-+    # sampling only changes the served distribution when a request asks for
-+    # temperature/top_p, and forcing it on makes every draft step materialise a
-+    # full-vocab proposal q that a greedy batch never reads. The draft worker
-+    # logs a warning if a non-greedy batch ever arrives while the gate is on
-+    # (it cannot repair one: the draft graphs are captured once, at startup).
-+    greedy_gate = os.environ.get("AITER_GREEDY_SPEC_GATE", "1") == "1"
++    # The gate defaults OFF, i.e. rejection sampling is left enabled.
++    #
++    # It was written to skip the full-vocab proposal q that a greedy batch never
++    # reads. That saving is real, but it is not free: the comment above this
++    # block says why -- ROCm has no sampling-verify kernel, so with rejection
++    # sampling disabled EAGLE verify falls back to argmax. On a batch that asks
++    # for temperature/top_p that path emits token ids outside the vocabulary,
++    # which `_check_vocab_boundary_finish` catches and reports, confusingly, as
++    # `FINISH_MATCHED_STR(matched="NaN happened")`.
++    #
++    # Measured on GLM-5.2 TP4/EP4 at c8, 320 requests through bench_serving:
++    # gate on -> 33 s wall, ~32 tokens per request, six of eight concurrent
++    # requests killed; gate off -> 291 s wall, ~1086 tokens per request, clean.
++    # The failure is probabilistic per request, so a short probe reads clean
++    # often enough to mislead a bisection -- use a full bench load to test it.
++    #
++    # Set AITER_GREEDY_SPEC_GATE=1 to get the old behaviour back, but only for
++    # a deployment that can guarantee every request decodes greedily.
++    greedy_gate = os.environ.get("AITER_GREEDY_SPEC_GATE", "0") == "1"
      if (
          is_hip()
 +        and not greedy_gate
@@ -121,7 +133,7 @@ diff -ruN a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt
 +            or self.topk != 1
 +            or self.hot_token_id is not None
 +            or not _is_hip
-+            or os.environ.get("AITER_GREEDY_SPEC_GATE", "1") != "1"
++            or os.environ.get("AITER_GREEDY_SPEC_GATE", "0") != "1"
 +        ):
 +            return
 +
