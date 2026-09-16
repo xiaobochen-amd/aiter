@@ -621,6 +621,8 @@ def _precompile_to_cache(
                 xcd_swizzle=xcd_swizzle,
                 k_wave=k_wave,
                 v2_output_layout=_v2_output_layout,
+                # Mirrors the runtime predicate so the AOT cache key matches.
+                reuse_cached_b=tokens > tile_m,
             )
             _run_compiled(exe, args)
 
@@ -806,6 +808,7 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                reuse_cached_b=tokens > _sort_block_m,
             )
             _run_compiled(exe, args)
 

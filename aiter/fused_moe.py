@@ -61,9 +61,10 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
 BLOCK_SIZE_M = 32
 
 # Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
-# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
+# FlyDSL folds the Opus backend's P0 and P23 kernels into one launch. Set
+# AITER_USE_FLYDSL_MOE_SORTING=0 to fall back to Opus.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "1") == "1"
 # "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
 #   auto (default) / adaptive -> use the adaptive branch. NO shape fallback: the
 #     kernel is codegen'd for a fixed shape set (SHAPES in
@@ -73,6 +74,136 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 #   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
+
+# A checkpoint may ship a dense bf16 MoE layer while the rest of the model is
+# MXFP4 -- GLM-5.2's draft layer is one. That layer lands on CK 2-stage and
+# streams 4x the weight bytes, which is the whole cost of a decode MoE.
+_BF16_MOE_MXFP4 = os.environ.get("AITER_BF16_MOE_MXFP4", "1") == "1"
+# Keyed on (id, _version) per pitfalls/06's weight-quant cache rule; the entry
+# pins the source tensors so an id can never be recycled under a live key.
+_bf16_moe_mxfp4_cache: dict = {}
+
+
+def _unshuffle_weight_16x16(w: torch.Tensor) -> torch.Tensor:
+    """Undo ``shuffle_weight(w, layout=(16, 16))`` for a 3-D expert weight.
+
+    ``shuffle_weight`` views ``(E, N, K)`` as ``(E, N/16, 16, K/BK, BK/Kel, Kel)``
+    and permutes it by ``(0, 1, 3, 4, 2, 5)``; this applies the inverse so the
+    quantiser can see row-major values again.
+    """
+    experts, n, k = w.shape
+    kel = 16 // w.element_size()
+    bk = 32  # IK * 2 for layout=(16, 16)
+    return (
+        w.view(experts, n // 16, k // bk, bk // kel, 16, kel)
+        .permute(0, 1, 4, 2, 3, 5)
+        .contiguous()
+        .view(experts, n, k)
+    )
+
+
+def _quant_moe_weight_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4-quantise one dense bf16 expert weight into the preshuffled layout.
+
+    Mirrors the a4w4 preparation the tuned path expects: per-1x32 e8m0 quant,
+    ``(16, 16)`` weight shuffle and the matching e8m0 scale shuffle.
+    """
+    from aiter.ops.quant import per_1x32_mx_quant_hip
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility import fp4_utils
+
+    if getattr(w, "is_shuffled", False):
+        w = _unshuffle_weight_16x16(w)
+    experts, n, k = w.shape
+    w_qt, w_scale = per_1x32_mx_quant_hip(
+        w.contiguous().view(experts * n, k), quant_dtype=dtypes.fp4x2, shuffle=False
+    )
+    w_qt = shuffle_weight(w_qt.view(experts, n, k // 2), layout=(16, 16))
+    # e8m0_shuffle takes the flat (E*N, K//32) scale, matching the quant output.
+    return w_qt, fp4_utils.e8m0_shuffle(w_scale)
+
+
+def _maybe_mxfp4_bf16_moe_weights(w1, w2, quant_type, scales, biases, activation):
+    """Return MXFP4 ``(w1, w2, w1_scale, w2_scale)`` for a dense bf16 MoE, else None.
+
+    The gate is deliberately narrow: only a dense bf16 expert pair with no
+    scales, no biases and a Silu gate-up geometry qualifies, which in a
+    MXFP4-served model is exactly the odd layer out.
+    """
+    if not _BF16_MOE_MXFP4 or quant_type != QuantType.No:
+        return None
+    if activation != ActivationType.Silu:
+        return None
+    if any(t is not None for t in scales) or any(t is not None for t in biases):
+        return None
+    if w1.dtype != dtypes.bf16 or w2.dtype != dtypes.bf16:
+        return None
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape[0] != w2.shape[0]:
+        return None
+    # Gate-up fused stage1 only, and both K axes must tile the 32-wide microscale
+    # group and the (16, 16) shuffle.
+    if w1.shape[1] != 2 * w2.shape[2] or w1.shape[2] != w2.shape[1]:
+        return None
+    if w1.shape[2] % 64 or w2.shape[2] % 64 or w1.shape[1] % 32 or w2.shape[1] % 32:
+        return None
+    # A cache hit is a dict lookup returning tensors that already exist, which
+    # is legal under capture -- so the lookup comes first. Only the cold path
+    # (a 5 GB one-shot quantisation) must stay out of the graph.
+    key = (id(w1), w1._version, id(w2), w2._version)
+    hit = _bf16_moe_mxfp4_cache.get(key)
+    if hit is None and torch.cuda.is_current_stream_capturing():
+        # A 5 GB one-shot quantisation must not land inside the graph.
+        # Returning None assumed an eager warmup had filled the cache, which is
+        # true on one sglang tree and false on another; now it is loud.
+        _warn_capture_cold_cache(w1, w2)
+        return None
+    if hit is None:
+        w1_qt, w1_scale = _quant_moe_weight_mxfp4(w1)
+        w2_qt, w2_scale = _quant_moe_weight_mxfp4(w2)
+        torch.cuda.empty_cache()  # the transient unshuffled bf16 copy is large
+        # (w1, w2) are pinned so their ids stay reserved while the entry lives.
+        hit = (w1, w2, w1_qt, w2_qt, w1_scale, w2_scale)
+        _bf16_moe_mxfp4_cache[key] = hit
+        logger.info(
+            f"[fused_moe] dense bf16 experts {tuple(w1.shape)}/{tuple(w2.shape)} "
+            f"(is_shuffled={getattr(w1, 'is_shuffled', False)}) converted to MXFP4 "
+            "(AITER_BF16_MOE_MXFP4=0 to disable)"
+        )
+    return hit[2:]
+
+
+_capture_cold_warned: set = set()
+
+
+def _warn_capture_cold_cache(w1, w2):
+    shapes = (tuple(w1.shape), tuple(w2.shape))
+    if shapes in _capture_cold_warned:
+        return
+    _capture_cold_warned.add(shapes)
+    logger.warning(
+        f"[fused_moe] dense bf16 experts {shapes[0]}/{shapes[1]} reached CUDA "
+        "graph capture before being quantised, so bf16 is what the graph will "
+        "replay. Call aiter.fused_moe.prequant_bf16_moe_weights(w1, w2) on "
+        "these tensors before capture to get the MXFP4 path."
+    )
+
+
+def prequant_bf16_moe_weights(w1, w2, activation=ActivationType.Silu):
+    """Fill the MXFP4 cache for a dense bf16 expert pair, ahead of capture.
+
+    Same gate as the per-call path minus the capture check, so it can be called
+    from wherever the weights are known to be final -- after load, before the
+    graph runner captures. Returns True if the pair is now cached. Safe to call
+    repeatedly; the second call is a dict lookup.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    got = _maybe_mxfp4_bf16_moe_weights(
+        w1, w2, QuantType.No, (None, None, None, None), (None, None), activation
+    )
+    return got is not None
+
+
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
@@ -310,20 +441,37 @@ def _flydsl_moe_sorting(
     expert_mask,
     num_local_tokens,
     accumulate=True,
+    num_local_experts=None,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
+    from aiter.ops.flydsl.kernels.moe_sorting_kernel import (
+        moe_sorting_num_valid_ids_size,
+    )
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    # Sort-buffer bound. Only local experts own sorted rows and each is padded
+    # to a whole block, so the waste is at most block_size - 1 rows per expert.
+    # num_experts is the global count and would not bound this.
+    sizing_experts = num_experts
+    if num_local_experts is not None:
+        sizing_experts = min(int(num_local_experts), num_experts)
+    max_num_tokens_padded = int(topk_ids.numel() + sizing_experts * (block_size - 1))
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    # Over-sized num_valid_ids asks the sorting kernel for the sorted-row
+    # inverse table, so consumers that address a token's sorted rows can read
+    # them directly instead of scanning the whole sorted_ids allocation.
+    num_valid_ids = torch.empty(
+        moe_sorting_num_valid_ids_size(M, num_experts, topk),
+        dtype=dtypes.i32,
+        device=device,
+    )
     # moe_buf shape mirrors _moe_sorting_impl: full [M, model_dim] when stage2
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
@@ -364,6 +512,7 @@ def moe_sorting(
     accumulate=True,
     flat=False,
     output_aux=False,
+    num_local_experts=None,
 ):
     if (
         not _USE_CK_MOE_SORTING
@@ -384,6 +533,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             accumulate=accumulate,
+            num_local_experts=num_local_experts,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
@@ -543,6 +693,18 @@ def fused_moe(
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
         )
+    mxfp4 = _maybe_mxfp4_bf16_moe_weights(
+        w1,
+        w2,
+        quant_type,
+        (w1_scale, w2_scale, a1_scale, a2_scale),
+        (bias1, bias2),
+        activation,
+    )
+    if mxfp4 is not None:
+        w1, w2, w1_scale, w2_scale = mxfp4
+        quant_type = QuantType.per_1x32
+
     if not block_size_M:
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
@@ -740,6 +902,7 @@ def _fused_moe_impl(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _stage2_override: Callable | None = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -990,6 +1153,10 @@ def _fused_moe_impl(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
+            # E is the local expert count (w1/w2 leading dim) and equals the
+            # number of set entries in expert_mask, since sorted_expert_ids
+            # carries the mask's prefix-sum index into w1.
+            num_local_experts=E,
         )
         if need_local_topk_ids:
             (
@@ -1008,6 +1175,8 @@ def _fused_moe_impl(
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
+        if _stage2_override is not None:
+            raise RuntimeError("_stage2_override requires a two-stage MoE config")
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -1077,6 +1246,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            _stage2_override=_stage2_override,
         )
 
 
@@ -1558,6 +1728,7 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        k_wave=parsed.get("k_wave", 1),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
     )
@@ -2136,6 +2307,31 @@ def _flydsl_v2_stage2_wrapper(
             fp8_pitch_align=_fp8_pitch_align,
         )
     return out
+
+
+# Per token tier for the heuristic mxfp4 FlyDSL MoE fallback:
+# (token_upper_bound, tile_m, stage1 tile_n, stage1 suffix, stage2 suffix).
+# A table rather than an if-chain so a tier can be re-measured on its own.
+_MXFP4_FLYDSL_TOKEN_TIERS = (
+    (2048, 32, 128, "_w2", "_bnt2"),
+    (4096, 64, 128, "_w3_bnt0", ""),
+    # Above 4096 tokens the MoE is compute-bound and the widest M tile wins,
+    # so the top tier stays open rather than falling back to a narrower one.
+    (None, 128, 128, "_w2_bnt0", ""),
+)
+
+
+# a4w4-only geometry for decode-sized calls (token < the first tier bound):
+# (stage1 tile_n, stage1 suffix, stage2 tile_n). See the comments at the use
+# site for why these differ from the generic tier.
+_A4W4_DECODE_GEOMETRY = (64, "_w3_kw2", 64)
+
+
+def _pick_mxfp4_flydsl_tier(token):
+    for bound, tile_m, s1_tn, s1_sfx, s2_sfx in _MXFP4_FLYDSL_TOKEN_TIERS:
+        if bound is None or token < bound:
+            return tile_m, s1_tn, s1_sfx, s2_sfx
+    raise AssertionError("_MXFP4_FLYDSL_TOKEN_TIERS must end with an open tier")
 
 
 @functools.lru_cache(maxsize=2048)
@@ -2796,24 +2992,24 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
-        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
-        if token < 2048:
-            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
-        elif token < 4096:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
-        elif token < 16384:
-            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
-        else:
-            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        _tile_m, _s1_tn, _s1_sfx, _s2_sfx = _pick_mxfp4_flydsl_tier(token)
+        # Decode-sized a4w4 stage1 is weight-streaming: cost is set by how
+        # many K streams stay in flight, not by N. Re-splitting the same four
+        # waves as two N x two K doubles the in-flight streams for free.
+        _s2_tn = 128
+        # Stage2's reduction is fixed at inter_dim, so the K axis has nothing
+        # to give; what it has is a wide N, and tile_n=64 doubles the workgroup
+        # count over model_dim while each wave still owns a full MFMA block.
+        if (_a_type, _w_type) == ("fp4", "fp4") and token < 2048:
+            _s1_tn, _s1_sfx, _s2_tn = _A4W4_DECODE_GEOMETRY
         _base_kn1 = flydsl_kernel_name(
-            1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+            1, _a_type, _w_type, _out_type, _tile_m, _s1_tn, 256
         )
         _base_kn2 = flydsl_kernel_name(
-            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+            2, _a_type, _w_type, _out_type, _tile_m, _s2_tn, _s2_tk, "atomic"
         )
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
-
         # fp8 stage1 kernel names always carry a "_gui" suffix
         # (moe_kernels.py:114-115). Append it before the lookup so the fp8
         # variants resolve; fp4 names are unchanged.
@@ -3072,6 +3268,7 @@ def fused_moe_2stages(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _stage2_override: Callable | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -3403,8 +3600,7 @@ def fused_moe_2stages(
         a2 = a2.view(token_num, topk, inter_dim)
 
     stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
-    _stage2_call = functools.partial(
-        metadata.stage2,
+    stage2_args = (
         a2,
         w1,
         w2,
@@ -3413,6 +3609,8 @@ def fused_moe_2stages(
         num_valid_ids,
         moe_out,
         topk,
+    )
+    stage2_kwargs = dict(
         w2_scale=(
             # See stage1 w1_scale note: only reinterpret packed (e8m0) scales;
             # per_Token fp8 uses an fp32 scale and must be passed through as-is
@@ -3428,11 +3626,27 @@ def fused_moe_2stages(
         sorted_weights=stage2_sorted_weights,
         **extra_stage2_args,
     )
+    if _stage2_override is None:
+        _stage2_call = functools.partial(
+            metadata.stage2,
+            *stage2_args,
+            **stage2_kwargs,
+        )
+    else:
+        # A comm-fused Stage2 replaces the launch with one that also folds in
+        # the shared-expert partial and the TP all-reduce, and returns the
+        # complete result rather than writing moe_out in place.
+        _stage2_call = functools.partial(
+            _stage2_override,
+            ordinary_stage2=metadata.stage2,
+            stage2_args=stage2_args,
+            stage2_kwargs=stage2_kwargs,
+        )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage2", _stage2_call))
-    _stage2_call()
+    stage2_output = _stage2_call()
 
-    return moe_out
+    return moe_out if _stage2_override is None else stage2_output
 
 
 def torch_moe_act(act_input, torch_act, inter_dim):

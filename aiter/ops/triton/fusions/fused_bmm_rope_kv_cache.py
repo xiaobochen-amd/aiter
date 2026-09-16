@@ -504,8 +504,11 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     N = kv_lora_rank
     K = k
 
+    # qh is the BMM's batch and a factor of the launch width, so it selects
+    # the tile the same way it does for the standalone entry point. Omitting it
+    # left this path on the (N, K)-keyed table while the standalone one moved.
     if config is None:
-        config, _ = _get_fp8_config(M, N, K)
+        config, _ = _get_fp8_config(M, N, K, qh)
 
     config["BLOCK_SIZE_K"] = group_size
 

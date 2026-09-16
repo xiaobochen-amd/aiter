@@ -86,7 +86,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             ), "Output dimension error"
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K, B)
     config["BLOCK_SIZE_K"] = group_size
 
     grid = lambda META: (
