@@ -291,7 +291,8 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     is_fp8 = b_dtype == "fp8"
-    tile_ns = [128, 256] if is_fp4 else [128]
+    # tile_n=32 only tiles with k_wave>1 (each N-wave needs >=16 columns).
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [128]
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
@@ -329,11 +330,24 @@ def get_flydsl_stage2_kernels(
                                 "b_nt": bnt,
                                 "xcd_swizzle": xcd,
                             }
-                            kernels[base_name] = base_params
-                            kernels[base_name + "_persist"] = {
-                                **base_params,
-                                "persist": True,
-                            }
+                            if tn >= 64:
+                                kernels[base_name] = base_params
+                                kernels[base_name + "_persist"] = {
+                                    **base_params,
+                                    "persist": True,
+                                }
+                            # k_wave: the 4 waves are repartitioned as
+                            # (4/kw) N-waves x kw K-waves, so each N-wave needs
+                            # >=16 columns and the slice stays tile_k-aligned.
+                            if not is_fp4 or mode != "atomic" or a_dtype == "bf16":
+                                continue
+                            for kw in (2, 4):
+                                if tn // (4 // kw) < 16:
+                                    continue
+                                kernels[f"{base_name}_kw{kw}"] = {
+                                    **base_params,
+                                    "k_wave": kw,
+                                }
     _register_production_variants_stage2(kernels, a_dtype, b_dtype, out_dtype)
     return kernels
 
@@ -630,6 +644,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    reuse_cached_b: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -690,6 +705,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            reuse_cached_b=reuse_cached_b,
         )
     else:
         raise ValueError(
@@ -719,7 +735,9 @@ def compile_flydsl_moe_stage2(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     enable_bias: bool = False,
+    reuse_cached_b: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -765,16 +783,15 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
             cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
+            # `b_nt` / `xcd_swizzle` come from the kernel-name parser
+            # (`_bnt{N}` / `_xcd{N}` registry suffixes).
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
+            k_wave=k_wave,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            reuse_cached_b=reuse_cached_b,
         )
     else:
         raise ValueError(
@@ -1733,6 +1750,9 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        # An expert can only spill over an m-block when it holds more than
+        # `tile_m` rows, so below that the cached-B path is dead code.
+        "reuse_cached_b": token_num > tile_m,
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
@@ -2006,6 +2026,7 @@ def _flydsl_moe_stage2_impl(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     bias: torch.Tensor | None = None,
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
@@ -2248,7 +2269,11 @@ def _flydsl_moe_stage2_impl(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
+        k_wave=k_wave,
         enable_bias=(bias is not None),
+        # See the stage1 launcher: only sort blocks that an expert can spill
+        # over need the cached-B path.
+        reuse_cached_b=token_num > _sbm,
     )
     _run_compiled(exe, args)
 
@@ -2302,6 +2327,7 @@ def flydsl_moe_stage2(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
+    k_wave: int = 1,
     bias: torch.Tensor | None = None,
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
@@ -2355,6 +2381,7 @@ def flydsl_moe_stage2(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
+        k_wave=k_wave,
         bias=bias,
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,

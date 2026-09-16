@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
+
 import torch
 import triton
 
@@ -18,6 +20,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _nvfp4_quant_op,
     _static_per_tensor_quant_fp8_i8_kernel,
 )
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -149,6 +152,33 @@ def dynamic_per_token_quant_fp8_i8(
     return qx, scale_out
 
 
+@functools.lru_cache(maxsize=256)
+def _mxfp4_quant_refill_tile(M: int, N: int, num_sms: int) -> tuple[int, int]:
+    """Largest (BLOCK_SIZE_M, BLOCK_SIZE_N) whose grid still covers the machine.
+
+    Widest tile first so each CTA keeps a full cache line per row, then widest
+    BLOCK_SIZE_N among the ties. When no tile reaches num_sms the problem cannot
+    fill the part, so take the widest grid instead.
+    """
+    reach = []
+    small = []
+    for bm in (64, 32, 16, 8, 4, 2):
+        if bm > triton.next_power_of_2(M):
+            continue
+        for bn in (256, 128, 64, 32):
+            if bn > triton.next_power_of_2(N) or bm * bn < 512:
+                continue
+            grid = triton.cdiv(M, bm) * triton.cdiv(N, bn)
+            (reach if grid >= num_sms else small).append((bm * bn, bn, grid, bm))
+    if reach:
+        _, bn, _, bm = max(reach)
+    elif small:
+        _, bn, _, bm = max(small, key=lambda c: (c[2], c[0], c[1]))
+    else:
+        return 0, 0
+    return bm, bn
+
+
 def dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even"
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -210,6 +240,19 @@ def dynamic_mxfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
+
+    # The ladder above is sized for prefill activations, where the N extent
+    # alone covers the part. A decode activation is a few dozen rows tall, so
+    # the same tiles underfill the launch; re-pick the tile when they do.
+    num_sms = get_num_sms()
+    if grid[0] * grid[1] < num_sms:
+        bm, bn = _mxfp4_quant_refill_tile(M, N, num_sms)
+        if bm:
+            NUM_ITER = 1
+            NUM_STAGES = 1
+            NUM_WARPS = 4
+            BLOCK_SIZE_M, BLOCK_SIZE_N = bm, bn
+            grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     _dynamic_mxfp4_quant_kernel[grid](
         x,
