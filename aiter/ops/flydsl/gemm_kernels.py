@@ -75,6 +75,9 @@ _HGEMM_KERNEL_RE = re.compile(
 SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_WORKSPACE: dict[SplitKStreamKey, torch.Tensor] = {}
+# Captured HIP graphs retain raw pointers, not these Python Tensor owners.
+# Keep superseded allocations alive for graphs captured before a cache growth.
+SPLIT_K_RETIRED_BUFFERS: dict[SplitKStreamKey, list[torch.Tensor]] = {}
 
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
@@ -761,25 +764,36 @@ def _get_split_k_buffers(
     tiles: int,
     ws_bytes: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-stream split-K bookkeeping, grown in place and never shrunk.
+    """Per-stream split-K buffers retained across graph captures.
 
-    Safe to share: launches on a stream are ordered and the reduction hands the
-    counters back at zero.  Growing only on a larger launch keeps the allocation
-    out of any graph capture that follows a warm-up call.
+    Launches on a stream are ordered and return counters to zero. A later
+    warmup for a different graph can need a larger buffer, even at a smaller M
+    when the selected tiling/split-K changes. Old graphs still use the previous
+    addresses: retain their owners instead of returning that storage to the
+    allocator. Power-of-two capacities bound retained storage below the current
+    allocation size for each kind of buffer on each stream.
     """
     key = _stream_cache_key(stream)
     semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
     if semaphore is None or semaphore.numel() < tiles:
+        if semaphore is not None:
+            SPLIT_K_RETIRED_BUFFERS.setdefault(key, []).append(semaphore)
+        capacity = _align_up(max(tiles, 1), SPLIT_K_SEMAPHORE_GRANULE)
+        capacity = 1 << (capacity - 1).bit_length()
         semaphore = torch.zeros(
-            _align_up(max(tiles, 1), SPLIT_K_SEMAPHORE_GRANULE),
+            capacity,
             dtype=torch.int32,
             device=device,
         )
         SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
     workspace = SPLIT_K_GLOBAL_WORKSPACE.get(key)
     if workspace is None or workspace.numel() < ws_bytes:
+        if workspace is not None:
+            SPLIT_K_RETIRED_BUFFERS.setdefault(key, []).append(workspace)
+        capacity = _align_up(max(ws_bytes, 1), SPLIT_K_WORKSPACE_GRANULE)
+        capacity = 1 << (capacity - 1).bit_length()
         workspace = torch.empty(
-            _align_up(max(ws_bytes, 1), SPLIT_K_WORKSPACE_GRANULE),
+            capacity,
             dtype=torch.uint8,
             device=device,
         )
